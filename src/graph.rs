@@ -1,4 +1,10 @@
+//! Core graph types: the OSM parse shapes, the [`Edge`] weight stored on
+//! every road segment, graph construction, and [`SpatialGraph`], which bundles
+//! a road graph with the indexes every query needs.
+
+use crate::ch::ContractionHierarchy;
 use crate::overpass::NetworkType;
+use crate::search::{SearchIndex, SlotCosts};
 use crate::simplify::simplify_graph;
 use crate::utils::{calculate_distance, calculate_travel_time};
 use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
@@ -6,7 +12,12 @@ use petgraph::visit::EdgeRef;
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::ops::Index;
 use std::sync::{Arc, OnceLock};
+
+// ---------------------------------------------------------------------------
+// OSM input shapes (Overpass XML and PBF both produce these)
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct XmlData {
@@ -28,6 +39,7 @@ pub struct XmlNode {
     pub tags: Vec<XmlTag>,
 }
 
+/// An OSM way as parsed from XML or PBF: the input to [`create_graph`].
 #[derive(Debug, Deserialize, Clone)]
 pub struct XmlWay {
     #[serde(rename = "@id")]
@@ -36,44 +48,89 @@ pub struct XmlWay {
     pub nodes: Vec<XmlNodeRef>,
     #[serde(rename = "tag", default)]
     pub tags: Vec<XmlTag>,
-    #[serde(default)]
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct XmlNodeRef {
+    #[serde(rename = "@ref")]
+    pub node_id: i64,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct XmlTag {
+    #[serde(rename = "@k")]
+    pub key: String,
+    #[serde(rename = "@v")]
+    pub value: String,
+}
+
+pub fn parse_xml(xml_data: &str) -> Result<XmlData, quick_xml::DeError> {
+    quick_xml::de::from_str(xml_data)
+}
+
+// ---------------------------------------------------------------------------
+// Road graph
+// ---------------------------------------------------------------------------
+
+/// The road network: OSM nodes connected by directed [`Edge`]s.
+pub type RoadGraph = DiGraph<XmlNode, Edge>;
+
+/// One directed road segment, or a collapsed chain of segments, in a
+/// [`RoadGraph`].
+#[derive(Debug, Clone, Default)]
+pub struct Edge {
+    /// OSM id of the way this edge was cut from (the first way of a chain).
+    pub way_id: i64,
+    /// Routing-relevant tags of that way, shared by every edge cut from it.
+    pub tags: Arc<[XmlTag]>,
+    /// Length in metres.
     pub length: f64,
-    #[serde(default)]
     pub speed_kph: f64,
-    #[serde(default)]
+    /// Travel times in seconds per mode.
     pub walk_travel_time: f64,
-    #[serde(default)]
     pub bike_travel_time: f64,
-    #[serde(default)]
     pub drive_travel_time: f64,
-    /// Ordered route geometry as `(lat, lon)` points for this directed edge.
-    ///
-    /// Unsimplified edges contain their source and target coordinates.
-    /// Simplified edges retain the intermediate shape points from the collapsed
-    /// chain so route rendering follows the original road geometry.
-    #[serde(default)]
+    /// Intermediate shape as `(lat, lon)` points. Empty means a straight
+    /// segment between the endpoints, which is what unsimplified edges use.
+    /// Read it through [`Edge::oriented_geometry`], which handles both cases
+    /// and the orientation.
     pub geometry: Vec<(f64, f64)>,
 }
 
-impl XmlWay {
-    pub fn filter_useful_tags(mut self) -> Self {
-        const USEFUL_TAGS: &[&str] = &["highway", "name", "ref", "bridge", "tunnel", "service"];
-        // Linear search on 15-element static slice — no HashSet allocation needed.
-        self.tags
-            .retain(|tag| USEFUL_TAGS.contains(&tag.key.as_str()));
-        self
+impl Edge {
+    /// A straight edge whose travel times follow from `length` at walking
+    /// pace (5 km/h), cycling pace (15 km/h) and `speed_kph` for driving.
+    pub fn from_length(way_id: i64, tags: Arc<[XmlTag]>, length: f64, speed_kph: f64) -> Self {
+        Edge {
+            way_id,
+            tags,
+            length,
+            speed_kph,
+            walk_travel_time: calculate_travel_time(length, 5.0),
+            bike_travel_time: calculate_travel_time(length, 15.0),
+            drive_travel_time: calculate_travel_time(length, speed_kph),
+            geometry: Vec::new(),
+        }
     }
 
-    /// Return the travel time (seconds) for the given network type.
-    /// Centralises the walk / bike / drive dispatch so call sites don't
-    /// repeat the same match expression.
+    /// Travel time in seconds for `network_type`.
     #[inline]
     pub fn travel_time(&self, network_type: NetworkType) -> f64 {
-        match CostField::of(network_type) {
+        self.cost(CostField::of(network_type))
+    }
+
+    #[inline]
+    pub(crate) fn cost(&self, field: CostField) -> f64 {
+        match field {
             CostField::Walk => self.walk_travel_time,
             CostField::Bike => self.bike_travel_time,
             CostField::Drive => self.drive_travel_time,
         }
+    }
+
+    /// Value of the tag named `key`, if present.
+    pub fn tag(&self, key: &str) -> Option<&str> {
+        find_tag(&self.tags, key).map(|tag| tag.value.as_str())
     }
 
     /// This edge's route geometry, oriented from `source` to `target`.
@@ -102,9 +159,9 @@ impl XmlWay {
 /// Which precomputed travel-time field a [`NetworkType`] is costed with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CostField {
-    Walk,
-    Bike,
-    Drive,
+    Walk = 0,
+    Bike = 1,
+    Drive = 2,
 }
 
 impl CostField {
@@ -124,7 +181,7 @@ impl CostField {
 }
 
 /// Route geometry of one edge, oriented along the edge. See
-/// [`XmlWay::oriented_geometry`].
+/// [`Edge::oriented_geometry`].
 #[derive(Debug, Clone, Copy)]
 pub struct EdgeGeometry<'a> {
     points: GeometryPoints<'a>,
@@ -155,25 +212,11 @@ impl EdgeGeometry<'_> {
 }
 
 /// Oriented geometry of `edge` in `graph`. Panics if `edge` is not in `graph`.
-pub fn edge_geometry(graph: &DiGraph<XmlNode, XmlWay>, edge: EdgeIndex) -> EdgeGeometry<'_> {
+pub fn edge_geometry(graph: &RoadGraph, edge: EdgeIndex) -> EdgeGeometry<'_> {
     let (source, target) = graph
         .edge_endpoints(edge)
         .expect("edge index belongs to this graph");
     graph[edge].oriented_geometry(&graph[source], &graph[target])
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct XmlNodeRef {
-    #[serde(rename = "@ref")]
-    pub node_id: i64,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub struct XmlTag {
-    #[serde(rename = "@k")]
-    pub key: String,
-    #[serde(rename = "@v")]
-    pub value: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,34 +242,20 @@ impl Direction {
     }
 }
 
-// Function to parse the XML response
-pub fn parse_xml(xml_data: &str) -> Result<XmlData, quick_xml::DeError> {
-    let root: XmlData = quick_xml::de::from_str(xml_data)?;
-    Ok(root)
-}
-
 fn find_tag<'a>(tags: &'a [XmlTag], key: &str) -> Option<&'a XmlTag> {
     tags.iter().find(|tag| tag.key == key)
 }
 
-fn assess_path_directionality(path: &XmlWay) -> Direction {
-    let oneway_tag = find_tag(&path.tags, "oneway");
-    let junction_tag = find_tag(&path.tags, "junction");
-
-    if oneway_tag.is_some_and(|tag| matches!(tag.value.as_str(), "-1" | "reverse")) {
-        return Direction::OneWayReverse;
-    }
-
-    if oneway_tag.is_some_and(|tag| matches!(tag.value.as_str(), "yes" | "true" | "1")) {
-        return Direction::OneWayForward;
-    }
-
-    // Roundabouts are considered one-way implicitly
-    let is_roundabout = junction_tag.is_some_and(|tag| tag.value == "roundabout");
-    if is_roundabout {
-        Direction::OneWayForward
-    } else {
-        Direction::Bidirectional
+fn assess_path_directionality(tags: &[XmlTag]) -> Direction {
+    let oneway = find_tag(tags, "oneway").map(|tag| tag.value.as_str());
+    match oneway {
+        Some("-1" | "reverse") => Direction::OneWayReverse,
+        Some("yes" | "true" | "1") => Direction::OneWayForward,
+        // Roundabouts are one-way implicitly.
+        _ if find_tag(tags, "junction").is_some_and(|tag| tag.value == "roundabout") => {
+            Direction::OneWayForward
+        }
+        _ => Direction::Bidirectional,
     }
 }
 
@@ -252,52 +281,35 @@ fn highway_speed_kph(highway: &str) -> Option<f64> {
     }
 }
 
-fn way_speed_kph(way: &XmlWay) -> f64 {
+fn way_speed_kph(tags: &[XmlTag]) -> f64 {
     const FALLBACK_SPEED_KPH: f64 = 50.0;
-
-    if let Some(maxspeed) =
-        find_tag(&way.tags, "maxspeed").and_then(|tag| clean_maxspeed(&tag.value))
-    {
-        return maxspeed;
-    }
-
-    find_tag(&way.tags, "highway")
-        .and_then(|tag| highway_speed_kph(&tag.value))
+    find_tag(tags, "maxspeed")
+        .and_then(|tag| clean_maxspeed(&tag.value))
+        .or_else(|| find_tag(tags, "highway").and_then(|tag| highway_speed_kph(&tag.value)))
         .unwrap_or(FALLBACK_SPEED_KPH)
 }
 
-fn edge_way_from_template(
-    template: &XmlWay,
-    length: f64,
-    speed_kph: f64,
-    geometry: Vec<(f64, f64)>,
-) -> XmlWay {
-    XmlWay {
-        id: template.id,
-        nodes: Vec::new(),
-        tags: template.tags.clone(),
-        length,
-        speed_kph,
-        walk_travel_time: calculate_travel_time(length, 5.0),
-        bike_travel_time: calculate_travel_time(length, 15.0),
-        drive_travel_time: calculate_travel_time(length, speed_kph),
-        geometry,
-    }
+/// The tags edges keep; everything else is dropped at build time.
+fn useful_tags(mut tags: Vec<XmlTag>) -> Arc<[XmlTag]> {
+    const USEFUL_TAGS: &[&str] = &["highway", "name", "ref", "bridge", "tunnel", "service"];
+    tags.retain(|tag| USEFUL_TAGS.contains(&tag.key.as_str()));
+    tags.into()
 }
 
 /// Build a directed road graph from parsed OSM nodes and ways.
 ///
 /// Every consecutive node pair of a way becomes one edge per traversable
-/// direction. Way references to nodes missing from `nodes` (common in clipped
-/// extracts) are skipped rather than panicking. Unless `retain_all` is set the
-/// graph is then simplified: nearby intersection nodes are merged and
-/// degree-two chains are collapsed into single edges.
+/// direction; all edges of a way share one copy of its tags. Way references
+/// to nodes missing from `nodes` (common in clipped extracts) are skipped
+/// rather than panicking. Unless `retain_all` is set the graph is then
+/// simplified: nearby intersection nodes are merged and degree-two chains are
+/// collapsed into single edges.
 pub fn create_graph(
     nodes: Vec<XmlNode>,
     ways: Vec<XmlWay>,
     retain_all: bool,
     bidirectional: bool,
-) -> DiGraph<XmlNode, XmlWay> {
+) -> RoadGraph {
     let segment_count: usize = ways.iter().map(|w| w.nodes.len().saturating_sub(1)).sum();
     let mut graph = DiGraph::with_capacity(nodes.len(), segment_count * 2);
     let mut node_index_map = HashMap::with_capacity(nodes.len());
@@ -307,14 +319,12 @@ pub fn create_graph(
         node_index_map.insert(id, graph.add_node(node));
     }
 
-    for mut way in ways {
-        // Edge weights don't need the construction-only node list.
-        let node_refs = std::mem::take(&mut way.nodes);
-        let traversals = assess_path_directionality(&way).traversals(bidirectional);
-        let speed_kph = way_speed_kph(&way);
-        let way = way.filter_useful_tags();
+    for way in ways {
+        let traversals = assess_path_directionality(&way.tags).traversals(bidirectional);
+        let speed_kph = way_speed_kph(&way.tags);
+        let tags = useful_tags(way.tags);
 
-        for pair in node_refs.windows(2) {
+        for pair in way.nodes.windows(2) {
             let (Some(&a), Some(&b)) = (
                 node_index_map.get(&pair[0].node_id),
                 node_index_map.get(&pair[1].node_id),
@@ -323,18 +333,10 @@ pub fn create_graph(
             };
             let (pa, pb) = (node_to_latlon(&graph, a), node_to_latlon(&graph, b));
             let length = calculate_distance(pa.0, pa.1, pb.0, pb.1);
-
             for &reversed in traversals {
-                let (from, to, geometry) = if reversed {
-                    (b, a, vec![pb, pa])
-                } else {
-                    (a, b, vec![pa, pb])
-                };
-                graph.add_edge(
-                    from,
-                    to,
-                    edge_way_from_template(&way, length, speed_kph, geometry),
-                );
+                let (from, to) = if reversed { (b, a) } else { (a, b) };
+                let edge = Edge::from_length(way.id, Arc::clone(&tags), length, speed_kph);
+                graph.add_edge(from, to, edge);
             }
         }
     }
@@ -365,10 +367,14 @@ fn clean_maxspeed(maxspeed: &str) -> Option<f64> {
     Some(if is_mph { speed * MPH_TO_KPH } else { speed })
 }
 
-pub fn node_to_latlon(graph: &DiGraph<XmlNode, XmlWay>, node_index: NodeIndex) -> (f64, f64) {
+pub fn node_to_latlon(graph: &RoadGraph, node_index: NodeIndex) -> (f64, f64) {
     let node = &graph[node_index];
     (node.lat, node.lon)
 }
+
+// ---------------------------------------------------------------------------
+// Spatial index entries
+// ---------------------------------------------------------------------------
 
 /// R-tree entry pairing a node's projected coordinates with its NodeIndex.
 #[derive(Clone, Copy)]
@@ -393,6 +399,14 @@ impl RTreeObject for NodeEntry {
     }
 }
 
+impl PointDistance for NodeEntry {
+    fn distance_2(&self, point: &[f64; 2]) -> f64 {
+        let dlat = self.point[0] - point[0];
+        let dlon = self.point[1] - point[1];
+        dlat * dlat + dlon * dlon
+    }
+}
+
 /// Local equirectangular projection to metres, good enough for nearest-node
 /// queries and small-radius clustering.
 pub(crate) fn spatial_index_point(lat: f64, lon: f64) -> [f64; 2] {
@@ -403,46 +417,111 @@ pub(crate) fn spatial_index_point(lat: f64, lon: f64) -> [f64; 2] {
     ]
 }
 
-impl PointDistance for NodeEntry {
-    fn distance_2(&self, point: &[f64; 2]) -> f64 {
-        let dlat = self.point[0] - point[0];
-        let dlon = self.point[1] - point[1];
-        dlat * dlat + dlon * dlon
+// ---------------------------------------------------------------------------
+// NodeMap
+// ---------------------------------------------------------------------------
+
+/// A map from graph nodes to values with O(1) lookup and insertion-ordered
+/// iteration, backed by a dense slot table instead of hashing.
+///
+/// Search results use it: reachability entries are in settle order, i.e.
+/// sorted by travel time.
+#[derive(Debug, Clone)]
+pub struct NodeMap<T> {
+    slots: Vec<u32>,
+    entries: Vec<(NodeIndex, T)>,
+}
+
+const NO_SLOT: u32 = u32::MAX;
+
+impl<T> NodeMap<T> {
+    /// An empty map able to hold any node of a graph with `node_count` nodes.
+    pub fn with_node_count(node_count: usize) -> Self {
+        Self {
+            slots: vec![NO_SLOT; node_count],
+            entries: Vec::new(),
+        }
+    }
+
+    /// Insert or replace the value for `node`, returning the previous value.
+    /// Panics if `node` is outside the graph the map was sized for.
+    pub fn insert(&mut self, node: NodeIndex, value: T) -> Option<T> {
+        let slot = &mut self.slots[node.index()];
+        if *slot == NO_SLOT {
+            *slot = self.entries.len() as u32;
+            self.entries.push((node, value));
+            None
+        } else {
+            Some(std::mem::replace(
+                &mut self.entries[*slot as usize].1,
+                value,
+            ))
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, node: NodeIndex) -> Option<&T> {
+        match self.slots.get(node.index()) {
+            Some(&slot) if slot != NO_SLOT => Some(&self.entries[slot as usize].1),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn contains_key(&self, node: NodeIndex) -> bool {
+        self.get(node).is_some()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// `(node, value)` pairs in insertion order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&NodeIndex, &T)> + '_ {
+        self.entries.iter().map(|(node, value)| (node, value))
+    }
+
+    pub fn keys(&self) -> impl ExactSizeIterator<Item = NodeIndex> + '_ {
+        self.entries.iter().map(|(node, _)| *node)
+    }
+
+    pub fn values(&self) -> impl ExactSizeIterator<Item = &T> + '_ {
+        self.entries.iter().map(|(_, value)| value)
+    }
+
+    /// The entries as a slice, in insertion order.
+    pub fn as_slice(&self) -> &[(NodeIndex, T)] {
+        &self.entries
     }
 }
 
-/// Per cost field, the largest `straight-line distance / travel time` over all
-/// edges. Because great-circle distance obeys the triangle inequality,
-/// `distance(n, goal) / max_speed` never exceeds the true remaining cost, and
-/// the resulting A* heuristic is consistent even for edges whose endpoints
-/// were moved by intersection consolidation.
-fn max_straight_line_speeds(graph: &DiGraph<XmlNode, XmlWay>) -> [f64; 3] {
-    let mut max_speed = [0.0_f64; 3];
-    for edge in graph.edge_references() {
-        let (a, b) = (&graph[edge.source()], &graph[edge.target()]);
-        let distance = calculate_distance(a.lat, a.lon, b.lat, b.lon);
-        if distance == 0.0 {
-            continue;
-        }
-        for field in CostField::ALL {
-            let time = match field {
-                CostField::Walk => edge.weight().walk_travel_time,
-                CostField::Bike => edge.weight().bike_travel_time,
-                CostField::Drive => edge.weight().drive_travel_time,
-            };
-            if time.is_finite() && time >= 0.0 {
-                let speed = if time > 0.0 {
-                    distance / time
-                } else {
-                    f64::INFINITY
-                };
-                max_speed[field as usize] = max_speed[field as usize].max(speed);
-            }
-        }
+impl<T> Index<NodeIndex> for NodeMap<T> {
+    type Output = T;
+
+    fn index(&self, node: NodeIndex) -> &T {
+        self.get(node).expect("node is not in this NodeMap")
     }
-    // Pad by a hair so floating-point rounding can't make the bound inadmissible.
-    max_speed.map(|speed| speed * (1.0 + 1e-9))
 }
+
+impl<'a, T> IntoIterator for &'a NodeMap<T> {
+    type Item = (&'a NodeIndex, &'a T);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (NodeIndex, T)>,
+        fn(&'a (NodeIndex, T)) -> (&'a NodeIndex, &'a T),
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter().map(|(node, value)| (node, value))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SpatialGraph
+// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy)]
 pub struct SnapResult {
@@ -461,70 +540,52 @@ pub struct SnappedPoi {
     pub snap: SnapResult,
 }
 
-/// A graph bundled with a spatial index for O(log n) nearest-node queries
-/// and an optional pre-computed POI snap map for O(1) POI filtering.
+/// A road graph bundled with the indexes queries need: an R-tree for
+/// nearest-node lookups, a compact adjacency for searches, and (after
+/// [`SpatialGraph::prepare_routing`]) a contraction hierarchy per mode.
 ///
-/// Build once via `SpatialGraph::new`, reuse for all queries. All inner
-/// fields are reference-counted so cloning is O(1).
+/// Build once via [`SpatialGraph::new`], reuse for all queries. Cloning is
+/// O(1): clones share the graph and every index, including ones built later.
 #[derive(Clone)]
 pub struct SpatialGraph {
-    pub graph: Arc<DiGraph<XmlNode, XmlWay>>,
-    tree: Arc<RTree<NodeEntry>>,
+    pub graph: Arc<RoadGraph>,
     /// POI OSM node id → snapped graph node diagnostics, computed once at startup via
     /// `snap_pois`. `None` until called; `Some` map used by POI filtering
     /// for O(1) lookup instead of an R-tree query on every request.
     pub poi_snaps: Option<Arc<HashMap<i64, SnappedPoi>>>,
-    /// Upper bound on straight-line speed (m/s) over any edge, per cost
-    /// field, computed on first use by routing. See
-    /// [`SpatialGraph::max_straight_line_speed`].
-    max_speed_mps: Arc<OnceLock<[f64; 3]>>,
+    index: Arc<GraphIndex>,
+}
+
+/// Indexes derived from the graph. The cheap ones are built eagerly, the rest
+/// on first use and then shared by every clone.
+struct GraphIndex {
+    tree: RTree<NodeEntry>,
+    search: SearchIndex,
+    node_ids: OnceLock<Vec<(i64, NodeIndex)>>,
+    max_speed_mps: OnceLock<[f64; 3]>,
+    hierarchies: [OnceLock<ContractionHierarchy>; 3],
 }
 
 impl SpatialGraph {
-    pub fn new(graph: DiGraph<XmlNode, XmlWay>) -> Self {
-        let entries: Vec<NodeEntry> = graph
-            .node_indices()
-            .map(|i| NodeEntry::new(&graph[i], i))
-            .collect();
-        let tree = Arc::new(RTree::bulk_load(entries));
+    pub fn new(graph: RoadGraph) -> Self {
+        let tree = RTree::bulk_load(
+            graph
+                .node_indices()
+                .map(|i| NodeEntry::new(&graph[i], i))
+                .collect(),
+        );
+        let search = SearchIndex::new(&graph);
         Self {
             graph: Arc::new(graph),
-            tree,
             poi_snaps: None,
-            max_speed_mps: Arc::default(),
+            index: Arc::new(GraphIndex {
+                tree,
+                search,
+                node_ids: OnceLock::new(),
+                max_speed_mps: OnceLock::new(),
+                hierarchies: Default::default(),
+            }),
         }
-    }
-
-    /// The fastest straight-line speed (m/s) any edge allows for
-    /// `network_type`: `straight_line_distance / max_straight_line_speed`
-    /// never exceeds the true travel time between two nodes, which makes it
-    /// an admissible and consistent A* heuristic. Computed once, lazily, so
-    /// graphs that never route don't pay for it.
-    pub(crate) fn max_straight_line_speed(&self, network_type: NetworkType) -> f64 {
-        self.max_speed_mps
-            .get_or_init(|| max_straight_line_speeds(&self.graph))
-            [CostField::of(network_type) as usize]
-    }
-
-    /// Copy the subgraph induced by the nodes for which `keep` returns true.
-    ///
-    /// Node and edge order follow the parent graph, so results are
-    /// deterministic. POI snaps are not carried over.
-    pub fn induced_subgraph(&self, mut keep: impl FnMut(NodeIndex) -> bool) -> SpatialGraph {
-        let mut remap = vec![NodeIndex::end(); self.graph.node_count()];
-        let mut subgraph = DiGraph::new();
-        for index in self.graph.node_indices() {
-            if keep(index) {
-                remap[index.index()] = subgraph.add_node(self.graph[index].clone());
-            }
-        }
-        for edge in self.graph.edge_references() {
-            let (source, target) = (remap[edge.source().index()], remap[edge.target().index()]);
-            if source != NodeIndex::end() && target != NodeIndex::end() {
-                subgraph.add_edge(source, target, edge.weight().clone());
-            }
-        }
-        SpatialGraph::new(subgraph)
     }
 
     pub(crate) fn from_parsed_osm(
@@ -551,6 +612,71 @@ impl SpatialGraph {
         ))
     }
 
+    /// Compact adjacency used by every search.
+    pub(crate) fn search_index(&self) -> &SearchIndex {
+        &self.index.search
+    }
+
+    /// Per-slot edge costs for `field`, built on first use.
+    pub(crate) fn slot_costs(&self, field: CostField) -> &SlotCosts {
+        self.index
+            .search
+            .costs(field as usize, |edge| self.graph[edge].cost(field))
+    }
+
+    pub(crate) fn hierarchy_slot(&self, field: CostField) -> &OnceLock<ContractionHierarchy> {
+        &self.index.hierarchies[field as usize]
+    }
+
+    /// The fastest straight-line speed (m/s) any edge allows for `field`:
+    /// `straight_line_distance / speed` never exceeds the true travel time
+    /// between two nodes, which makes it an admissible and consistent A*
+    /// heuristic. Computed once, on first use.
+    pub(crate) fn max_straight_line_speed(&self, field: CostField) -> f64 {
+        self.index
+            .max_speed_mps
+            .get_or_init(|| max_straight_line_speeds(&self.graph))[field as usize]
+    }
+
+    /// The graph node with OSM id `node_id`, if any. O(log n) after a
+    /// one-time index build.
+    pub fn node_index(&self, node_id: i64) -> Option<NodeIndex> {
+        let ids = self.index.node_ids.get_or_init(|| {
+            let mut ids: Vec<(i64, NodeIndex)> = self
+                .graph
+                .node_indices()
+                .map(|idx| (self.graph[idx].id, idx))
+                .collect();
+            ids.sort_unstable();
+            ids
+        });
+        let pos = ids.partition_point(|&(id, _)| id < node_id);
+        ids.get(pos)
+            .filter(|&&(id, _)| id == node_id)
+            .map(|&(_, idx)| idx)
+    }
+
+    /// Copy the subgraph induced by the nodes for which `keep` returns true.
+    ///
+    /// Node and edge order follow the parent graph, so results are
+    /// deterministic. POI snaps and prepared hierarchies are not carried over.
+    pub fn induced_subgraph(&self, mut keep: impl FnMut(NodeIndex) -> bool) -> SpatialGraph {
+        let mut remap = vec![NodeIndex::end(); self.graph.node_count()];
+        let mut subgraph = DiGraph::new();
+        for index in self.graph.node_indices() {
+            if keep(index) {
+                remap[index.index()] = subgraph.add_node(self.graph[index].clone());
+            }
+        }
+        for edge in self.graph.edge_references() {
+            let (source, target) = (remap[edge.source().index()], remap[edge.target().index()]);
+            if source != NodeIndex::end() && target != NodeIndex::end() {
+                subgraph.add_edge(source, target, edge.weight().clone());
+            }
+        }
+        SpatialGraph::new(subgraph)
+    }
+
     /// Pre-snap a set of POI nodes to their nearest graph nodes, storing the
     /// result for O(1) lookup at request time.
     ///
@@ -560,22 +686,22 @@ impl SpatialGraph {
         let snaps: HashMap<i64, SnappedPoi> = pois
             .iter()
             .filter_map(|poi| {
-                self.snap_point(poi.lat, poi.lon).map(|snap| {
-                    (
-                        poi.id,
-                        SnappedPoi {
-                            poi_id: poi.id,
-                            snap,
-                        },
-                    )
-                })
+                let snap = self.snap_point(poi.lat, poi.lon)?;
+                Some((
+                    poi.id,
+                    SnappedPoi {
+                        poi_id: poi.id,
+                        snap,
+                    },
+                ))
             })
             .collect();
         self.poi_snaps = Some(Arc::new(snaps));
     }
 
     pub fn nearest_node(&self, lat: f64, lon: f64) -> Option<NodeIndex> {
-        self.tree
+        self.index
+            .tree
             .nearest_neighbor(&spatial_index_point(lat, lon))
             .map(|e| e.index)
     }
@@ -621,6 +747,33 @@ impl SpatialGraph {
     }
 }
 
+/// Per cost field, the largest `straight-line distance / travel time` over all
+/// edges. Because great-circle distance obeys the triangle inequality,
+/// `distance(n, goal) / max_speed` never exceeds the true remaining cost.
+fn max_straight_line_speeds(graph: &RoadGraph) -> [f64; 3] {
+    let mut max_speed = [0.0_f64; 3];
+    for edge in graph.edge_references() {
+        let (a, b) = (&graph[edge.source()], &graph[edge.target()]);
+        let distance = calculate_distance(a.lat, a.lon, b.lat, b.lon);
+        if distance == 0.0 {
+            continue;
+        }
+        for field in CostField::ALL {
+            let time = edge.weight().cost(field);
+            if time.is_finite() && time >= 0.0 {
+                let speed = if time > 0.0 {
+                    distance / time
+                } else {
+                    f64::INFINITY
+                };
+                max_speed[field as usize] = max_speed[field as usize].max(speed);
+            }
+        }
+    }
+    // Pad by a hair so floating-point rounding can't make the bound inadmissible.
+    max_speed.map(|speed| speed * (1.0 + 1e-9))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,16 +802,10 @@ mod tests {
                     value: v.into(),
                 })
                 .collect(),
-            length: 0.0,
-            speed_kph: 0.0,
-            walk_travel_time: 0.0,
-            bike_travel_time: 0.0,
-            drive_travel_time: 0.0,
-            geometry: Vec::new(),
         }
     }
 
-    fn edge_id_pairs(graph: &DiGraph<XmlNode, XmlWay>) -> Vec<(i64, i64)> {
+    fn edge_id_pairs(graph: &RoadGraph) -> Vec<(i64, i64)> {
         let mut pairs: Vec<(i64, i64)> = graph
             .edge_references()
             .map(|edge| (graph[edge.source()].id, graph[edge.target()].id))
@@ -828,7 +975,7 @@ mod tests {
     #[test]
     fn oriented_geometry_follows_edge_direction() {
         let (a, b) = (make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0));
-        let mut way = make_way_raw(vec![], vec![]);
+        let mut way = Edge::default();
 
         let straight: Vec<_> = way.oriented_geometry(&a, &b).points().collect();
         assert_eq!(straight, vec![(0.0, 0.0), (0.001, 0.0)]);
@@ -856,6 +1003,70 @@ mod tests {
         let ids: Vec<i64> = sub.graph.node_weights().map(|n| n.id).collect();
         assert_eq!(ids, vec![1, 2]);
         assert_eq!(edge_id_pairs(&sub.graph), vec![(1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn edges_of_one_way_share_a_single_tag_allocation() {
+        let nodes = vec![
+            make_node(1, 0.0, 0.0),
+            make_node(2, 0.001, 0.0),
+            make_node(3, 0.002, 0.0),
+        ];
+        let way = make_way_raw(
+            vec![1, 2, 3],
+            vec![
+                ("highway", "residential"),
+                ("name", "Elm"),
+                ("surface", "x"),
+            ],
+        );
+
+        let graph = create_graph(nodes, vec![way], true, false);
+
+        let edges: Vec<&Edge> = graph.edge_weights().collect();
+        assert_eq!(edges.len(), 4);
+        assert!(edges.iter().all(|e| Arc::ptr_eq(&e.tags, &edges[0].tags)));
+        assert_eq!(edges[0].tag("name"), Some("Elm"));
+        assert_eq!(
+            edges[0].tag("surface"),
+            None,
+            "non-routing tags are dropped"
+        );
+        assert!(
+            edges[0].geometry.is_empty(),
+            "straight edges store no points"
+        );
+    }
+
+    #[test]
+    fn node_map_behaves_like_an_ordered_map() {
+        let mut map = NodeMap::with_node_count(5);
+        assert!(map.is_empty());
+        assert_eq!(map.insert(NodeIndex::new(3), "c"), None);
+        assert_eq!(map.insert(NodeIndex::new(1), "a"), None);
+        assert_eq!(map.insert(NodeIndex::new(3), "C"), Some("c"));
+
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(NodeIndex::new(3)), Some(&"C"));
+        assert_eq!(map[NodeIndex::new(1)], "a");
+        assert!(!map.contains_key(NodeIndex::new(0)));
+        assert!(
+            !map.contains_key(NodeIndex::new(99)),
+            "out of range is absent"
+        );
+        let keys: Vec<usize> = map.keys().map(|k| k.index()).collect();
+        assert_eq!(keys, vec![3, 1], "insertion order");
+    }
+
+    #[test]
+    fn node_index_finds_nodes_by_osm_id() {
+        let nodes = vec![make_node(42, 0.0, 0.0), make_node(7, 0.001, 0.0)];
+        let way = make_way_raw(vec![42, 7], vec![("highway", "residential")]);
+        let sg = SpatialGraph::new(create_graph(nodes, vec![way], true, false));
+
+        let idx = sg.node_index(7).unwrap();
+        assert_eq!(sg.graph[idx].id, 7);
+        assert_eq!(sg.node_index(8), None);
     }
 
     #[test]

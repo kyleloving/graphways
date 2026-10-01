@@ -31,7 +31,7 @@ Or add the Rust crate to `Cargo.toml`:
 
 ```toml
 [dependencies]
-graphways = "0.4.0"
+graphways = "0.5.0"
 ```
 
 To build the Python extension from source, install Rust and maturin, then run:

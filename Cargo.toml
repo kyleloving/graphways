@@ -1,6 +1,6 @@
 [package]
 name = "graphways"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/kyleloving/graphways"
@@ -56,4 +56,4 @@ geojson = "0.24.1"
 rstar = "0.12"
 osmpbf = "0.3"
 rayon = "1.8"
-spade = "2.15.1"
+delaunator = "1"

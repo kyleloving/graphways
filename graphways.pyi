@@ -392,9 +392,11 @@ class SpatialGraph:
         max_snap_m: float | None = 100.0,
     ) -> RouteResult:
         """
-        Find the fastest route between two coordinates using A*.
+        Find the fastest route between two coordinates (exactly optimal).
 
         The network type (drive/walk/bike) is inherited from the ``SpatialGraph``.
+        The first call starts building a routing index in the background and
+        answers with A* meanwhile; later calls use the index once it is ready.
 
         Returns
         -------
@@ -403,6 +405,18 @@ class SpatialGraph:
             ``coordinates``, ``cumulative_times_s``, and snap diagnostics.
 
         """
+        ...
+
+    def prepare_routing(self) -> None:
+        """
+        Build the routing index for this graph's network type now and wait
+        for it, so every subsequent ``route()`` takes the fast path. Optional:
+        ``route()`` starts the same build in the background on first use.
+        """
+        ...
+
+    def is_routing_prepared(self) -> bool:
+        """Whether the routing index has been built."""
         ...
 
     def fetch_pois(self, isochrone: IsochroneResult | str) -> PoiCollection:

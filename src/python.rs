@@ -2,6 +2,7 @@
 //! (maturin enables it when building the wheel).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use geojson::{Feature, JsonObject};
@@ -11,7 +12,7 @@ use pyo3::exceptions::{PyLookupError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
 
-use crate::graph::{SnapResult, SpatialGraph, XmlNode, XmlWay};
+use crate::graph::{Edge, NodeMap, SnapResult, SpatialGraph, XmlNode};
 use crate::overpass::NetworkType;
 use crate::{cache, feasibility, geocoding, isochrone, poi, reachability, routing, utils};
 
@@ -78,16 +79,15 @@ fn nearest_of(
 }
 
 /// Edges of `sg` whose endpoints both carry a label, with those labels.
+/// Visits only the labelled nodes' edges, not the whole graph.
 fn labeled_edges<'a, L>(
     sg: &'a SpatialGraph,
-    labels: &'a HashMap<NodeIndex, L>,
-) -> impl Iterator<Item = (EdgeReference<'a, XmlWay>, &'a L, &'a L)> + 'a {
-    sg.graph.edge_references().filter_map(move |edge| {
-        Some((
-            edge,
-            labels.get(&edge.source())?,
-            labels.get(&edge.target())?,
-        ))
+    labels: &'a NodeMap<L>,
+) -> impl Iterator<Item = (EdgeReference<'a, Edge>, &'a L, &'a L)> + 'a {
+    labels.iter().flat_map(move |(&source, source_label)| {
+        sg.graph
+            .edges(source)
+            .filter_map(move |edge| Some((edge, source_label, labels.get(edge.target())?)))
     })
 }
 
@@ -123,7 +123,7 @@ fn point(node: &XmlNode) -> geojson::Value {
     geojson::Value::Point(vec![node.lon, node.lat])
 }
 
-fn edge_line(sg: &SpatialGraph, edge: EdgeReference<'_, XmlWay>) -> geojson::Value {
+fn edge_line(sg: &SpatialGraph, edge: EdgeReference<'_, Edge>) -> geojson::Value {
     let geometry = edge
         .weight()
         .oriented_geometry(&sg.graph[edge.source()], &sg.graph[edge.target()]);
@@ -131,14 +131,9 @@ fn edge_line(sg: &SpatialGraph, edge: EdgeReference<'_, XmlWay>) -> geojson::Val
 }
 
 /// An edge's road class, length, speed and per-mode travel times.
-fn edge_properties(way: &XmlWay) -> JsonObject {
-    let highway = way
-        .tags
-        .iter()
-        .find(|tag| tag.key == "highway")
-        .map_or("unknown", |tag| tag.value.as_str());
+fn edge_properties(way: &Edge) -> JsonObject {
     props([
-        ("highway", highway.into()),
+        ("highway", way.tag("highway").unwrap_or("unknown").into()),
         ("length_m", way.length.into()),
         ("speed_kph", way.speed_kph.into()),
         ("drive_time_s", way.drive_travel_time.into()),
@@ -148,7 +143,7 @@ fn edge_properties(way: &XmlWay) -> JsonObject {
 }
 
 /// `source_node_id` / `target_node_id` properties of an edge.
-fn endpoint_ids(sg: &SpatialGraph, edge: EdgeReference<'_, XmlWay>) -> JsonObject {
+fn endpoint_ids(sg: &SpatialGraph, edge: EdgeReference<'_, Edge>) -> JsonObject {
     props([
         ("source_node_id", sg.graph[edge.source()].id.into()),
         ("target_node_id", sg.graph[edge.target()].id.into()),
@@ -451,6 +446,26 @@ impl PyPoiCollection {
 struct PyGraph {
     sg: SpatialGraph,
     network_type: NetworkType,
+    routing_requested: AtomicBool,
+}
+
+impl PyGraph {
+    fn new(sg: SpatialGraph, network_type: NetworkType) -> Self {
+        Self {
+            sg,
+            network_type,
+            routing_requested: AtomicBool::new(false),
+        }
+    }
+
+    /// Start building the routing index on a background thread, once.
+    /// Routes are answered with A* until it is ready, so no call waits on it.
+    fn prepare_routing_in_background(&self) {
+        if !self.routing_requested.swap(true, Ordering::Relaxed) {
+            let (sg, network_type) = (self.sg.clone(), self.network_type);
+            std::thread::spawn(move || sg.prepare_routing(network_type));
+        }
+    }
 }
 
 #[pymethods]
@@ -460,7 +475,7 @@ impl PyGraph {
     fn from_pbf(path: String, network: String, retain_all: bool) -> PyResult<Self> {
         let network_type = parse_network_type(&network)?;
         let sg = SpatialGraph::from_pbf(path, network_type, Some(retain_all))?;
-        Ok(Self { sg, network_type })
+        Ok(Self::new(sg, network_type))
     }
 
     #[staticmethod]
@@ -469,7 +484,7 @@ impl PyGraph {
         let network_type = parse_network_type(&network)?;
         let sg = SpatialGraph::from_osm(&xml, network_type, Some(retain_all))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self { sg, network_type })
+        Ok(Self::new(sg, network_type))
     }
 
     #[staticmethod]
@@ -490,7 +505,7 @@ impl PyGraph {
             network_type,
             retain_all,
         ))?;
-        Ok(Self { sg, network_type })
+        Ok(Self::new(sg, network_type))
     }
 
     fn node_count(&self) -> usize {
@@ -527,21 +542,40 @@ impl PyGraph {
         })
     }
 
+    /// Build the routing index for this graph's mode now and wait for it.
+    ///
+    /// Optional: the first `route()` call starts the same build in the
+    /// background and routes with A* meanwhile. Call this when you want
+    /// every route to get the fast path from the start.
+    fn prepare_routing(&self, py: Python<'_>) {
+        self.routing_requested.store(true, Ordering::Relaxed);
+        py.allow_threads(|| self.sg.prepare_routing(self.network_type));
+    }
+
+    /// Whether the routing index is built (see `prepare_routing`).
+    fn is_routing_prepared(&self) -> bool {
+        self.sg.is_routing_prepared(self.network_type)
+    }
+
     #[pyo3(signature = (origin, destination, max_snap_m = Some(100.0)))]
     fn route(
         &self,
+        py: Python<'_>,
         origin: (f64, f64),
         destination: (f64, f64),
         max_snap_m: Option<f64>,
     ) -> PyResult<PyRouteResult> {
-        let route = self.sg.route(
-            origin.0,
-            origin.1,
-            destination.0,
-            destination.1,
-            self.network_type,
-            max_snap_m,
-        )?;
+        self.prepare_routing_in_background();
+        let route = py.allow_threads(|| {
+            self.sg.route(
+                origin.0,
+                origin.1,
+                destination.0,
+                destination.1,
+                self.network_type,
+                max_snap_m,
+            )
+        })?;
         Ok(PyRouteResult { route })
     }
 
@@ -684,8 +718,8 @@ impl PyReachableGraph {
         &self.inner.graph
     }
 
-    fn times(&self) -> &HashMap<NodeIndex, f64> {
-        &self.inner.result.distances
+    fn times(&self) -> &NodeMap<f64> {
+        &self.inner.result.times
     }
 }
 
@@ -711,7 +745,7 @@ impl PyReachableGraph {
     }
 
     fn nearest_node(&self, lat: f64, lon: f64) -> Option<(i64, f64, f64)> {
-        nearest_of(self.sg(), self.times().keys().copied(), lat, lon)
+        nearest_of(self.sg(), self.times().keys(), lat, lon)
     }
 
     fn travel_time_to_node_id(&self, node_id: i64) -> Option<f64> {
@@ -842,7 +876,7 @@ impl PyPrismGraph {
         &self.inner.graph
     }
 
-    fn feasible(&self) -> &HashMap<NodeIndex, feasibility::FeasibleNode> {
+    fn feasible(&self) -> &NodeMap<feasibility::FeasibleNode> {
         &self.inner.result.feasible
     }
 }
@@ -887,7 +921,7 @@ impl PyPrismGraph {
     }
 
     fn nearest_node(&self, lat: f64, lon: f64) -> Option<(i64, f64, f64)> {
-        nearest_of(self.sg(), self.feasible().keys().copied(), lat, lon)
+        nearest_of(self.sg(), self.feasible().keys(), lat, lon)
     }
 
     fn slack_at_node_id(&self, node_id: i64) -> Option<f64> {

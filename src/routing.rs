@@ -1,8 +1,18 @@
+//! Point-to-point routing.
+//!
+//! [`SpatialGraph::prepare_routing`] builds a contraction hierarchy for a
+//! mode; after that, routes for that mode are answered by a bidirectional
+//! search over the hierarchy in well under a millisecond on a city graph.
+//! Without it, routing falls back to A* with an admissible straight-line
+//! heuristic. Both return exactly optimal routes.
+
 use petgraph::graph::{EdgeIndex, NodeIndex};
 
+use crate::ch::ContractionHierarchy;
 use crate::error::OsmGraphError;
-use crate::graph::{edge_geometry, SnapResult, SpatialGraph};
+use crate::graph::{edge_geometry, CostField, SnapResult, SpatialGraph};
 use crate::overpass::NetworkType;
+use crate::reachability::EdgeInfo;
 use crate::search::astar;
 use crate::utils::calculate_distance;
 
@@ -22,30 +32,37 @@ pub struct Route {
     pub destination_snap: SnapResult,
 }
 
-/// A* over the network's travel times. The heuristic is the straight-line
-/// distance to the goal at the fastest straight-line speed any edge allows,
-/// which never overestimates (so routes stay optimal) and is far tighter than
-/// a fixed global speed, especially for walking and cycling.
+/// Optimal path edges for a built-in mode: through the contraction hierarchy
+/// when one has been prepared, otherwise A* guided by the straight-line
+/// distance at the fastest speed any edge allows (admissible, so still exact).
 fn shortest_path_edges(
     sg: &SpatialGraph,
     origin: NodeIndex,
     dest: NodeIndex,
     network_type: NetworkType,
 ) -> Option<Vec<EdgeIndex>> {
-    let speed = sg.max_straight_line_speed(network_type);
+    let field = CostField::of(network_type);
+    if let Some(hierarchy) = sg.hierarchy_slot(field).get() {
+        return hierarchy
+            .shortest_path(origin, dest)
+            .map(|(_, edges)| edges);
+    }
+
+    let speed = sg.max_straight_line_speed(field);
     let goal = &sg.graph[dest];
-    let remaining_lower_bound = |node: NodeIndex| {
+    let remaining_lower_bound = |node: u32| {
         if !(speed.is_finite() && speed > 0.0) {
             return 0.0;
         }
-        let n = &sg.graph[node];
+        let n = &sg.graph[NodeIndex::new(node as usize)];
         calculate_distance(n.lat, n.lon, goal.lat, goal.lon) / speed
     };
+    let costs = &sg.slot_costs(field).out;
     astar(
-        &sg.graph,
+        &sg.search_index().out,
         origin,
         dest,
-        |edge| edge.weight().travel_time(network_type),
+        |slot| costs[slot],
         remaining_lower_bound,
     )
     .map(|(_, edges)| edges)
@@ -64,7 +81,7 @@ fn route_geometry_and_times(
     sg: &SpatialGraph,
     origin: NodeIndex,
     edges: &[EdgeIndex],
-    network_type: NetworkType,
+    mut edge_time_of: impl FnMut(EdgeIndex) -> f64,
 ) -> RouteGeometry {
     let mut out = RouteGeometry {
         coordinates: Vec::new(),
@@ -83,7 +100,7 @@ fn route_geometry_and_times(
     for &edge in edges {
         let way = &sg.graph[edge];
         let geometry = edge_geometry(&sg.graph, edge);
-        let edge_time = way.travel_time(network_type);
+        let edge_time = edge_time_of(edge);
         let edge_start_time = out.duration_s;
 
         segment_lengths.clear();
@@ -128,20 +145,18 @@ fn route_geometry_and_times(
     out
 }
 
-pub fn route(
+/// Snap both endpoints, enforcing `max_snap_m` when given.
+fn snap_endpoints(
     sg: &SpatialGraph,
-    origin_lat: f64,
-    origin_lon: f64,
-    dest_lat: f64,
-    dest_lon: f64,
-    network_type: NetworkType,
+    origin: (f64, f64),
+    destination: (f64, f64),
     max_snap_m: Option<f64>,
-) -> Result<Route, OsmGraphError> {
+) -> Result<(SnapResult, SnapResult), OsmGraphError> {
     let origin_snap = sg
-        .snap_point(origin_lat, origin_lon)
+        .snap_point(origin.0, origin.1)
         .ok_or(OsmGraphError::OriginNodeNotFound)?;
     let destination_snap = sg
-        .snap_point(dest_lat, dest_lon)
+        .snap_point(destination.0, destination.1)
         .ok_or(OsmGraphError::DestinationNodeNotFound)?;
     if let Some(max_distance_m) = max_snap_m {
         for (role, snap) in [("origin", origin_snap), ("destination", destination_snap)] {
@@ -154,16 +169,17 @@ pub fn route(
             }
         }
     }
+    Ok((origin_snap, destination_snap))
+}
 
-    let edges = shortest_path_edges(
-        sg,
-        origin_snap.node_index,
-        destination_snap.node_index,
-        network_type,
-    )
-    .ok_or(OsmGraphError::PathNotFound)?;
-
-    let geometry = route_geometry_and_times(sg, origin_snap.node_index, &edges, network_type);
+fn assemble(
+    sg: &SpatialGraph,
+    (origin_snap, destination_snap): (SnapResult, SnapResult),
+    edges: Option<Vec<EdgeIndex>>,
+    edge_time_of: impl FnMut(EdgeIndex) -> f64,
+) -> Result<Route, OsmGraphError> {
+    let edges = edges.ok_or(OsmGraphError::PathNotFound)?;
+    let geometry = route_geometry_and_times(sg, origin_snap.node_index, &edges, edge_time_of);
     Ok(Route {
         coordinates: geometry.coordinates,
         cumulative_times_s: geometry.cumulative_times_s,
@@ -174,11 +190,55 @@ pub fn route(
     })
 }
 
+pub fn route(
+    sg: &SpatialGraph,
+    origin_lat: f64,
+    origin_lon: f64,
+    dest_lat: f64,
+    dest_lon: f64,
+    network_type: NetworkType,
+    max_snap_m: Option<f64>,
+) -> Result<Route, OsmGraphError> {
+    let snaps = snap_endpoints(
+        sg,
+        (origin_lat, origin_lon),
+        (dest_lat, dest_lon),
+        max_snap_m,
+    )?;
+    let edges = shortest_path_edges(sg, snaps.0.node_index, snaps.1.node_index, network_type);
+    assemble(sg, snaps, edges, |edge| {
+        sg.graph[edge].travel_time(network_type)
+    })
+}
+
 impl SpatialGraph {
-    /// Find the shortest route between two lat/lon points.
+    /// Preprocess this graph for fast routing in `network_type`.
     ///
-    /// Snaps both points to the nearest graph nodes, then runs A* to find the
-    /// optimal path. Returns [`OsmGraphError::OriginNodeNotFound`] or
+    /// Builds a contraction hierarchy for the mode's travel times (a few
+    /// seconds on a city graph; once per mode, shared by every clone of this
+    /// graph). Afterwards [`SpatialGraph::route`] for that mode answers in
+    /// well under a millisecond. Routing works without it, just more slowly.
+    pub fn prepare_routing(&self, network_type: NetworkType) {
+        let field = CostField::of(network_type);
+        self.hierarchy_slot(field).get_or_init(|| {
+            ContractionHierarchy::build(self.search_index(), &self.slot_costs(field).out)
+        });
+    }
+
+    /// Whether [`SpatialGraph::prepare_routing`] has run for `network_type`'s
+    /// travel times.
+    pub fn is_routing_prepared(&self, network_type: NetworkType) -> bool {
+        self.hierarchy_slot(CostField::of(network_type))
+            .get()
+            .is_some()
+    }
+
+    /// Find the fastest route between two lat/lon points.
+    ///
+    /// Snaps both points to the nearest graph nodes and finds an optimal
+    /// path, through the contraction hierarchy if
+    /// [`SpatialGraph::prepare_routing`] has run for this mode and with A*
+    /// otherwise. Returns [`OsmGraphError::OriginNodeNotFound`] or
     /// [`OsmGraphError::DestinationNodeNotFound`] if snapping fails, and
     /// [`OsmGraphError::PathNotFound`] if the snapped nodes are disconnected.
     pub fn route(
@@ -200,12 +260,44 @@ impl SpatialGraph {
             max_snap_m,
         )
     }
+
+    /// Find the cheapest route under a caller-supplied edge cost, e.g. live
+    /// traffic or a penalty on certain road classes.
+    ///
+    /// The returned durations are in the closure's units. Costs that are
+    /// negative, NaN or infinite make an edge impassable. Arbitrary costs rule
+    /// out precomputation and distance bounds, so this runs a plain Dijkstra
+    /// search; prefer [`SpatialGraph::route`] for the built-in travel times.
+    pub fn route_with<F>(
+        &self,
+        origin: (f64, f64),
+        destination: (f64, f64),
+        max_snap_m: Option<f64>,
+        mut cost: F,
+    ) -> Result<Route, OsmGraphError>
+    where
+        F: FnMut(EdgeInfo<'_>) -> f64,
+    {
+        let snaps = snap_endpoints(self, origin, destination, max_snap_m)?;
+        let out = &self.search_index().out;
+        let edges = astar(
+            out,
+            snaps.0.node_index,
+            snaps.1.node_index,
+            |slot| cost(EdgeInfo::of(&self.graph, out.edges[slot])),
+            |_| 0.0,
+        )
+        .map(|(_, edges)| edges);
+        assemble(self, snaps, edges, |edge| {
+            cost(EdgeInfo::of(&self.graph, edge.index() as u32))
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{SpatialGraph, XmlNode, XmlTag, XmlWay};
+    use crate::graph::{Edge, SpatialGraph, XmlNode, XmlTag};
     use crate::overpass::NetworkType;
     use petgraph::graph::DiGraph;
 
@@ -218,14 +310,14 @@ mod tests {
         }
     }
 
-    fn make_way(drive_travel_time: f64, length: f64) -> XmlWay {
-        XmlWay {
-            id: 1,
-            nodes: vec![],
+    fn make_way(drive_travel_time: f64, length: f64) -> Edge {
+        Edge {
+            way_id: 1,
             tags: vec![XmlTag {
                 key: "highway".into(),
                 value: "residential".into(),
-            }],
+            }]
+            .into(),
             length,
             speed_kph: 50.0,
             walk_travel_time: length / (5.0 / 3.6),
@@ -235,14 +327,14 @@ mod tests {
         }
     }
 
-    fn make_profile_way(drive_travel_time: f64, walk_travel_time: f64, length: f64) -> XmlWay {
-        XmlWay {
-            id: 1,
-            nodes: vec![],
+    fn make_profile_way(drive_travel_time: f64, walk_travel_time: f64, length: f64) -> Edge {
+        Edge {
+            way_id: 1,
             tags: vec![XmlTag {
                 key: "highway".into(),
                 value: "residential".into(),
-            }],
+            }]
+            .into(),
             length,
             speed_kph: 50.0,
             walk_travel_time,
@@ -256,8 +348,8 @@ mod tests {
         drive_travel_time: f64,
         length: f64,
         geometry: Vec<(f64, f64)>,
-    ) -> XmlWay {
-        XmlWay {
+    ) -> Edge {
+        Edge {
             geometry,
             ..make_way(drive_travel_time, length)
         }
@@ -430,30 +522,70 @@ mod tests {
     }
 
     #[test]
-    fn astar_costs_match_dijkstra_on_fixture() {
+    fn astar_and_ch_costs_match_dijkstra_on_fixture() {
         use crate::reachability::compute_reachability;
 
         for network_type in [NetworkType::Walk, NetworkType::Drive] {
             let sg = SpatialGraph::from_pbf("tests/fixtures/tiny_map.osm.pbf", network_type, None)
                 .unwrap();
+            let prepared = sg.clone();
+            prepared.prepare_routing(network_type);
+            assert!(prepared.is_routing_prepared(network_type));
+            assert!(
+                sg.is_routing_prepared(network_type),
+                "clones share the hierarchy"
+            );
+            let unprepared = SpatialGraph::new((*sg.graph).clone());
+
+            let path_cost = |edges: Vec<EdgeIndex>| {
+                edges
+                    .iter()
+                    .map(|&e| sg.graph[e].travel_time(network_type))
+                    .sum::<f64>()
+            };
             for origin in sg.graph.node_indices() {
-                let exact =
-                    compute_reachability(&sg.graph, origin, f64::INFINITY, network_type).distances;
+                let exact = compute_reachability(&sg, origin, f64::INFINITY, network_type).times;
                 for dest in sg.graph.node_indices() {
-                    let astar = shortest_path_edges(&sg, origin, dest, network_type).map(|edges| {
-                        edges
-                            .iter()
-                            .map(|&e| sg.graph[e].travel_time(network_type))
-                            .sum::<f64>()
-                    });
-                    match (astar, exact.get(&dest)) {
-                        (Some(a), Some(&d)) => assert!((a - d).abs() < 1e-9, "{a} vs {d}"),
-                        (None, None) => {}
-                        other => panic!("A* and Dijkstra disagree on reachability: {other:?}"),
+                    let want = exact.get(dest).copied();
+                    for graph in [&prepared, &unprepared] {
+                        let got =
+                            shortest_path_edges(graph, origin, dest, network_type).map(path_cost);
+                        match (got, want) {
+                            (Some(a), Some(d)) => assert!((a - d).abs() < 1e-9, "{a} vs {d}"),
+                            (None, None) => {}
+                            other => panic!("search disagrees with Dijkstra: {other:?}"),
+                        }
                     }
                 }
             }
         }
+    }
+
+    #[test]
+    fn route_with_uses_custom_costs() {
+        let mut g = DiGraph::new();
+        let a = g.add_node(make_node(1, 0.0, 0.0));
+        let b = g.add_node(make_node(2, 0.001, 0.0));
+        let c = g.add_node(make_node(3, 0.002, 0.0));
+        g.add_edge(a, c, make_way(10.0, 100.0));
+        g.add_edge(a, b, make_way(30.0, 50.0));
+        g.add_edge(b, c, make_way(30.0, 50.0));
+        let sg = SpatialGraph::new(g);
+
+        // Penalise the direct edge tenfold: the two-hop path wins.
+        let route = sg
+            .route_with((0.0, 0.0), (0.002, 0.0), None, |e| {
+                let base = e.weight.drive_travel_time;
+                if e.source == a && e.target == c {
+                    base * 10.0
+                } else {
+                    base
+                }
+            })
+            .unwrap();
+
+        assert_eq!(route.coordinates.len(), 3);
+        assert_eq!(route.duration_s, 60.0);
     }
 
     #[test]

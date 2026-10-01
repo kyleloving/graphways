@@ -1,234 +1,441 @@
-//! Shortest-path kernels shared by routing, reachability and feasibility.
+//! Shortest-path kernels shared by routing, reachability, feasibility and the
+//! contraction hierarchy.
 //!
-//! All searches label nodes through dense `Vec`s indexed by `NodeIndex`
-//! rather than `HashMap`s. Graph node indices are contiguous, so this turns
-//! every relaxation into a bounds-checked array access instead of a hash and
-//! probe, which is where most of the time in a city-scale search used to go.
+//! Searches run on [`SearchIndex`], a compact array-based (CSR) copy of the
+//! graph's adjacency kept next to the petgraph graph. A relaxation touches a
+//! few small arrays (neighbour, cost) instead of chasing petgraph's
+//! linked edge lists through ~100-byte edge records. Per-mode costs are laid
+//! out in adjacency order and built on first use.
+//!
+//! Point-to-point searches borrow their scratch arrays from a per-thread pool
+//! and reset only the entries they touched, so a query costs O(nodes visited)
+//! rather than O(graph size).
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::ops::Range;
+use std::sync::OnceLock;
 
-use petgraph::graph::{DiGraph, EdgeIndex, EdgeReference, NodeIndex};
-use petgraph::visit::EdgeRef;
-use petgraph::Direction;
+use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
 
-/// Binary-heap entry that pops the *smallest* `key` first.
+use crate::graph::NodeMap;
+
+/// Adjacency in compressed sparse row form, for one direction.
 ///
-/// Only `key` participates in the ordering; NaN keys never enter the heap
-/// because edge costs are validated before they are pushed.
-#[derive(Clone, Copy, Debug)]
-struct MinScored<T> {
-    key: f64,
-    item: T,
+/// Slots `range(u)` hold the arcs of node `u`: `neighbors[slot]` is the node
+/// at the other end and `edges[slot]` the petgraph edge index.
+pub(crate) struct Adjacency {
+    offsets: Vec<u32>,
+    pub(crate) neighbors: Vec<u32>,
+    pub(crate) edges: Vec<u32>,
 }
 
-impl<T> PartialEq for MinScored<T> {
+impl Adjacency {
+    /// Group `arcs` = `(owner, neighbor, edge)` by owner with a counting sort.
+    /// Arcs keep their relative order within each owner.
+    fn build(node_count: usize, arcs: &[(u32, u32, u32)]) -> Self {
+        let mut offsets = vec![0u32; node_count + 1];
+        for &(owner, _, _) in arcs {
+            offsets[owner as usize + 1] += 1;
+        }
+        for i in 0..node_count {
+            offsets[i + 1] += offsets[i];
+        }
+        let mut cursor = offsets.clone();
+        let mut neighbors = vec![0u32; arcs.len()];
+        let mut edges = vec![0u32; arcs.len()];
+        for &(owner, neighbor, edge) in arcs {
+            let slot = &mut cursor[owner as usize];
+            neighbors[*slot as usize] = neighbor;
+            edges[*slot as usize] = edge;
+            *slot += 1;
+        }
+        Self {
+            offsets,
+            neighbors,
+            edges,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn range(&self, node: u32) -> Range<usize> {
+        self.offsets[node as usize] as usize..self.offsets[node as usize + 1] as usize
+    }
+
+    pub(crate) fn node_count(&self) -> usize {
+        self.offsets.len() - 1
+    }
+}
+
+/// Edge costs for one mode, one value per adjacency slot.
+pub(crate) struct SlotCosts {
+    pub(crate) out: Vec<f64>,
+    pub(crate) inc: Vec<f64>,
+}
+
+/// Forward and backward adjacency of a graph, plus per-mode slot costs.
+pub(crate) struct SearchIndex {
+    /// Arcs grouped by source; neighbour = target.
+    pub(crate) out: Adjacency,
+    /// Arcs grouped by target; neighbour = source.
+    pub(crate) inc: Adjacency,
+    costs: [OnceLock<SlotCosts>; 3],
+}
+
+impl SearchIndex {
+    pub(crate) fn new<N, E>(graph: &DiGraph<N, E>) -> Self {
+        let raw = graph.raw_edges();
+        let mut arcs: Vec<(u32, u32, u32)> = raw
+            .iter()
+            .enumerate()
+            .map(|(id, e)| {
+                (
+                    e.source().index() as u32,
+                    e.target().index() as u32,
+                    id as u32,
+                )
+            })
+            .collect();
+        let out = Adjacency::build(graph.node_count(), &arcs);
+        for arc in &mut arcs {
+            *arc = (arc.1, arc.0, arc.2);
+        }
+        let inc = Adjacency::build(graph.node_count(), &arcs);
+        Self {
+            out,
+            inc,
+            costs: Default::default(),
+        }
+    }
+
+    /// Slot costs for mode `field`, computing them with `edge_cost` the first
+    /// time they are asked for.
+    pub(crate) fn costs(&self, field: usize, edge_cost: impl Fn(EdgeIndex) -> f64) -> &SlotCosts {
+        self.costs[field].get_or_init(|| {
+            let lay_out = |adjacency: &Adjacency| {
+                adjacency
+                    .edges
+                    .iter()
+                    .map(|&edge| edge_cost(EdgeIndex::new(edge as usize)))
+                    .collect()
+            };
+            SlotCosts {
+                out: lay_out(&self.out),
+                inc: lay_out(&self.inc),
+            }
+        })
+    }
+
+    pub(crate) fn node_count(&self) -> usize {
+        self.out.node_count()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Heap entries and scratch space
+// ---------------------------------------------------------------------------
+
+/// Binary-heap entry that pops the smallest `key` first.
+///
+/// `cost` is the path cost carried alongside (equal to `key` for Dijkstra,
+/// `key - heuristic` for A*). NaN never enters: costs are validated first.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeapEntry {
+    pub(crate) key: f64,
+    pub(crate) cost: f64,
+    pub(crate) node: u32,
+}
+
+impl PartialEq for HeapEntry {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
     }
 }
 
-impl<T> Eq for MinScored<T> {}
+impl Eq for HeapEntry {}
 
-impl<T> PartialOrd for MinScored<T> {
+impl PartialOrd for HeapEntry {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<T> Ord for MinScored<T> {
+impl Ord for HeapEntry {
     fn cmp(&self, other: &Self) -> Ordering {
         other.key.total_cmp(&self.key)
     }
 }
 
-/// Dijkstra and A* treat non-finite or negative edge costs as impassable.
+/// Searches treat non-finite or negative edge costs as impassable.
 #[inline]
-fn usable(cost: f64) -> bool {
+pub(crate) fn usable(cost: f64) -> bool {
     cost.is_finite() && cost >= 0.0
 }
 
-/// Travel-time labels produced by [`dijkstra`].
-pub(crate) struct Labels {
-    /// Cost from the search root, `f64::INFINITY` when unreached.
+pub(crate) const NONE: u32 = u32::MAX;
+
+/// Per-node labels for one search, reset in O(touched) after use.
+#[derive(Default)]
+pub(crate) struct Workspace {
     dist: Vec<f64>,
-    /// Every node with a finite label, in the order it was first reached.
-    reached: Vec<NodeIndex>,
+    /// Predecessor node and the arc (edge or slot, caller's choice) used.
+    pred_node: Vec<u32>,
+    pred_arc: Vec<u32>,
+    settled: Vec<bool>,
+    touched: Vec<u32>,
+    pub(crate) heap: BinaryHeap<HeapEntry>,
+    /// Node marks valid for the current `generation` only, so starting a new
+    /// set of marks is O(1).
+    marks: Vec<u32>,
+    generation: u32,
 }
 
-impl Labels {
+impl Workspace {
+    fn fit(&mut self, node_count: usize) {
+        if self.dist.len() < node_count {
+            self.dist.resize(node_count, f64::INFINITY);
+            self.pred_node.resize(node_count, NONE);
+            self.pred_arc.resize(node_count, NONE);
+            self.settled.resize(node_count, false);
+            self.marks.resize(node_count, 0);
+        }
+    }
+
+    /// Forget all marks.
+    pub(crate) fn clear_marks(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.marks.fill(0);
+            self.generation = 1;
+        }
+    }
+
+    /// Mark `node`; returns whether it was unmarked before.
     #[inline]
-    pub(crate) fn get(&self, node: NodeIndex) -> Option<f64> {
-        self.dist
-            .get(node.index())
-            .copied()
-            .filter(|cost| cost.is_finite())
+    pub(crate) fn mark(&mut self, node: u32) -> bool {
+        let generation = self.generation;
+        std::mem::replace(&mut self.marks[node as usize], generation) != generation
     }
 
-    /// Reached nodes and their final cost, in discovery order.
-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = (NodeIndex, f64)> + '_ {
-        self.reached
-            .iter()
-            .map(|&node| (node, self.dist[node.index()]))
+    #[inline]
+    pub(crate) fn is_marked(&self, node: u32) -> bool {
+        self.marks[node as usize] == self.generation
+    }
+
+    #[inline]
+    pub(crate) fn dist(&self, node: u32) -> f64 {
+        self.dist[node as usize]
+    }
+
+    #[inline]
+    pub(crate) fn pred(&self, node: u32) -> (u32, u32) {
+        (self.pred_node[node as usize], self.pred_arc[node as usize])
+    }
+
+    /// Lower `node`'s label to `cost` if that improves it; returns whether it did.
+    #[inline]
+    pub(crate) fn relax(&mut self, node: u32, cost: f64, pred_node: u32, pred_arc: u32) -> bool {
+        let i = node as usize;
+        if cost < self.dist[i] {
+            if self.dist[i] == f64::INFINITY {
+                self.touched.push(node); // first label since the last reset
+            }
+            self.dist[i] = cost;
+            self.pred_node[i] = pred_node;
+            self.pred_arc[i] = pred_arc;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mark `node` settled; returns false if it already was.
+    #[inline]
+    pub(crate) fn settle(&mut self, node: u32) -> bool {
+        !std::mem::replace(&mut self.settled[node as usize], true)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        for &node in &self.touched {
+            let i = node as usize;
+            self.dist[i] = f64::INFINITY;
+            self.pred_node[i] = NONE;
+            self.pred_arc[i] = NONE;
+            self.settled[i] = false;
+        }
+        self.touched.clear();
+        self.heap.clear();
     }
 }
 
-/// One-to-many Dijkstra bounded by `max_cost` (inclusive).
+thread_local! {
+    static POOL: RefCell<Vec<Workspace>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A workspace on loan from this thread's pool; reset and returned on drop.
+pub(crate) struct PooledWorkspace(Option<Workspace>);
+
+impl std::ops::Deref for PooledWorkspace {
+    type Target = Workspace;
+    fn deref(&self) -> &Workspace {
+        self.0.as_ref().expect("present until drop")
+    }
+}
+
+impl std::ops::DerefMut for PooledWorkspace {
+    fn deref_mut(&mut self) -> &mut Workspace {
+        self.0.as_mut().expect("present until drop")
+    }
+}
+
+impl Drop for PooledWorkspace {
+    fn drop(&mut self) {
+        if let Some(mut workspace) = self.0.take() {
+            workspace.reset();
+            // Ignore failure during thread teardown.
+            let _ = POOL.try_with(|pool| pool.borrow_mut().push(workspace));
+        }
+    }
+}
+
+/// Borrow a clean workspace sized for `node_count` nodes.
+pub(crate) fn workspace(node_count: usize) -> PooledWorkspace {
+    let mut workspace = POOL
+        .try_with(|pool| pool.borrow_mut().pop())
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    workspace.fit(node_count);
+    PooledWorkspace(Some(workspace))
+}
+
+// ---------------------------------------------------------------------------
+// Searches
+// ---------------------------------------------------------------------------
+
+/// One-to-many Dijkstra over `adjacency`, bounded by `max_cost` (inclusive).
 ///
-/// `direction` selects which way edges are followed: `Outgoing` computes
-/// `cost(start → v)`, `Incoming` computes `cost(v → start)` without building
-/// a reversed graph. In both cases `cost` receives the edge in its original
-/// orientation.
-pub(crate) fn dijkstra<N, E, F>(
-    graph: &DiGraph<N, E>,
+/// `cost(slot)` prices the arc in adjacency slot `slot`. Pass the forward
+/// adjacency for `cost(start → v)` and the backward one for `cost(v → start)`.
+/// The result lists every reached node in settle order, i.e. sorted by cost.
+pub(crate) fn dijkstra(
+    adjacency: &Adjacency,
     start: NodeIndex,
     max_cost: f64,
-    direction: Direction,
-    mut cost: F,
-) -> Labels
-where
-    F: FnMut(EdgeReference<'_, E>) -> f64,
-{
-    let mut labels = Labels {
-        dist: vec![f64::INFINITY; graph.node_count()],
-        reached: Vec::new(),
-    };
-    if start.index() >= graph.node_count() || max_cost.is_nan() || max_cost < 0.0 {
-        return labels;
+    mut cost: impl FnMut(usize) -> f64,
+) -> NodeMap<f64> {
+    let node_count = adjacency.node_count();
+    let mut result = NodeMap::with_node_count(node_count);
+    if start.index() >= node_count || max_cost.is_nan() || max_cost < 0.0 {
+        return result;
     }
 
-    let mut heap = BinaryHeap::new();
-    labels.dist[start.index()] = 0.0;
-    labels.reached.push(start);
-    heap.push(MinScored {
+    let mut ws = workspace(node_count);
+    let start = start.index() as u32;
+    ws.relax(start, 0.0, NONE, NONE);
+    ws.heap.push(HeapEntry {
         key: 0.0,
-        item: start,
+        cost: 0.0,
+        node: start,
     });
 
-    while let Some(MinScored {
-        key: node_cost,
-        item: node,
-    }) = heap.pop()
+    while let Some(HeapEntry {
+        cost: node_cost,
+        node,
+        ..
+    }) = ws.heap.pop()
     {
-        if node_cost > max_cost {
-            break;
-        }
-        if node_cost > labels.dist[node.index()] {
+        if node_cost > ws.dist(node) || !ws.settle(node) {
             continue; // stale heap entry
         }
+        result.insert(NodeIndex::new(node as usize), node_cost);
 
-        for edge in graph.edges_directed(node, direction) {
-            let edge_cost = cost(edge);
+        for slot in adjacency.range(node) {
+            let edge_cost = cost(slot);
             if !usable(edge_cost) {
                 continue;
             }
             let next_cost = node_cost + edge_cost;
-            if next_cost > max_cost {
-                continue;
-            }
-            let next = match direction {
-                Direction::Outgoing => edge.target(),
-                Direction::Incoming => edge.source(),
-            };
-            let slot = &mut labels.dist[next.index()];
-            if next_cost < *slot {
-                if slot.is_infinite() {
-                    labels.reached.push(next);
-                }
-                *slot = next_cost;
-                heap.push(MinScored {
+            let next = adjacency.neighbors[slot];
+            if next_cost <= max_cost && ws.relax(next, next_cost, node, slot as u32) {
+                ws.heap.push(HeapEntry {
                     key: next_cost,
-                    item: next,
+                    cost: next_cost,
+                    node: next,
                 });
             }
         }
     }
 
-    labels
+    result
 }
 
-/// Point-to-point A* search.
+/// Point-to-point A* over the forward adjacency `out`.
 ///
 /// `heuristic` must never overestimate the remaining cost to `goal`
-/// (pass `|_| 0.0` for plain Dijkstra). Returns the total cost and the edges
-/// of the optimal path in travel order.
-pub(crate) fn astar<N, E, F, H>(
-    graph: &DiGraph<N, E>,
+/// (`|_| 0.0` gives plain Dijkstra). Returns the total cost and the petgraph
+/// edges of an optimal path in travel order.
+pub(crate) fn astar(
+    out: &Adjacency,
     start: NodeIndex,
     goal: NodeIndex,
-    mut cost: F,
-    mut heuristic: H,
-) -> Option<(f64, Vec<EdgeIndex>)>
-where
-    F: FnMut(EdgeReference<'_, E>) -> f64,
-    H: FnMut(NodeIndex) -> f64,
-{
-    let node_count = graph.node_count();
+    mut cost: impl FnMut(usize) -> f64,
+    mut heuristic: impl FnMut(u32) -> f64,
+) -> Option<(f64, Vec<EdgeIndex>)> {
+    let node_count = out.node_count();
     if start.index() >= node_count || goal.index() >= node_count {
         return None;
     }
 
-    let mut best = vec![f64::INFINITY; node_count];
-    let mut predecessor = vec![EdgeIndex::end(); node_count];
-    let mut heap = BinaryHeap::new();
-
-    best[start.index()] = 0.0;
-    heap.push(MinScored {
+    let mut ws = workspace(node_count);
+    let (start, goal) = (start.index() as u32, goal.index() as u32);
+    ws.relax(start, 0.0, NONE, NONE);
+    ws.heap.push(HeapEntry {
         key: heuristic(start),
-        item: (0.0, start),
+        cost: 0.0,
+        node: start,
     });
 
-    while let Some(MinScored {
-        item: (node_cost, node),
+    while let Some(HeapEntry {
+        cost: node_cost,
+        node,
         ..
-    }) = heap.pop()
+    }) = ws.heap.pop()
     {
-        if node_cost > best[node.index()] {
+        if node_cost > ws.dist(node) || !ws.settle(node) {
             continue; // stale heap entry
         }
         if node == goal {
-            return Some((node_cost, unwind(graph, &predecessor, start, goal)));
+            let mut edges = Vec::new();
+            let mut current = goal;
+            while current != start {
+                let (pred, slot) = ws.pred(current);
+                edges.push(EdgeIndex::new(out.edges[slot as usize] as usize));
+                current = pred;
+            }
+            edges.reverse();
+            return Some((node_cost, edges));
         }
 
-        for edge in graph.edges(node) {
-            let edge_cost = cost(edge);
+        for slot in out.range(node) {
+            let edge_cost = cost(slot);
             if !usable(edge_cost) {
                 continue;
             }
-            let next = edge.target();
+            let next = out.neighbors[slot];
             let next_cost = node_cost + edge_cost;
-            if next_cost < best[next.index()] {
-                best[next.index()] = next_cost;
-                predecessor[next.index()] = edge.id();
-                heap.push(MinScored {
+            if ws.relax(next, next_cost, node, slot as u32) {
+                ws.heap.push(HeapEntry {
                     key: next_cost + heuristic(next),
-                    item: (next_cost, next),
+                    cost: next_cost,
+                    node: next,
                 });
             }
         }
     }
 
     None
-}
-
-fn unwind<N, E>(
-    graph: &DiGraph<N, E>,
-    predecessor: &[EdgeIndex],
-    start: NodeIndex,
-    goal: NodeIndex,
-) -> Vec<EdgeIndex> {
-    let mut edges = Vec::new();
-    let mut current = goal;
-    while current != start {
-        let edge = predecessor[current.index()];
-        edges.push(edge);
-        current = graph
-            .edge_endpoints(edge)
-            .expect("predecessor edges belong to the searched graph")
-            .0;
-    }
-    edges.reverse();
-    edges
 }
 
 #[cfg(test)]
@@ -247,45 +454,63 @@ mod tests {
         (g, [a, b, c, d])
     }
 
+    fn weights(g: &DiGraph<(), f64>, adjacency: &Adjacency) -> Vec<f64> {
+        adjacency
+            .edges
+            .iter()
+            .map(|&e| g[EdgeIndex::new(e as usize)])
+            .collect()
+    }
+
     #[test]
     fn dijkstra_forward_and_backward_agree_on_pair_costs() {
         let (g, [a, b, c, d]) = diamond();
-        let forward = dijkstra(&g, a, f64::INFINITY, Direction::Outgoing, |e| *e.weight());
-        let backward = dijkstra(&g, d, f64::INFINITY, Direction::Incoming, |e| *e.weight());
+        let index = SearchIndex::new(&g);
+        let (out_w, inc_w) = (weights(&g, &index.out), weights(&g, &index.inc));
+        let forward = dijkstra(&index.out, a, f64::INFINITY, |s| out_w[s]);
+        let backward = dijkstra(&index.inc, d, f64::INFINITY, |s| inc_w[s]);
 
-        assert_eq!(forward.get(d), Some(2.0));
-        assert_eq!(backward.get(a), Some(2.0));
-        assert_eq!(backward.get(c), Some(0.5));
-        assert_eq!(forward.get(b), Some(1.0));
-        assert_eq!(forward.iter().len(), 4);
+        assert_eq!(forward.get(d), Some(&2.0));
+        assert_eq!(backward.get(a), Some(&2.0));
+        assert_eq!(backward.get(c), Some(&0.5));
+        assert_eq!(forward.get(b), Some(&1.0));
+        assert_eq!(forward.len(), 4);
+        let costs: Vec<f64> = forward.values().copied().collect();
+        assert!(costs.windows(2).all(|w| w[0] <= w[1]), "settle order");
     }
 
     #[test]
     fn dijkstra_bound_is_inclusive_and_skips_bad_costs() {
         let (g, [a, b, c, d]) = diamond();
-        let bounded = dijkstra(&g, a, 1.0, Direction::Outgoing, |e| *e.weight());
-        assert_eq!(bounded.get(b), Some(1.0));
+        let index = SearchIndex::new(&g);
+        let w = weights(&g, &index.out);
+        let bounded = dijkstra(&index.out, a, 1.0, |s| w[s]);
+        assert_eq!(bounded.get(b), Some(&1.0));
         assert_eq!(bounded.get(c), None);
         assert_eq!(bounded.get(d), None);
 
-        let nan = dijkstra(&g, a, f64::INFINITY, Direction::Outgoing, |_| f64::NAN);
-        assert_eq!(nan.iter().len(), 1);
+        let nan = dijkstra(&index.out, a, f64::INFINITY, |_| f64::NAN);
+        assert_eq!(nan.len(), 1);
     }
 
     #[test]
-    fn astar_returns_cheapest_edge_sequence() {
+    fn astar_returns_cheapest_edge_sequence_and_pool_resets() {
         let (g, [a, b, _, d]) = diamond();
-        let (cost, edges) = astar(&g, a, d, |e| *e.weight(), |_| 0.0).unwrap();
-        assert_eq!(cost, 2.0);
-        let nodes: Vec<_> = edges
-            .iter()
-            .map(|&e| g.edge_endpoints(e).unwrap().1)
-            .collect();
-        assert_eq!(nodes, vec![b, d]);
-        assert_eq!(astar(&g, d, a, |e| *e.weight(), |_| 0.0), None);
-        assert_eq!(
-            astar(&g, a, a, |e| *e.weight(), |_| 0.0),
-            Some((0.0, vec![]))
-        );
+        let index = SearchIndex::new(&g);
+        let w = weights(&g, &index.out);
+        for _ in 0..3 {
+            let (cost, edges) = astar(&index.out, a, d, |s| w[s], |_| 0.0).unwrap();
+            assert_eq!(cost, 2.0);
+            let nodes: Vec<_> = edges
+                .iter()
+                .map(|&e| g.edge_endpoints(e).unwrap().1)
+                .collect();
+            assert_eq!(nodes, vec![b, d]);
+            assert_eq!(astar(&index.out, d, a, |s| w[s], |_| 0.0), None);
+            assert_eq!(
+                astar(&index.out, a, a, |s| w[s], |_| 0.0),
+                Some((0.0, vec![]))
+            );
+        }
     }
 }

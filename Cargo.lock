@@ -176,6 +176,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "delaunator"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e1ee323c1275374f7e612d3724d12707079fb6a2117349fe144def656f5a880"
+dependencies = [
+ "robust",
+]
+
+[[package]]
 name = "earcutr"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -378,8 +387,9 @@ checksum = "4271d37baee1b8c7e4b708028c57d816cf9d2434acb33a549475f78c181f6253"
 
 [[package]]
 name = "graphways"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
+ "delaunator",
  "geo",
  "geojson",
  "osmpbf",
@@ -390,7 +400,6 @@ dependencies = [
  "reqwest",
  "rstar",
  "serde",
- "spade",
  "tokio",
 ]
 

@@ -153,7 +153,7 @@ pub(crate) async fn fetch_pois_within(polygon: &Polygon<f64>) -> Result<Vec<Poi>
 /// 1. Derives a bounding box from the origin node and `max_cost`.
 /// 2. Fetches POI nodes from Overpass within that box (cached).
 /// 3. Snaps each POI to its nearest graph node via the spatial index.
-/// 4. Keeps only POIs whose snapped node appears in `reachability.distances`.
+/// 4. Keeps only POIs whose snapped node appears in `reachability.times`.
 ///
 /// The `travel_time_s` on each [`ReachablePoi`] is the Dijkstra distance to
 /// the snapped node — the same value that drove the isochrone — not a
@@ -183,7 +183,7 @@ pub(crate) async fn fetch_pois_within_reachability(
                 Some(snaps) => snaps.get(&n.id)?.snap,
                 None => sg.snap_point(n.lat, n.lon)?,
             };
-            let travel_time_s = *reachability.distances.get(&snap.node_index)?;
+            let travel_time_s = *reachability.times.get(snap.node_index)?;
             Some(ReachablePoi {
                 poi: Poi {
                     id: n.id,

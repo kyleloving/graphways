@@ -15,6 +15,7 @@ pub mod utils;
 
 // Internal implementation details; not part of the public Rust API.
 mod cache;
+mod ch;
 mod search;
 mod simplify;
 

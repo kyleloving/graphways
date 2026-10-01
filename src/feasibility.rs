@@ -34,16 +34,12 @@
 //!   cannot be completed within the budget at all, giving callers a clear
 //!   signal to surface to users rather than an opaque empty result.
 
-use std::collections::HashMap;
-
 use geo::{ConvexHull, MultiPoint, Polygon};
-use petgraph::graph::{DiGraph, NodeIndex};
-use petgraph::visit::EdgeRef;
-use petgraph::Direction;
+use petgraph::graph::NodeIndex;
 
-use crate::graph::{node_to_latlon, SpatialGraph, XmlNode, XmlWay};
+use crate::graph::{node_to_latlon, CostField, NodeMap, RoadGraph, SpatialGraph};
 use crate::overpass::NetworkType;
-use crate::reachability::EdgeInfo;
+use crate::reachability::{induced_edge_count, EdgeInfo};
 use crate::search::{astar, dijkstra};
 
 // ---------------------------------------------------------------------------
@@ -75,9 +71,9 @@ pub struct FeasibilityResult {
     /// This is the floor: `available_time` must be ≥ this for any node to be
     /// feasible. Stored here so callers can report headroom to users.
     pub direct_time: f64,
-    /// Every node whose `inbound + outbound ≤ available_time`, keyed by
-    /// `NodeIndex`. Nodes that are unreachable in either direction are absent.
-    pub feasible: HashMap<NodeIndex, FeasibleNode>,
+    /// Every node whose `inbound + outbound ≤ available_time`, in increasing
+    /// order of inbound time. Nodes unreachable in either direction are absent.
+    pub feasible: NodeMap<FeasibleNode>,
 }
 
 /// Reason a feasibility query cannot produce any results.
@@ -136,91 +132,72 @@ pub struct PrismGraph {
 // Core computation
 // ---------------------------------------------------------------------------
 
-/// Compute which nodes are reachable from `origin` *and* can reach
-/// `destination` within `available_time` seconds.
-///
-/// Returns `Err(InfeasibleReason::NoPathExists)` when origin and destination
-/// are disconnected, and `Err(InfeasibleReason::BudgetTooTight)` when the
-/// direct travel time already exceeds `available_time`. Both cases carry
-/// enough information for callers to produce a meaningful error message.
-///
-/// # Arguments
-///
-/// * `graph`          – The road network.
-/// * `origin`         – Starting node index.
-/// * `destination`    – Ending node index.
-/// * `available_time` – Total time budget in seconds. Subtract any activity
-///   duration or buffer *before* calling.
-/// * `network_type`   – Determines which edge weight (walk / bike / drive) is used.
-///
-/// Compute two-sided feasibility with a caller-supplied edge cost.
-///
-/// The closure is invoked once per edge relaxation in *both* the forward and
-/// reverse Dijkstra searches. In each invocation the [`EdgeInfo`] reflects the
-/// edge's *original* graph orientation — `source` and `target` are not flipped
-/// for the reverse search — so cost models keyed by edge identity, density, or
-/// node position see a consistent view in both directions.
-///
-/// Use this when injecting density-based traffic penalties, externally-supplied
-/// traffic multipliers, or any custom cost. Costs must be non-negative and
-/// finite or Dijkstra's invariants break.
-pub fn compute_feasibility_with<F>(
-    graph: &DiGraph<XmlNode, XmlWay>,
+/// Which adjacency an edge-cost callback is pricing a slot of.
+#[derive(Clone, Copy)]
+enum Side {
+    Out,
+    In,
+}
+
+/// Two-sided feasibility with `price(side, slot)` giving each arc's cost.
+fn feasibility(
+    sg: &SpatialGraph,
     origin: NodeIndex,
     destination: NodeIndex,
     available_time: f64,
-    mut cost: F,
-) -> Result<FeasibilityResult, InfeasibleReason>
-where
-    F: FnMut(EdgeInfo<'_>) -> f64,
-{
+    mut price: impl FnMut(Side, usize) -> f64,
+) -> Result<FeasibilityResult, InfeasibleReason> {
+    let index = sg.search_index();
+
     // Forward search: origin → every node within budget.
-    let forward = dijkstra(graph, origin, available_time, Direction::Outgoing, |e| {
-        cost(e.into())
+    let forward = dijkstra(&index.out, origin, available_time, |slot| {
+        price(Side::Out, slot)
     });
 
     let direct_time = match forward.get(destination) {
-        Some(time) => time,
+        Some(&time) => time,
         // Out of budget or disconnected: one targeted search tells which.
         None => {
-            return Err(
-                match astar(graph, origin, destination, |e| cost(e.into()), |_| 0.0) {
-                    Some((direct_time, _)) => InfeasibleReason::BudgetTooTight {
-                        direct_time,
-                        available_time,
-                    },
-                    None => InfeasibleReason::NoPathExists,
+            let direct = astar(
+                &index.out,
+                origin,
+                destination,
+                |slot| price(Side::Out, slot),
+                |_| 0.0,
+            );
+            return Err(match direct {
+                Some((direct_time, _)) => InfeasibleReason::BudgetTooTight {
+                    direct_time,
+                    available_time,
                 },
-            )
+                None => InfeasibleReason::NoPathExists,
+            });
         }
     };
 
     // Reverse search: every node → destination, following incoming edges.
-    // The closure still sees each edge in its original orientation.
-    let backward = dijkstra(
-        graph,
-        destination,
-        available_time,
-        Direction::Incoming,
-        |e| cost(e.into()),
-    );
+    let backward = dijkstra(&index.inc, destination, available_time, |slot| {
+        price(Side::In, slot)
+    });
 
     // Intersect: keep nodes present in both searches whose combined cost fits.
-    let feasible = forward
-        .iter()
-        .filter_map(|(node, inbound)| {
-            let outbound = backward.get(node)?;
-            let total = inbound + outbound;
-            (total <= available_time).then_some((
+    let mut feasible = NodeMap::with_node_count(index.node_count());
+    for (&node, &inbound) in &forward {
+        let Some(&outbound) = backward.get(node) else {
+            continue;
+        };
+        let total = inbound + outbound;
+        if total <= available_time {
+            feasible.insert(
                 node,
                 FeasibleNode {
                     inbound_time: inbound,
                     outbound_time: outbound,
                     slack: available_time - total,
                 },
-            ))
-        })
-        .collect();
+            );
+        }
+    }
 
     Ok(FeasibilityResult {
         origin,
@@ -231,21 +208,64 @@ where
     })
 }
 
+/// Compute two-sided feasibility with a caller-supplied edge cost.
+///
+/// Finds every node reachable from `origin` that can still reach
+/// `destination` within `available_time` seconds (subtract any activity
+/// duration or buffer *before* calling). Returns
+/// `Err(InfeasibleReason::NoPathExists)` when origin and destination are
+/// disconnected, and `Err(InfeasibleReason::BudgetTooTight)` when the direct
+/// travel time already exceeds `available_time`.
+///
+/// The closure is invoked once per edge relaxation in *both* the forward and
+/// reverse searches. In each invocation the [`EdgeInfo`] reflects the edge's
+/// *original* graph orientation — `source` and `target` are not flipped for
+/// the reverse search — so cost models keyed by edge identity, density, or
+/// node position see a consistent view in both directions. Costs that are
+/// negative, NaN or infinite make an edge impassable.
+pub fn compute_feasibility_with<F>(
+    sg: &SpatialGraph,
+    origin: NodeIndex,
+    destination: NodeIndex,
+    available_time: f64,
+    mut cost: F,
+) -> Result<FeasibilityResult, InfeasibleReason>
+where
+    F: FnMut(EdgeInfo<'_>) -> f64,
+{
+    let index = sg.search_index();
+    feasibility(sg, origin, destination, available_time, |side, slot| {
+        let adjacency = match side {
+            Side::Out => &index.out,
+            Side::In => &index.inc,
+        };
+        cost(EdgeInfo::of(&sg.graph, adjacency.edges[slot]))
+    })
+}
+
 /// Compute two-sided feasibility using the precomputed walk/bike/drive travel
 /// time on each edge.
 ///
-/// Convenience wrapper around [`compute_feasibility_with`]. For custom cost
-/// models (traffic, density penalties), call `compute_feasibility_with` directly.
+/// For custom cost models (traffic, density penalties), call
+/// [`compute_feasibility_with`].
 pub fn compute_feasibility(
-    graph: &DiGraph<XmlNode, XmlWay>,
+    sg: &SpatialGraph,
     origin: NodeIndex,
     destination: NodeIndex,
     available_time: f64,
     network_type: NetworkType,
 ) -> Result<FeasibilityResult, InfeasibleReason> {
-    compute_feasibility_with(graph, origin, destination, available_time, |e| {
-        e.weight.travel_time(network_type)
-    })
+    let costs = sg.slot_costs(CostField::of(network_type));
+    feasibility(
+        sg,
+        origin,
+        destination,
+        available_time,
+        |side, slot| match side {
+            Side::Out => costs.out[slot],
+            Side::In => costs.inc[slot],
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -264,7 +284,7 @@ pub fn compute_feasibility(
 /// Returns `None` if fewer than three qualifying nodes exist (a polygon cannot
 /// be formed).
 pub fn build_feasibility_polygon(
-    graph: &DiGraph<XmlNode, XmlWay>,
+    graph: &RoadGraph,
     result: &FeasibilityResult,
     min_slack: f64,
 ) -> Option<Polygon> {
@@ -292,34 +312,23 @@ impl PrismGraph {
         self.result.feasible.len()
     }
 
+    /// Number of directed edges between prism nodes.
     pub fn edge_count(&self) -> usize {
-        self.graph
-            .graph
-            .edge_references()
-            .filter(|edge| {
-                self.result.feasible.contains_key(&edge.source())
-                    && self.result.feasible.contains_key(&edge.target())
-            })
-            .count()
+        induced_edge_count(&self.graph, &self.result.feasible)
     }
 
     pub fn contains_node_id(&self, node_id: i64) -> bool {
-        self.result
-            .feasible
-            .keys()
-            .any(|&idx| self.graph.graph[idx].id == node_id)
+        self.slack_at_node_id(node_id).is_some()
     }
 
     pub fn slack_at_node_id(&self, node_id: i64) -> Option<f64> {
-        self.result
-            .feasible
-            .iter()
-            .find_map(|(&idx, node)| (self.graph.graph[idx].id == node_id).then_some(node.slack))
+        let node = self.graph.node_index(node_id)?;
+        self.result.feasible.get(node).map(|n| n.slack)
     }
 
     pub fn materialize(&self) -> SpatialGraph {
         self.graph
-            .induced_subgraph(|node| self.result.feasible.contains_key(&node))
+            .induced_subgraph(|node| self.result.feasible.contains_key(node))
     }
 
     pub fn route(
@@ -371,13 +380,7 @@ impl SpatialGraph {
     ) -> Option<Result<PrismGraph, InfeasibleReason>> {
         let origin = self.nearest_node_within(origin_lat, origin_lon, max_snap_m)?;
         let destination = self.nearest_node_within(dest_lat, dest_lon, max_snap_m)?;
-        let result = compute_feasibility(
-            &self.graph,
-            origin,
-            destination,
-            available_time,
-            network_type,
-        );
+        let result = compute_feasibility(self, origin, destination, available_time, network_type);
         Some(result.map(|result| PrismGraph {
             graph: self.clone(),
             result,
@@ -420,39 +423,33 @@ mod tests {
                 key: "highway".into(),
                 value: "residential".into(),
             }],
-            length: 0.0,
-            speed_kph: 0.0,
-            walk_travel_time: 0.0,
-            bike_travel_time: 0.0,
-            drive_travel_time: 0.0,
-            geometry: Vec::new(),
         }
     }
 
     /// Linear graph:  A ─── B ─── C ─── D  (~111 m between each node)
-    fn linear_graph() -> DiGraph<XmlNode, XmlWay> {
+    fn linear_graph() -> SpatialGraph {
         let nodes = vec![
             node(1, 0.000, 0.0),
             node(2, 0.001, 0.0),
             node(3, 0.002, 0.0),
             node(4, 0.003, 0.0),
         ];
-        create_graph(
+        SpatialGraph::new(create_graph(
             nodes,
             vec![way(vec![1, 2, 3, 4])],
             /*retain_all=*/ true,
             false,
-        )
+        ))
     }
 
-    fn find_node(g: &DiGraph<XmlNode, XmlWay>, osm_id: i64) -> NodeIndex {
-        g.node_indices().find(|&i| g[i].id == osm_id).unwrap()
+    fn find_node(g: &SpatialGraph, osm_id: i64) -> NodeIndex {
+        g.node_index(osm_id).unwrap()
     }
 
     /// Convenience: run with a generous budget and unwrap — used by tests that
     /// only care about the happy path.
     fn feasibility_ok(
-        g: &DiGraph<XmlNode, XmlWay>,
+        g: &SpatialGraph,
         origin: NodeIndex,
         dest: NodeIndex,
         budget: f64,
@@ -497,20 +494,20 @@ mod tests {
 
         let o = result
             .feasible
-            .get(&origin)
+            .get(origin)
             .expect("origin must be feasible");
         assert_eq!(o.inbound_time, 0.0, "origin inbound should be 0");
 
         let d = result
             .feasible
-            .get(&dest)
+            .get(dest)
             .expect("destination must be feasible");
         assert_eq!(d.outbound_time, 0.0, "destination outbound should be 0");
     }
 
     #[test]
     fn prism_graph_view_exposes_induced_counts_and_slack_labels() {
-        let sg = SpatialGraph::new(linear_graph());
+        let sg = linear_graph();
         let prism = sg
             .prism(0.0, 0.0, 0.003, 0.0, 10_000.0, NetworkType::Drive, None)
             .expect("origin and destination should snap")
@@ -554,7 +551,7 @@ mod tests {
         let result = feasibility_ok(&g, origin, dest, 10_000.0);
 
         // direct_time must equal the destination's inbound_time (shortest path).
-        let dest_node = result.feasible.get(&dest).unwrap();
+        let dest_node = result.feasible.get(dest).unwrap();
         assert!(
             (result.direct_time - dest_node.inbound_time).abs() < 1e-9,
             "direct_time {} != destination inbound_time {}",
@@ -633,8 +630,8 @@ mod tests {
         let result = compute_feasibility(&g, origin, dest, direct_time, NetworkType::Drive)
             .expect("budget == direct_time should be Ok");
 
-        assert!(result.feasible.contains_key(&dest));
-        assert!(result.feasible.contains_key(&origin));
+        assert!(result.feasible.contains_key(dest));
+        assert!(result.feasible.contains_key(origin));
     }
 
     // ------------------------------------------------------------------
@@ -644,9 +641,10 @@ mod tests {
     #[test]
     fn disconnected_graph_returns_no_path() {
         // Two isolated nodes with no edges between them.
-        let mut g: DiGraph<XmlNode, XmlWay> = DiGraph::new();
-        let a = g.add_node(node(1, 0.0, 0.0));
-        let b = g.add_node(node(2, 1.0, 1.0));
+        let mut raw = RoadGraph::new();
+        let a = raw.add_node(node(1, 0.0, 0.0));
+        let b = raw.add_node(node(2, 1.0, 1.0));
+        let g = SpatialGraph::new(raw);
 
         let err = compute_feasibility(&g, a, b, 10_000.0, NetworkType::Drive)
             .expect_err("expected NoPathExists");
@@ -700,7 +698,7 @@ mod tests {
         .expect("doubled should be Ok");
 
         for (node, base) in &baseline.feasible {
-            let d = doubled.feasible.get(node).expect("doubled missing a node");
+            let d = doubled.feasible.get(*node).expect("doubled missing a node");
             assert!((d.inbound_time - 2.0 * base.inbound_time).abs() < 1e-9);
             assert!((d.outbound_time - 2.0 * base.outbound_time).abs() < 1e-9);
             // Identity must still hold under the doubled cost.
@@ -759,7 +757,7 @@ mod tests {
 
         assert_eq!(a.feasible.len(), b.feasible.len());
         for (node, fa) in &a.feasible {
-            let fb = b.feasible.get(node).expect("node missing in _with result");
+            let fb = b.feasible.get(*node).expect("node missing in _with result");
             assert!((fa.inbound_time - fb.inbound_time).abs() < 1e-9);
             assert!((fa.outbound_time - fb.outbound_time).abs() < 1e-9);
             assert!((fa.slack - fb.slack).abs() < 1e-9);

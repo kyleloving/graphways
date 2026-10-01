@@ -237,12 +237,6 @@ impl PbfScan {
                     .map(|&node_id| XmlNodeRef { node_id })
                     .collect(),
                 tags: to_xml_tags(&way.tags),
-                length: 0.0,
-                speed_kph: 0.0,
-                walk_travel_time: 0.0,
-                bike_travel_time: 0.0,
-                drive_travel_time: 0.0,
-                geometry: Vec::new(),
             })
             .collect();
 

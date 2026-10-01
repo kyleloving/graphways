@@ -29,7 +29,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-graphways = "0.4.0"
+graphways = "0.5.0"
 ```
 
 > **Note:** The crate is published as `graphways`; the library module is `graphways` (matching the Python package name).

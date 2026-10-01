@@ -11,12 +11,10 @@ use petgraph::visit::EdgeRef;
 use petgraph::Direction::{Incoming, Outgoing};
 use rstar::RTree;
 
-use crate::graph::{edge_geometry, NodeEntry, XmlNode, XmlWay};
-use crate::utils::calculate_distance;
+use crate::graph::{edge_geometry, Edge, NodeEntry, RoadGraph, XmlNode};
+use crate::utils::{calculate_distance, calculate_travel_time};
 
 const CONSOLIDATION_DISTANCE_M: f64 = 5.0;
-
-type RoadGraph = DiGraph<XmlNode, XmlWay>;
 
 pub fn simplify_graph(graph: RoadGraph) -> RoadGraph {
     let (graph, _) = consolidate_intersections(graph, CONSOLIDATION_DISTANCE_M);
@@ -56,7 +54,7 @@ pub fn simplify_graph(graph: RoadGraph) -> RoadGraph {
 /// Every ordered node pair therefore carries at most one edge, the fastest by
 /// drive time (the first one seen on ties). Road nodes have a handful of
 /// edges, so the adjacency scan in `find_edge` beats a hash map here.
-fn add_or_keep_fastest(graph: &mut RoadGraph, source: NodeIndex, target: NodeIndex, way: XmlWay) {
+fn add_or_keep_fastest(graph: &mut RoadGraph, source: NodeIndex, target: NodeIndex, way: Edge) {
     match graph.find_edge(source, target) {
         None => {
             graph.add_edge(source, target, way);
@@ -117,18 +115,12 @@ fn next_chain_step(
     step
 }
 
-fn collapse_path_edges(graph: &RoadGraph, edges: &[EdgeIndex]) -> XmlWay {
+fn collapse_path_edges(graph: &RoadGraph, edges: &[EdgeIndex]) -> Edge {
     let first = &graph[edges[0]];
-    let mut way = XmlWay {
-        id: first.id,
-        nodes: Vec::new(),
+    let mut way = Edge {
+        way_id: first.way_id,
         tags: first.tags.clone(),
-        length: 0.0,
-        speed_kph: 0.0,
-        walk_travel_time: 0.0,
-        bike_travel_time: 0.0,
-        drive_travel_time: 0.0,
-        geometry: Vec::new(),
+        ..Edge::default()
     };
     let mut weighted_speed_sum = 0.0;
 
@@ -191,6 +183,13 @@ fn is_endpoint(graph: &RoadGraph, node: NodeIndex) -> bool {
 /// the node it was merged into. Edges are moved, not cloned; an edge whose
 /// endpoints land in the same cluster is dropped, and parallel edges between
 /// two clusters are reduced to the fastest.
+///
+/// Merging moves nodes by up to `merge_distance_m`, so edges touching a merged
+/// node are refit to their new endpoints: a straight edge takes the new
+/// straight-line length (longer or shorter), and an edge with shape points is
+/// stretched if its endpoints now lie farther apart than its length. Travel
+/// times scale with length, keeping each edge's speed, and no edge ends up
+/// "faster than straight" (which would also break the A* lower bound).
 fn consolidate_intersections(
     graph: RoadGraph,
     merge_distance_m: f64,
@@ -205,8 +204,10 @@ fn consolidate_intersections(
 
     let mut new_graph = DiGraph::with_capacity(clusters.len(), graph.edge_count());
     let mut old_to_new = vec![NodeIndex::end(); graph.node_count()];
+    let mut moved = Vec::with_capacity(clusters.len());
     for members in &clusters {
         let new_idx = new_graph.add_node(merge_nodes(&graph, members));
+        moved.push(members.len() > 1);
         for &old_idx in members {
             old_to_new[old_idx.index()] = new_idx;
         }
@@ -216,12 +217,42 @@ fn consolidate_intersections(
     for edge in edges {
         let new_src = old_to_new[edge.source().index()];
         let new_dst = old_to_new[edge.target().index()];
-        if new_src != new_dst {
-            add_or_keep_fastest(&mut new_graph, new_src, new_dst, edge.weight);
+        if new_src == new_dst {
+            continue;
         }
+        let mut weight = edge.weight;
+        if moved[new_src.index()] || moved[new_dst.index()] {
+            let (a, b) = (&new_graph[new_src], &new_graph[new_dst]);
+            refit_length(&mut weight, calculate_distance(a.lat, a.lon, b.lat, b.lon));
+        }
+        add_or_keep_fastest(&mut new_graph, new_src, new_dst, weight);
     }
 
     (new_graph, old_to_new)
+}
+
+/// Fit `edge` to endpoints `span` metres apart, keeping its speeds: straight
+/// edges take exactly `span`, shaped edges are only ever lengthened.
+fn refit_length(edge: &mut Edge, span: f64) {
+    let length = if edge.geometry.is_empty() {
+        span
+    } else {
+        edge.length.max(span)
+    };
+    if length.is_nan() || length == edge.length {
+        return;
+    }
+    if edge.length > 0.0 && length > 0.0 {
+        let scale = length / edge.length;
+        edge.walk_travel_time *= scale;
+        edge.bike_travel_time *= scale;
+        edge.drive_travel_time *= scale;
+    } else {
+        edge.walk_travel_time = calculate_travel_time(length, 5.0);
+        edge.bike_travel_time = calculate_travel_time(length, 15.0);
+        edge.drive_travel_time = calculate_travel_time(length, edge.speed_kph);
+    }
+    edge.length = length;
 }
 
 /// Greedy clustering in node order: each unassigned node seeds a cluster of
@@ -280,7 +311,7 @@ fn merge_nodes(graph: &RoadGraph, indices: &[NodeIndex]) -> XmlNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{XmlNode, XmlTag, XmlWay};
+    use crate::graph::{XmlNode, XmlTag};
 
     fn make_node(id: i64, lat: f64, lon: f64) -> XmlNode {
         XmlNode {
@@ -298,33 +329,27 @@ mod tests {
         }
     }
 
-    fn make_way(id: i64, drive_travel_time: f64) -> XmlWay {
-        XmlWay {
-            id,
-            nodes: Vec::new(),
-            tags: Vec::new(),
+    fn make_way(id: i64, drive_travel_time: f64) -> Edge {
+        Edge {
+            way_id: id,
             length: 100.0,
             speed_kph: 50.0,
             walk_travel_time: 72.0,
             bike_travel_time: 24.0,
             drive_travel_time,
-            geometry: Vec::new(),
+            ..Edge::default()
         }
     }
 
-    fn make_way_with_length(id: i64, drive_travel_time: f64, length: f64) -> XmlWay {
-        XmlWay {
+    fn make_way_with_length(id: i64, drive_travel_time: f64, length: f64) -> Edge {
+        Edge {
             length,
             ..make_way(id, drive_travel_time)
         }
     }
 
-    fn make_way_with_geometry(
-        id: i64,
-        drive_travel_time: f64,
-        geometry: Vec<(f64, f64)>,
-    ) -> XmlWay {
-        XmlWay {
+    fn make_way_with_geometry(id: i64, drive_travel_time: f64, geometry: Vec<(f64, f64)>) -> Edge {
+        Edge {
             geometry,
             ..make_way(id, drive_travel_time)
         }
@@ -477,20 +502,15 @@ mod tests {
         let a = graph.add_node(make_node(1, 0.0, 0.0));
         let b1 = graph.add_node(make_node(2, 0.001, 0.0));
         let b2 = graph.add_node(make_node(3, 0.001000001, 0.0));
-        graph.add_edge(a, b1, make_way(1, 30.0));
-        graph.add_edge(a, b2, make_way(2, 20.0));
+        graph.add_edge(a, b1, make_way_with_length(1, 30.0, 120.0));
+        graph.add_edge(a, b2, make_way_with_length(2, 20.0, 120.0));
 
         let (consolidated, _) = consolidate_intersections(graph, 5.0);
 
         assert_eq!(consolidated.edge_count(), 1);
-        assert_eq!(
-            consolidated
-                .edge_weights()
-                .next()
-                .unwrap()
-                .drive_travel_time,
-            20.0
-        );
+        // The 20 s edge wins; its length is then refit to the merged span.
+        let edge = consolidated.edge_weights().next().unwrap();
+        assert!((edge.drive_travel_time - 20.0 * edge.length / 120.0).abs() < 1e-9);
     }
 
     #[test]
@@ -516,6 +536,32 @@ mod tests {
         assert_eq!(ids, vec![10, 20, 40, 50]);
         let a_node = simplified.node_weights().find(|n| n.id == 10).unwrap();
         assert_eq!(a_node.tags.len(), 1, "unmerged nodes keep their tags");
+    }
+
+    #[test]
+    fn merged_endpoints_refit_straight_edges_to_their_new_span() {
+        // b1/b2 sit 4 m apart and merge to their midpoint; the 1 m edge from
+        // b2 to c ends up spanning ~3 m, so it must be stretched.
+        let mut graph = DiGraph::new();
+        let b1 = graph.add_node(make_node(1, 0.0, 0.0));
+        let b2 = graph.add_node(make_node(2, 0.000036, 0.0));
+        let c = graph.add_node(make_node(3, 0.000045, 0.0));
+        graph.add_edge(b2, c, make_way_with_length(1, 0.1, 1.0));
+        graph.add_edge(b1, b2, make_way(2, 1.0));
+
+        let (consolidated, map) = consolidate_intersections(graph, 5.0);
+        assert_eq!(map[b1.index()], map[b2.index()]);
+        let edge = consolidated.edge_weights().next().unwrap();
+        let (a, b) = (
+            &consolidated[map[b2.index()]],
+            &consolidated[map[c.index()]],
+        );
+        let span = calculate_distance(a.lat, a.lon, b.lat, b.lon);
+        assert!((edge.length - span).abs() < 1e-9 && span > 2.0);
+        assert!(
+            (edge.drive_travel_time - 0.1 * span).abs() < 1e-9,
+            "speed kept"
+        );
     }
 
     #[test]

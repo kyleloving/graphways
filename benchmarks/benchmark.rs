@@ -18,16 +18,13 @@
 //!     PROFILE_LOOP=1    run the production hot path repeatedly for profiler sampling
 
 use std::env;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use petgraph::algo::dijkstra;
-
 use graphways::graph::{create_graph, SpatialGraph};
-use graphways::isochrone::{build_isochrone_polygons, calculate_isochrones_concurrently};
+use graphways::isochrone::{build_isochrone_polygons, isochrones_from_node};
 use graphways::overpass::NetworkType;
 use graphways::pbf::read_pbf;
-use graphways::reachability::ReachabilityResult;
+use graphways::reachability::{compute_reachability_with, ReachabilityResult};
 
 #[derive(Debug)]
 struct Config {
@@ -236,36 +233,32 @@ fn run_hot_path(
             .ok_or("nearest_node")?;
         let nearest_node_time = t.elapsed();
 
+        // Unbounded search, to measure how much a budget saves.
         let mut evals = 0_u64;
         let t = Instant::now();
-        let distances = dijkstra(&*sg.graph, start, None, |e| {
+        let unbounded = compute_reachability_with(sg, start, f64::INFINITY, |e| {
             evals += 1;
-            e.weight().travel_time(config.network_type)
+            e.weight.travel_time(config.network_type)
         });
         let dijkstra_time = t.elapsed();
 
-        let settled = distances.len() as u64;
-        let in_budget = distances
+        let settled = unbounded.times.len() as u64;
+        let in_budget = unbounded
+            .times
             .values()
             .filter(|&&time| time <= max_limit)
             .count() as u64;
 
         let result = ReachabilityResult {
-            start,
             max_cost: max_limit,
-            distances,
+            ..unbounded
         };
         let t = Instant::now();
         let limit_hull_samples = build_hulls_by_limit(sg, &result, &config.limits);
         let hulls_sequential_time = t.elapsed();
 
         let t = Instant::now();
-        let _polygons = calculate_isochrones_concurrently(
-            Arc::clone(&sg.graph),
-            start,
-            config.limits.clone(),
-            config.network_type,
-        );
+        let _polygons = isochrones_from_node(sg, start, &config.limits, config.network_type);
         let isochrones_parallel_time = t.elapsed();
 
         if measure {
@@ -296,7 +289,7 @@ fn build_hulls_by_limit(
         let t = Instant::now();
         let _ = build_isochrone_polygons(&sg.graph, result, &[budget]);
         let point_count = result
-            .distances
+            .times
             .values()
             .filter(|&&time| time <= budget)
             .count();
@@ -323,12 +316,7 @@ fn run_profile_loop(config: &Config, sg: &SpatialGraph) -> Result<(), Box<dyn st
     let start = Instant::now();
     let mut iters = 0_u32;
     while start.elapsed().as_secs() < 20 {
-        let _ = calculate_isochrones_concurrently(
-            Arc::clone(&sg.graph),
-            start_node,
-            config.limits.clone(),
-            config.network_type,
-        );
+        let _ = isochrones_from_node(sg, start_node, &config.limits, config.network_type);
         iters += 1;
     }
     println!(

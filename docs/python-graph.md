@@ -106,7 +106,13 @@ graph.route(
 ) -> RouteResult
 ```
 
-Find the fastest route between two coordinates using A\*.
+Find the fastest route between two coordinates. Routes are exactly optimal.
+
+The first `route()` call starts building a routing index (a contraction
+hierarchy) in a background thread and answers with A\* meanwhile; once the
+index is ready, routes take well under a millisecond. Call
+`graph.prepare_routing()` to build it up front and wait for it, and
+`graph.is_routing_prepared()` to check.
 
 The network type (drive/walk/bike) is inherited from the `SpatialGraph`.
 Coordinates snap to the nearest graph node. Pass `max_snap_m` to reject routes

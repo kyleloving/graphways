@@ -1,15 +1,13 @@
 #[cfg(feature = "extension-module")]
 use crate::error::OsmGraphError;
-use crate::graph::{self, SpatialGraph};
+use crate::graph::{self, RoadGraph, SpatialGraph};
 #[cfg(feature = "extension-module")]
 use crate::overpass;
 use crate::overpass::NetworkType;
 use crate::reachability::{compute_reachability, ReachabilityResult};
 use geo::{ConvexHull, LineString, MultiPoint, Polygon};
 use petgraph::prelude::*;
-use spade::{DelaunayTriangulation, HasPosition, Point2, Triangulation};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 const SATURATED_REUSE_RATIO: f64 = 0.99;
 const CONTOUR_KEY_SCALE: f64 = 10.0;
@@ -22,12 +20,12 @@ const CONTOUR_KEY_SCALE: f64 = 10.0;
 /// Limits greater than `result.max_cost` are clamped to `max_cost` — the result
 /// only contains nodes that were searched within that budget.
 pub fn build_isochrone_polygons(
-    graph: &DiGraph<graph::XmlNode, graph::XmlWay>,
+    graph: &RoadGraph,
     result: &ReachabilityResult,
     time_limits: &[f64],
 ) -> Vec<Polygon> {
     let mut node_times: Vec<(NodeIndex, f64)> =
-        result.distances.iter().map(|(&n, &t)| (n, t)).collect();
+        result.times.iter().map(|(&n, &t)| (n, t)).collect();
     // Break time ties by node index so the output never depends on hash order.
     node_times.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
     let Some(&(_, max_seen)) = node_times.last() else {
@@ -62,24 +60,22 @@ fn upper_bound_node_times(node_times: &[(NodeIndex, f64)], time: f64) -> usize {
     node_times.partition_point(|(_, candidate)| *candidate <= time)
 }
 
+/// A reached node in a local metric projection, with its travel time.
 #[derive(Clone, Copy)]
 struct IsoVertex {
-    position: Point2<f64>,
+    x: f64,
+    y: f64,
     lat: f64,
     lon: f64,
     time: f64,
 }
 
-impl HasPosition for IsoVertex {
-    type Scalar = f64;
-
-    fn position(&self) -> Point2<f64> {
-        self.position
-    }
-}
-
+/// Travel time as a piecewise-linear surface over a Delaunay triangulation
+/// of the reached nodes; isochrones are its level lines.
 struct TriangulatedSurface {
-    triangulation: DelaunayTriangulation<IsoVertex>,
+    vertices: Vec<IsoVertex>,
+    /// Vertex indices, three per triangle.
+    triangles: Vec<usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -99,7 +95,7 @@ struct ContourSegment {
 type ContourKey = (i64, i64);
 
 fn build_triangulated_isochrones(
-    graph: &DiGraph<graph::XmlNode, graph::XmlWay>,
+    graph: &RoadGraph,
     node_times: &[(NodeIndex, f64)],
     time_limits: &[f64],
     max_seen: f64,
@@ -137,10 +133,7 @@ fn build_triangulated_isochrones(
 }
 
 impl TriangulatedSurface {
-    fn from_graph_times(
-        graph: &DiGraph<graph::XmlNode, graph::XmlWay>,
-        node_times: &[(NodeIndex, f64)],
-    ) -> Option<Self> {
+    fn from_graph_times(graph: &RoadGraph, node_times: &[(NodeIndex, f64)]) -> Option<Self> {
         if node_times.len() < 3 {
             return None;
         }
@@ -164,7 +157,8 @@ impl TriangulatedSurface {
             );
             if seen.insert(key) {
                 vertices.push(IsoVertex {
-                    position: Point2::new(x, y),
+                    x,
+                    y,
                     lat: osm_node.lat,
                     lon: osm_node.lon,
                     time,
@@ -176,9 +170,15 @@ impl TriangulatedSurface {
             return None;
         }
 
-        DelaunayTriangulation::bulk_load(vertices)
-            .ok()
-            .map(|triangulation| Self { triangulation })
+        let points: Vec<delaunator::Point> = vertices
+            .iter()
+            .map(|v| delaunator::Point { x: v.x, y: v.y })
+            .collect();
+        let triangles = delaunator::triangulate(&points).triangles;
+        Some(Self {
+            vertices,
+            triangles,
+        })
     }
 
     fn contour_polygon(&self, limit: f64) -> Polygon {
@@ -200,19 +200,13 @@ impl TriangulatedSurface {
     }
 
     fn contour_segments(&self, limit: f64) -> Vec<ContourSegment> {
-        let mut segments = Vec::new();
-        for face in self.triangulation.inner_faces() {
-            let vertices = face.vertices();
-            let triangle = [
-                *vertices[0].data(),
-                *vertices[1].data(),
-                *vertices[2].data(),
-            ];
-            if let Some(segment) = triangle_contour_segment(triangle, limit) {
-                segments.push(segment);
-            }
-        }
-        segments
+        self.triangles
+            .chunks_exact(3)
+            .filter_map(|t| {
+                let triangle = [t[0], t[1], t[2]].map(|i| self.vertices[i]);
+                triangle_contour_segment(triangle, limit)
+            })
+            .collect()
     }
 }
 
@@ -238,8 +232,8 @@ fn triangle_contour_segment(vertices: [IsoVertex; 3], limit: f64) -> Option<Cont
 
 fn interpolate_contour_point(from: IsoVertex, to: IsoVertex, ratio: f64) -> ContourPoint {
     ContourPoint {
-        x: from.position.x + (to.position.x - from.position.x) * ratio,
-        y: from.position.y + (to.position.y - from.position.y) * ratio,
+        x: from.x + (to.x - from.x) * ratio,
+        y: from.y + (to.y - from.y) * ratio,
         lat: from.lat + (to.lat - from.lat) * ratio,
         lon: from.lon + (to.lon - from.lon) * ratio,
     }
@@ -340,17 +334,16 @@ fn projected_ring_area(ring: &[ContourPoint]) -> f64 {
 }
 
 /// Isochrones for every limit from one reachability search sized to the
-/// largest limit. (Despite the name, the work is shared rather than run
-/// concurrently: one search and one triangulation serve all limits.)
-pub fn calculate_isochrones_concurrently(
-    graph: std::sync::Arc<DiGraph<graph::XmlNode, graph::XmlWay>>,
+/// largest limit: one search and one triangulation serve all limits.
+pub fn isochrones_from_node(
+    sg: &SpatialGraph,
     start_node: NodeIndex,
-    time_limits: Vec<f64>,
+    time_limits: &[f64],
     network_type: NetworkType,
 ) -> Vec<Polygon> {
     let max_cost = time_limits.iter().copied().fold(0.0_f64, f64::max);
-    let result = compute_reachability(&graph, start_node, max_cost, network_type);
-    build_isochrone_polygons(&graph, &result, &time_limits)
+    let result = compute_reachability(sg, start_node, max_cost, network_type);
+    build_isochrone_polygons(&sg.graph, &result, time_limits)
 }
 
 impl SpatialGraph {
@@ -369,10 +362,10 @@ impl SpatialGraph {
         max_snap_m: Option<f64>,
     ) -> Option<Vec<Polygon>> {
         let start_node = self.nearest_node_within(lat, lon, max_snap_m)?;
-        Some(calculate_isochrones_concurrently(
-            Arc::clone(&self.graph),
+        Some(isochrones_from_node(
+            self,
             start_node,
-            time_limits,
+            &time_limits,
             network_type,
         ))
     }
@@ -422,15 +415,17 @@ pub(crate) async fn calculate_isochrones_from_point(
         return Err(OsmGraphError::EmptyGraph);
     }
     let bidirectional = matches!(network_type, NetworkType::Walk);
-    let g = graph::create_graph(parsed.nodes, parsed.ways, retain_all, bidirectional);
-    let sg = SpatialGraph::new(g);
+    let sg = SpatialGraph::new(graph::create_graph(
+        parsed.nodes,
+        parsed.ways,
+        retain_all,
+        bidirectional,
+    ));
 
     let node_index = sg
         .nearest_node(lat, lon)
         .ok_or(OsmGraphError::NodeNotFound)?;
-    let shared_graph = Arc::clone(&sg.graph); // O(1) refcount bump — no graph copy
-    let isochrones =
-        calculate_isochrones_concurrently(shared_graph, node_index, time_limits, network_type);
+    let isochrones = isochrones_from_node(&sg, node_index, &time_limits, network_type);
 
     Ok((isochrones, sg))
 }
@@ -438,11 +433,10 @@ pub(crate) async fn calculate_isochrones_from_point(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{XmlNode, XmlWay};
+    use crate::graph::{Edge, NodeMap, XmlNode};
     use crate::reachability::compute_reachability;
     use geo::Area;
     use petgraph::graph::DiGraph;
-    use std::sync::Arc;
 
     fn point(x: f64, y: f64) -> ContourPoint {
         ContourPoint {
@@ -488,21 +482,19 @@ mod tests {
         }
     }
 
-    fn make_way(seconds: f64) -> XmlWay {
-        XmlWay {
-            id: 1,
-            nodes: Vec::new(),
-            tags: Vec::new(),
+    fn make_way(seconds: f64) -> Edge {
+        Edge {
+            way_id: 1,
             length: seconds,
             speed_kph: 50.0,
             walk_travel_time: seconds,
             bike_travel_time: seconds,
             drive_travel_time: seconds,
-            geometry: Vec::new(),
+            ..Edge::default()
         }
     }
 
-    fn square_graph() -> (DiGraph<graph::XmlNode, graph::XmlWay>, NodeIndex) {
+    fn square_graph() -> (SpatialGraph, NodeIndex) {
         let mut graph = DiGraph::new();
         let center = graph.add_node(make_node(0, 0.0, 0.0));
         let north = graph.add_node(make_node(1, 0.001, 0.0));
@@ -513,16 +505,16 @@ mod tests {
             graph.add_edge(center, node, make_way(10.0));
             graph.add_edge(node, center, make_way(10.0));
         }
-        (graph, center)
+        (SpatialGraph::new(graph), center)
     }
 
     #[test]
     fn empty_reachability_returns_empty_polygons_in_input_order() {
-        let graph = DiGraph::new();
+        let graph = RoadGraph::new();
         let result = ReachabilityResult {
             start: NodeIndex::new(0),
             max_cost: 0.0,
-            distances: HashMap::new(),
+            times: NodeMap::with_node_count(0),
         };
 
         let polygons = build_isochrone_polygons(&graph, &result, &[60.0, 30.0]);
@@ -539,9 +531,10 @@ mod tests {
         let a = graph.add_node(make_node(1, 0.0, 0.0));
         let b = graph.add_node(make_node(2, 0.001, 0.0));
         graph.add_edge(a, b, make_way(10.0));
-        let result = compute_reachability(&graph, a, 10.0, NetworkType::Drive);
+        let sg = SpatialGraph::new(graph);
+        let result = compute_reachability(&sg, a, 10.0, NetworkType::Drive);
 
-        let polygons = build_isochrone_polygons(&graph, &result, &[10.0]);
+        let polygons = build_isochrone_polygons(&sg.graph, &result, &[10.0]);
 
         assert!(polygons[0].exterior().0.is_empty());
     }
@@ -550,12 +543,7 @@ mod tests {
     fn isochrone_output_order_matches_input_limits() {
         let (graph, start) = square_graph();
 
-        let polygons = calculate_isochrones_concurrently(
-            Arc::new(graph),
-            start,
-            vec![20.0, 5.0],
-            NetworkType::Drive,
-        );
+        let polygons = isochrones_from_node(&graph, start, &[20.0, 5.0], NetworkType::Drive);
 
         assert_eq!(polygons.len(), 2);
         assert!(polygons[0].unsigned_area() > polygons[1].unsigned_area());
@@ -565,12 +553,7 @@ mod tests {
     fn increasing_time_limits_have_non_decreasing_area() {
         let (graph, start) = square_graph();
 
-        let polygons = calculate_isochrones_concurrently(
-            Arc::new(graph),
-            start,
-            vec![5.0, 20.0],
-            NetworkType::Drive,
-        );
+        let polygons = isochrones_from_node(&graph, start, &[5.0, 20.0], NetworkType::Drive);
 
         assert!(polygons[0].unsigned_area() <= polygons[1].unsigned_area());
     }
