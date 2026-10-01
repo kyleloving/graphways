@@ -177,8 +177,13 @@ pub(crate) async fn fetch_pois_within_reachability(
         .nodes
         .into_iter()
         .filter_map(|n| {
-            let snapped = sg.poi_snaps.as_ref()?.get(&n.id).copied()?;
-            let travel_time_s = *reachability.distances.get(&snapped.snap.node_index)?;
+            // Pre-snapped POIs (PBF graphs) are an O(1) lookup; otherwise
+            // snap on the fly through the spatial index.
+            let snap = match &sg.poi_snaps {
+                Some(snaps) => snaps.get(&n.id)?.snap,
+                None => sg.snap_point(n.lat, n.lon)?,
+            };
+            let travel_time_s = *reachability.distances.get(&snap.node_index)?;
             Some(ReachablePoi {
                 poi: Poi {
                     id: n.id,
@@ -187,8 +192,8 @@ pub(crate) async fn fetch_pois_within_reachability(
                     tags: n.tags.into_iter().map(|t| (t.key, t.value)).collect(),
                 },
                 travel_time_s,
-                snap_node_id: snapped.snap.node_id,
-                snap_distance_m: snapped.snap.distance_m,
+                snap_node_id: snap.node_id,
+                snap_distance_m: snap.distance_m,
             })
         })
         .collect();

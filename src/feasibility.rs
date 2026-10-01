@@ -23,9 +23,11 @@
 //!
 //! # Design notes
 //!
-//! - The reverse Dijkstra runs on the *reversed* graph so that
+//! - The reverse Dijkstra follows incoming edges so that
 //!   `outbound_time(v → destination)` is computed as a single one-to-many
 //!   search from `destination` rather than N individual searches.
+//! - Both searches stop at `available_time`: a node farther than the budget
+//!   in either direction can never be feasible.
 //! - `NetworkType` is threaded through so walk / bike / drive travel times are
 //!   respected consistently.
 //! - [`compute_feasibility`] returns `Err(InfeasibleReason)` when the trip
@@ -35,13 +37,14 @@
 use std::collections::HashMap;
 
 use geo::{ConvexHull, MultiPoint, Polygon};
-use petgraph::algo::dijkstra;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
+use petgraph::Direction;
 
 use crate::graph::{node_to_latlon, SpatialGraph, XmlNode, XmlWay};
 use crate::overpass::NetworkType;
 use crate::reachability::EdgeInfo;
+use crate::search::{astar, dijkstra};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -171,67 +174,53 @@ pub fn compute_feasibility_with<F>(
 where
     F: FnMut(EdgeInfo<'_>) -> f64,
 {
-    // Forward search: origin → all nodes.
-    let forward = dijkstra(graph, origin, None, |e| {
-        cost(EdgeInfo {
-            id: e.id(),
-            source: e.source(),
-            target: e.target(),
-            weight: e.weight(),
-        })
+    // Forward search: origin → every node within budget.
+    let forward = dijkstra(graph, origin, available_time, Direction::Outgoing, |e| {
+        cost(e.into())
     });
 
-    // Fast-path checks before running the (more expensive) reverse search.
-    let direct_time = match forward.get(&destination) {
-        Some(&t) => t,
-        None => return Err(InfeasibleReason::NoPathExists),
+    let direct_time = match forward.get(destination) {
+        Some(time) => time,
+        // Out of budget or disconnected: one targeted search tells which.
+        None => {
+            return Err(
+                match astar(graph, origin, destination, |e| cost(e.into()), |_| 0.0) {
+                    Some((direct_time, _)) => InfeasibleReason::BudgetTooTight {
+                        direct_time,
+                        available_time,
+                    },
+                    None => InfeasibleReason::NoPathExists,
+                },
+            )
+        }
     };
 
-    if direct_time > available_time {
-        return Err(InfeasibleReason::BudgetTooTight {
-            direct_time,
-            available_time,
-        });
-    }
+    // Reverse search: every node → destination, following incoming edges.
+    // The closure still sees each edge in its original orientation.
+    let backward = dijkstra(
+        graph,
+        destination,
+        available_time,
+        Direction::Incoming,
+        |e| cost(e.into()),
+    );
 
-    // Reverse search: destination → all nodes on the *reversed* graph.
-    // petgraph's `Reversed` wrapper flips edge direction without copying the graph.
-    // We translate the reversed edge's id back to the original endpoints so the
-    // closure always sees the edge in its forward orientation.
-    let reversed = petgraph::visit::Reversed(graph);
-    let backward = dijkstra(reversed, destination, None, |e| {
-        let id = e.id();
-        let (source, target) = graph.edge_endpoints(id).unwrap();
-        let weight = graph.edge_weight(id).unwrap();
-        cost(EdgeInfo {
-            id,
-            source,
-            target,
-            weight,
-        })
-    });
-
-    // Intersect: keep only nodes present in both searches whose combined cost
-    // fits within the budget.
-    let mut feasible = HashMap::new();
-    for (&node, &inbound) in &forward {
-        if inbound > available_time {
-            continue;
-        }
-        if let Some(&outbound) = backward.get(&node) {
+    // Intersect: keep nodes present in both searches whose combined cost fits.
+    let feasible = forward
+        .iter()
+        .filter_map(|(node, inbound)| {
+            let outbound = backward.get(node)?;
             let total = inbound + outbound;
-            if total <= available_time {
-                feasible.insert(
-                    node,
-                    FeasibleNode {
-                        inbound_time: inbound,
-                        outbound_time: outbound,
-                        slack: available_time - total,
-                    },
-                );
-            }
-        }
-    }
+            (total <= available_time).then_some((
+                node,
+                FeasibleNode {
+                    inbound_time: inbound,
+                    outbound_time: outbound,
+                    slack: available_time - total,
+                },
+            ))
+        })
+        .collect();
 
     Ok(FeasibilityResult {
         origin,
@@ -298,28 +287,6 @@ pub fn build_feasibility_polygon(
 // SpatialGraph entry points
 // ---------------------------------------------------------------------------
 
-fn prism_subgraph(sg: &SpatialGraph, result: &FeasibilityResult) -> SpatialGraph {
-    let mut subgraph = DiGraph::new();
-    let mut old_to_new = HashMap::new();
-
-    for &old_idx in result.feasible.keys() {
-        let new_idx = subgraph.add_node(sg.graph[old_idx].clone());
-        old_to_new.insert(old_idx, new_idx);
-    }
-
-    for edge in sg.graph.edge_references() {
-        let (Some(&source), Some(&target)) = (
-            old_to_new.get(&edge.source()),
-            old_to_new.get(&edge.target()),
-        ) else {
-            continue;
-        };
-        subgraph.add_edge(source, target, edge.weight().clone());
-    }
-
-    SpatialGraph::new(subgraph)
-}
-
 impl PrismGraph {
     pub fn node_count(&self) -> usize {
         self.result.feasible.len()
@@ -351,7 +318,8 @@ impl PrismGraph {
     }
 
     pub fn materialize(&self) -> SpatialGraph {
-        prism_subgraph(&self.graph, &self.result)
+        self.graph
+            .induced_subgraph(|node| self.result.feasible.contains_key(&node))
     }
 
     pub fn route(
@@ -504,7 +472,7 @@ mod tests {
         let dest = find_node(&g, 4);
         let result = feasibility_ok(&g, origin, dest, 10_000.0);
 
-        for (_, n) in &result.feasible {
+        for n in result.feasible.values() {
             assert!(
                 n.inbound_time + n.outbound_time <= result.available_time + 1e-9,
                 "node violates budget: inbound={} outbound={} budget={}",
@@ -567,7 +535,7 @@ mod tests {
         let dest = find_node(&g, 4);
         let result = feasibility_ok(&g, origin, dest, 10_000.0);
 
-        for (_, n) in &result.feasible {
+        for n in result.feasible.values() {
             let expected = result.available_time - n.inbound_time - n.outbound_time;
             assert!(
                 (n.slack - expected).abs() < 1e-9,
@@ -769,7 +737,7 @@ mod tests {
         })
         .expect("should be Ok");
 
-        for (_, f) in &result.feasible {
+        for f in result.feasible.values() {
             assert!((f.inbound_time + f.outbound_time + f.slack - 10_000.0).abs() < 1e-9);
             assert!(f.slack >= 0.0);
         }

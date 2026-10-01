@@ -386,6 +386,7 @@ dependencies = [
  "petgraph",
  "pyo3",
  "quick-xml",
+ "rayon",
  "reqwest",
  "rstar",
  "serde",

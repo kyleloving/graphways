@@ -5,14 +5,15 @@
 //! downstream filtering (POIs, candidates, two-sided feasibility) consume this
 //! same result, so a single search powers all of them.
 //!
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 
-use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
+use petgraph::graph::{DiGraph, EdgeIndex, EdgeReference, NodeIndex};
 use petgraph::visit::EdgeRef;
+use petgraph::Direction;
 
 use crate::graph::{SpatialGraph, XmlNode, XmlWay};
 use crate::overpass::NetworkType;
+use crate::search::dijkstra;
 
 /// Result of a one-to-many shortest-path search from a single origin.
 ///
@@ -53,32 +54,14 @@ pub struct EdgeInfo<'a> {
     pub weight: &'a XmlWay,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct SearchState {
-    cost: f64,
-    node: NodeIndex,
-}
-
-impl PartialEq for SearchState {
-    fn eq(&self, other: &Self) -> bool {
-        self.cost == other.cost && self.node == other.node
-    }
-}
-
-impl Eq for SearchState {}
-
-impl PartialOrd for SearchState {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for SearchState {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .cost
-            .partial_cmp(&self.cost)
-            .unwrap_or(Ordering::Equal)
+impl<'a> From<EdgeReference<'a, XmlWay>> for EdgeInfo<'a> {
+    fn from(edge: EdgeReference<'a, XmlWay>) -> Self {
+        EdgeInfo {
+            id: edge.id(),
+            source: edge.source(),
+            target: edge.target(),
+            weight: edge.weight(),
+        }
     }
 }
 
@@ -97,63 +80,13 @@ pub fn compute_reachability_with<F>(
 where
     F: FnMut(EdgeInfo<'_>) -> f64,
 {
-    if max_cost.is_nan() || max_cost < 0.0 {
-        return ReachabilityResult {
-            start,
-            max_cost,
-            distances: HashMap::new(),
-        };
-    }
-
-    let mut distances = HashMap::new();
-    let mut heap = BinaryHeap::new();
-    distances.insert(start, 0.0);
-    heap.push(SearchState {
-        cost: 0.0,
-        node: start,
+    let labels = dijkstra(graph, start, max_cost, Direction::Outgoing, |edge| {
+        cost(edge.into())
     });
-
-    while let Some(SearchState {
-        cost: node_cost,
-        node,
-    }) = heap.pop()
-    {
-        if node_cost > max_cost {
-            break;
-        }
-        if node_cost > *distances.get(&node).unwrap_or(&f64::INFINITY) {
-            continue;
-        }
-
-        for edge in graph.edges(node) {
-            let edge_cost = cost(EdgeInfo {
-                id: edge.id(),
-                source: edge.source(),
-                target: edge.target(),
-                weight: edge.weight(),
-            });
-            if !edge_cost.is_finite() || edge_cost < 0.0 {
-                continue;
-            }
-            let next = edge.target();
-            let next_cost = node_cost + edge_cost;
-            if next_cost > max_cost {
-                continue;
-            }
-            if next_cost < *distances.get(&next).unwrap_or(&f64::INFINITY) {
-                distances.insert(next, next_cost);
-                heap.push(SearchState {
-                    cost: next_cost,
-                    node: next,
-                });
-            }
-        }
-    }
-
     ReachabilityResult {
         start,
         max_cost,
-        distances,
+        distances: labels.iter().collect(),
     }
 }
 
@@ -172,28 +105,6 @@ pub fn compute_reachability(
     compute_reachability_with(graph, start, max_cost, |e| {
         e.weight.travel_time(network_type)
     })
-}
-
-fn reachable_subgraph(sg: &SpatialGraph, result: &ReachabilityResult) -> SpatialGraph {
-    let mut subgraph = DiGraph::new();
-    let mut old_to_new = HashMap::new();
-
-    for &old_idx in result.distances.keys() {
-        let new_idx = subgraph.add_node(sg.graph[old_idx].clone());
-        old_to_new.insert(old_idx, new_idx);
-    }
-
-    for edge in sg.graph.edge_references() {
-        let (Some(&source), Some(&target)) = (
-            old_to_new.get(&edge.source()),
-            old_to_new.get(&edge.target()),
-        ) else {
-            continue;
-        };
-        subgraph.add_edge(source, target, edge.weight().clone());
-    }
-
-    SpatialGraph::new(subgraph)
 }
 
 impl ReachableGraph {
@@ -227,7 +138,8 @@ impl ReachableGraph {
     }
 
     pub fn materialize(&self) -> SpatialGraph {
-        reachable_subgraph(&self.graph, &self.result)
+        self.graph
+            .induced_subgraph(|node| self.result.distances.contains_key(&node))
     }
 
     pub fn route(

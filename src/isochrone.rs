@@ -15,8 +15,9 @@ const SATURATED_REUSE_RATIO: f64 = 0.99;
 const CONTOUR_KEY_SCALE: f64 = 10.0;
 
 /// Build one isochrone polygon per requested time limit from a precomputed
-/// `ReachabilityResult`. Polygons are built in parallel (one scoped thread per
-/// limit). The returned vector is in the same order as `time_limits`.
+/// `ReachabilityResult`, by contouring a Delaunay triangulation of the
+/// reached nodes' travel times. The triangulation is built once and shared by
+/// every limit. The returned vector is in the same order as `time_limits`.
 ///
 /// Limits greater than `result.max_cost` are clamped to `max_cost` — the result
 /// only contains nodes that were searched within that budget.
@@ -27,17 +28,13 @@ pub fn build_isochrone_polygons(
 ) -> Vec<Polygon> {
     let mut node_times: Vec<(NodeIndex, f64)> =
         result.distances.iter().map(|(&n, &t)| (n, t)).collect();
-    node_times.sort_by(|a, b| a.1.total_cmp(&b.1));
-    if node_times.is_empty() {
+    // Break time ties by node index so the output never depends on hash order.
+    node_times.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+    let Some(&(_, max_seen)) = node_times.last() else {
         return time_limits.iter().map(|_| empty_polygon()).collect();
-    }
+    };
 
-    let max_seen = node_times
-        .iter()
-        .map(|(_, time)| *time)
-        .fold(0.0_f64, f64::max);
-
-    build_triangulated_isochrones(graph, &node_times, time_limits, max_seen)
+    build_triangulated_isochrones(graph, &node_times, time_limits, max_seen.max(0.0))
 }
 
 fn is_saturated_limit(node_times: &[(NodeIndex, f64)], limit: f64) -> bool {
@@ -107,34 +104,34 @@ fn build_triangulated_isochrones(
     time_limits: &[f64],
     max_seen: f64,
 ) -> Vec<Polygon> {
-    let all_points = || {
-        node_times
-            .iter()
-            .map(|(node, _)| graph::node_to_latlon(graph, *node))
-            .collect()
+    let hull_of_everything = || {
+        convex_hull_from_points(
+            node_times
+                .iter()
+                .map(|(node, _)| graph::node_to_latlon(graph, *node))
+                .collect(),
+        )
     };
 
     let Some(surface) = TriangulatedSurface::from_graph_times(graph, node_times) else {
-        return time_limits
-            .iter()
-            .map(|_| convex_hull_from_points(all_points()))
-            .collect();
+        let hull = hull_of_everything();
+        return time_limits.iter().map(|_| hull.clone()).collect();
     };
 
-    let saturated_polygon = time_limits
+    // A limit that (nearly) every reached node satisfies gets the hull of all
+    // reached nodes; it is computed at most once and shared.
+    let saturated: Vec<bool> = time_limits
         .iter()
-        .any(|&limit| limit >= max_seen || is_saturated_limit(node_times, limit))
-        .then(|| convex_hull_from_points(all_points()));
+        .map(|&limit| limit >= max_seen || is_saturated_limit(node_times, limit))
+        .collect();
+    let saturated_polygon = saturated.contains(&true).then(hull_of_everything);
 
     time_limits
         .iter()
-        .map(|&limit| {
-            if limit >= max_seen || is_saturated_limit(node_times, limit) {
-                if let Some(polygon) = &saturated_polygon {
-                    return polygon.clone();
-                }
-            }
-            surface.contour_polygon(limit)
+        .zip(&saturated)
+        .map(|(&limit, &is_saturated)| match &saturated_polygon {
+            Some(polygon) if is_saturated => polygon.clone(),
+            _ => surface.contour_polygon(limit),
         })
         .collect()
 }
@@ -225,25 +222,18 @@ fn triangle_contour_segment(vertices: [IsoVertex; 3], limit: f64) -> Option<Cont
         (vertices[1], vertices[2]),
         (vertices[2], vertices[0]),
     ];
-    let mut points = Vec::with_capacity(2);
-
-    for (from, to) in edges {
-        let crosses =
-            (from.time <= limit && to.time > limit) || (to.time <= limit && from.time > limit);
-        if crosses {
+    // A level line crosses a triangle on exactly zero or two of its edges.
+    let mut crossings = edges.into_iter().filter_map(|(from, to)| {
+        let crosses = (from.time <= limit) != (to.time <= limit);
+        crosses.then(|| {
             let ratio = ((limit - from.time) / (to.time - from.time)).clamp(0.0, 1.0);
-            points.push(interpolate_contour_point(from, to, ratio));
-        }
-    }
-
-    if points.len() == 2 && contour_key(points[0]) != contour_key(points[1]) {
-        Some(ContourSegment {
-            from: points[0],
-            to: points[1],
+            interpolate_contour_point(from, to, ratio)
         })
-    } else {
-        None
-    }
+    });
+
+    let (from, to) = (crossings.next()?, crossings.next()?);
+    (crossings.next().is_none() && contour_key(from) != contour_key(to))
+        .then_some(ContourSegment { from, to })
 }
 
 fn interpolate_contour_point(from: IsoVertex, to: IsoVertex, ratio: f64) -> ContourPoint {
@@ -255,68 +245,75 @@ fn interpolate_contour_point(from: IsoVertex, to: IsoVertex, ratio: f64) -> Cont
     }
 }
 
+/// Stitch contour segments into closed rings and return the one enclosing the
+/// largest area, as `(lat, lon)` points with the first point repeated last.
+///
+/// Segment endpoints are snapped to a 10 cm grid and interned to dense ids, so
+/// the walk is plain `Vec` indexing. Starting edges are tried in segment
+/// order, which keeps the choice of ring deterministic.
 fn largest_closed_ring(segments: &[ContourSegment]) -> Option<Vec<(f64, f64)>> {
-    let mut adjacency: HashMap<ContourKey, Vec<ContourKey>> = HashMap::new();
-    let mut points: HashMap<ContourKey, ContourPoint> = HashMap::new();
-    let mut unused = HashSet::new();
+    let mut ids: HashMap<ContourKey, usize> = HashMap::with_capacity(segments.len());
+    let mut points: Vec<ContourPoint> = Vec::with_capacity(segments.len());
+    let mut intern = |point: ContourPoint| {
+        *ids.entry(contour_key(point)).or_insert_with(|| {
+            points.push(point);
+            points.len() - 1
+        })
+    };
 
-    for segment in segments {
-        let from = contour_key(segment.from);
-        let to = contour_key(segment.to);
-        if from == to {
-            continue;
-        }
-        points.entry(from).or_insert(segment.from);
-        points.entry(to).or_insert(segment.to);
-        adjacency.entry(from).or_default().push(to);
-        adjacency.entry(to).or_default().push(from);
-        unused.insert(normalized_edge(from, to));
+    // Undirected, deduplicated edges between interned points.
+    let mut edges: Vec<(usize, usize)> = segments
+        .iter()
+        .filter_map(|segment| {
+            let (a, b) = (intern(segment.from), intern(segment.to));
+            (a != b).then_some((a.min(b), a.max(b)))
+        })
+        .collect();
+    {
+        let mut seen = HashSet::with_capacity(edges.len());
+        edges.retain(|edge| seen.insert(*edge));
     }
 
-    let mut best_ring = None;
+    let mut adjacency: Vec<Vec<(usize, usize)>> = vec![Vec::new(); points.len()];
+    for (edge, &(a, b)) in edges.iter().enumerate() {
+        adjacency[a].push((b, edge));
+        adjacency[b].push((a, edge));
+    }
+
+    let mut used = vec![false; edges.len()];
+    let mut ring: Vec<usize> = Vec::new();
+    let mut best_ring: Option<Vec<(f64, f64)>> = None;
     let mut best_area = 0.0;
 
-    while let Some(&(start, first_next)) = unused.iter().next() {
-        let mut ring_keys = vec![start];
+    for first_edge in 0..edges.len() {
+        if used[first_edge] {
+            continue;
+        }
+        used[first_edge] = true;
+        let (start, mut current) = edges[first_edge];
         let mut previous = start;
-        let mut current = first_next;
-        let mut closed = false;
+        ring.clear();
+        ring.extend([start, current]);
 
-        loop {
-            unused.remove(&normalized_edge(previous, current));
-            ring_keys.push(current);
-
-            if current == start {
-                closed = true;
-                break;
-            }
-
-            let Some(next) = adjacency.get(&current).and_then(|neighbors| {
-                neighbors.iter().copied().find(|candidate| {
-                    *candidate != previous && unused.contains(&normalized_edge(current, *candidate))
-                })
-            }) else {
+        while current != start {
+            let next = adjacency[current]
+                .iter()
+                .find(|&&(neighbor, edge)| neighbor != previous && !used[edge]);
+            let Some(&(neighbor, edge)) = next else {
                 break;
             };
-
+            used[edge] = true;
+            ring.push(neighbor);
             previous = current;
-            current = next;
+            current = neighbor;
         }
 
-        if closed && ring_keys.len() >= 4 {
-            let ring_points: Vec<ContourPoint> = ring_keys
-                .iter()
-                .filter_map(|key| points.get(key).copied())
-                .collect();
+        if current == start && ring.len() >= 4 {
+            let ring_points: Vec<ContourPoint> = ring.iter().map(|&id| points[id]).collect();
             let area = projected_ring_area(&ring_points).abs();
             if area > best_area {
                 best_area = area;
-                best_ring = Some(
-                    ring_points
-                        .into_iter()
-                        .map(|point| (point.lat, point.lon))
-                        .collect(),
-                );
+                best_ring = Some(ring_points.iter().map(|p| (p.lat, p.lon)).collect());
             }
         }
     }
@@ -331,14 +328,6 @@ fn contour_key(point: ContourPoint) -> ContourKey {
     )
 }
 
-fn normalized_edge(a: ContourKey, b: ContourKey) -> (ContourKey, ContourKey) {
-    if a <= b {
-        (a, b)
-    } else {
-        (b, a)
-    }
-}
-
 fn projected_ring_area(ring: &[ContourPoint]) -> f64 {
     if ring.len() < 4 {
         return 0.0;
@@ -348,6 +337,102 @@ fn projected_ring_area(ring: &[ContourPoint]) -> f64 {
         .map(|pair| pair[0].x * pair[1].y - pair[1].x * pair[0].y)
         .sum::<f64>()
         * 0.5
+}
+
+/// Isochrones for every limit from one reachability search sized to the
+/// largest limit. (Despite the name, the work is shared rather than run
+/// concurrently: one search and one triangulation serve all limits.)
+pub fn calculate_isochrones_concurrently(
+    graph: std::sync::Arc<DiGraph<graph::XmlNode, graph::XmlWay>>,
+    start_node: NodeIndex,
+    time_limits: Vec<f64>,
+    network_type: NetworkType,
+) -> Vec<Polygon> {
+    let max_cost = time_limits.iter().copied().fold(0.0_f64, f64::max);
+    let result = compute_reachability(&graph, start_node, max_cost, network_type);
+    build_isochrone_polygons(&graph, &result, &time_limits)
+}
+
+impl SpatialGraph {
+    /// Build isochrone polygons for one or more time limits from a lat/lon origin.
+    ///
+    /// Each polygon encloses all nodes reachable within the corresponding time
+    /// limit. The returned `Vec` is in the same order as `time_limits`.
+    ///
+    /// Returns `None` if no graph node is found near `(lat, lon)`.
+    pub fn isochrones(
+        &self,
+        lat: f64,
+        lon: f64,
+        time_limits: Vec<f64>,
+        network_type: NetworkType,
+        max_snap_m: Option<f64>,
+    ) -> Option<Vec<Polygon>> {
+        let start_node = self.nearest_node_within(lat, lon, max_snap_m)?;
+        Some(calculate_isochrones_concurrently(
+            Arc::clone(&self.graph),
+            start_node,
+            time_limits,
+            network_type,
+        ))
+    }
+}
+
+#[cfg(feature = "extension-module")]
+pub(crate) async fn calculate_isochrones_from_point(
+    lat: f64,
+    lon: f64,
+    max_dist: Option<f64>,
+    time_limits: Vec<f64>,
+    network_type: overpass::NetworkType,
+    retain_all: bool,
+) -> Result<(Vec<Polygon>, SpatialGraph), OsmGraphError> {
+    use crate::cache;
+
+    // Auto-size bounding box if not provided.
+    // Use max time limit * a generous speed + 20% buffer to ensure the
+    // isochrone never saturates into a square at the bbox boundary.
+    let max_speed_m_per_s = match network_type {
+        NetworkType::Walk => 5.0 / 3.6,
+        NetworkType::Bike => 25.0 / 3.6,
+        NetworkType::Drive
+        | NetworkType::DriveService
+        | NetworkType::All
+        | NetworkType::AllPrivate => 120.0 / 3.6,
+    };
+    let max_time = time_limits.iter().cloned().fold(0.0_f64, f64::max);
+    let computed_dist = max_dist.unwrap_or(max_time * max_speed_m_per_s * 1.2);
+
+    let polygon_coord_str = overpass::bbox_from_point(lat, lon, computed_dist);
+    let query = overpass::create_overpass_query(&polygon_coord_str, network_type);
+
+    let xml = if let Some(cached_xml) = cache::check_xml_cache(&query)? {
+        cached_xml // in-memory hit
+    } else if let Some(disk_xml) = cache::check_disk_xml_cache(&query) {
+        cache::insert_into_xml_cache(query.clone(), disk_xml.clone())?; // promote to memory
+        disk_xml // disk hit
+    } else {
+        let fetched = overpass::make_request(&overpass::overpass_url(), &query).await?;
+        cache::write_disk_xml_cache(&query, &fetched); // persist to disk (best-effort)
+        cache::insert_into_xml_cache(query.clone(), fetched.clone())?;
+        fetched // network fetch
+    };
+    let parsed = graph::parse_xml(&xml)?;
+    if parsed.nodes.is_empty() {
+        return Err(OsmGraphError::EmptyGraph);
+    }
+    let bidirectional = matches!(network_type, NetworkType::Walk);
+    let g = graph::create_graph(parsed.nodes, parsed.ways, retain_all, bidirectional);
+    let sg = SpatialGraph::new(g);
+
+    let node_index = sg
+        .nearest_node(lat, lon)
+        .ok_or(OsmGraphError::NodeNotFound)?;
+    let shared_graph = Arc::clone(&sg.graph); // O(1) refcount bump — no graph copy
+    let isochrones =
+        calculate_isochrones_concurrently(shared_graph, node_index, time_limits, network_type);
+
+    Ok((isochrones, sg))
 }
 
 #[cfg(test)]
@@ -489,97 +574,4 @@ mod tests {
 
         assert!(polygons[0].unsigned_area() <= polygons[1].unsigned_area());
     }
-}
-
-pub fn calculate_isochrones_concurrently(
-    graph: std::sync::Arc<DiGraph<graph::XmlNode, graph::XmlWay>>,
-    start_node: NodeIndex,
-    time_limits: Vec<f64>,
-    network_type: NetworkType,
-) -> Vec<Polygon> {
-    let max_cost = time_limits.iter().cloned().fold(0.0_f64, f64::max);
-    let result = compute_reachability(&graph, start_node, max_cost, network_type);
-    build_isochrone_polygons(&graph, &result, &time_limits)
-}
-
-impl SpatialGraph {
-    /// Build isochrone polygons for one or more time limits from a lat/lon origin.
-    ///
-    /// Each polygon encloses all nodes reachable within the corresponding time
-    /// limit. The returned `Vec` is in the same order as `time_limits`.
-    ///
-    /// Returns `None` if no graph node is found near `(lat, lon)`.
-    pub fn isochrones(
-        &self,
-        lat: f64,
-        lon: f64,
-        time_limits: Vec<f64>,
-        network_type: NetworkType,
-        max_snap_m: Option<f64>,
-    ) -> Option<Vec<Polygon>> {
-        let start_node = self.nearest_node_within(lat, lon, max_snap_m)?;
-        Some(calculate_isochrones_concurrently(
-            Arc::clone(&self.graph),
-            start_node,
-            time_limits,
-            network_type,
-        ))
-    }
-}
-
-#[cfg(feature = "extension-module")]
-pub(crate) async fn calculate_isochrones_from_point(
-    lat: f64,
-    lon: f64,
-    max_dist: Option<f64>,
-    time_limits: Vec<f64>,
-    network_type: overpass::NetworkType,
-    retain_all: bool,
-) -> Result<(Vec<Polygon>, SpatialGraph), OsmGraphError> {
-    use crate::cache;
-
-    // Auto-size bounding box if not provided.
-    // Use max time limit * a generous speed + 20% buffer to ensure the
-    // isochrone never saturates into a square at the bbox boundary.
-    let max_speed_m_per_s = match network_type {
-        NetworkType::Walk => 5.0 / 3.6,
-        NetworkType::Bike => 25.0 / 3.6,
-        NetworkType::Drive
-        | NetworkType::DriveService
-        | NetworkType::All
-        | NetworkType::AllPrivate => 120.0 / 3.6,
-    };
-    let max_time = time_limits.iter().cloned().fold(0.0_f64, f64::max);
-    let computed_dist = max_dist.unwrap_or(max_time * max_speed_m_per_s * 1.2);
-
-    let polygon_coord_str = overpass::bbox_from_point(lat, lon, computed_dist);
-    let query = overpass::create_overpass_query(&polygon_coord_str, network_type);
-
-    let xml = if let Some(cached_xml) = cache::check_xml_cache(&query)? {
-        cached_xml // in-memory hit
-    } else if let Some(disk_xml) = cache::check_disk_xml_cache(&query) {
-        cache::insert_into_xml_cache(query.clone(), disk_xml.clone())?; // promote to memory
-        disk_xml // disk hit
-    } else {
-        let fetched = overpass::make_request(&overpass::overpass_url(), &query).await?;
-        cache::write_disk_xml_cache(&query, &fetched); // persist to disk (best-effort)
-        cache::insert_into_xml_cache(query.clone(), fetched.clone())?;
-        fetched // network fetch
-    };
-    let parsed = graph::parse_xml(&xml)?;
-    if parsed.nodes.is_empty() {
-        return Err(OsmGraphError::EmptyGraph);
-    }
-    let bidirectional = matches!(network_type, NetworkType::Walk);
-    let g = graph::create_graph(parsed.nodes, parsed.ways, retain_all, bidirectional);
-    let sg = SpatialGraph::new(g);
-
-    let node_index = sg
-        .nearest_node(lat, lon)
-        .ok_or(OsmGraphError::NodeNotFound)?;
-    let shared_graph = Arc::clone(&sg.graph); // O(1) refcount bump — no graph copy
-    let isochrones =
-        calculate_isochrones_concurrently(shared_graph, node_index, time_limits, network_type);
-
-    Ok((isochrones, sg))
 }

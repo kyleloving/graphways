@@ -1,10 +1,12 @@
+use crate::overpass::NetworkType;
 use crate::simplify::simplify_graph;
 use crate::utils::{calculate_distance, calculate_travel_time};
-use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
+use petgraph::visit::EdgeRef;
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 #[derive(Debug, Deserialize)]
 pub struct XmlData {
@@ -66,13 +68,98 @@ impl XmlWay {
     /// Centralises the walk / bike / drive dispatch so call sites don't
     /// repeat the same match expression.
     #[inline]
-    pub fn travel_time(&self, network_type: crate::overpass::NetworkType) -> f64 {
-        match network_type {
-            crate::overpass::NetworkType::Walk => self.walk_travel_time,
-            crate::overpass::NetworkType::Bike => self.bike_travel_time,
-            _ => self.drive_travel_time,
+    pub fn travel_time(&self, network_type: NetworkType) -> f64 {
+        match CostField::of(network_type) {
+            CostField::Walk => self.walk_travel_time,
+            CostField::Bike => self.bike_travel_time,
+            CostField::Drive => self.drive_travel_time,
         }
     }
+
+    /// This edge's route geometry, oriented from `source` to `target`.
+    ///
+    /// Falls back to the straight segment between the two nodes when the edge
+    /// carries no shape points, and flips stored geometry that runs backwards.
+    /// Borrows the stored points; nothing is allocated.
+    pub fn oriented_geometry(&self, source: &XmlNode, target: &XmlNode) -> EdgeGeometry<'_> {
+        let (start, end) = ((source.lat, source.lon), (target.lat, target.lon));
+        let [first, .., last] = self.geometry.as_slice() else {
+            return EdgeGeometry {
+                points: GeometryPoints::Straight([start, end]),
+                reversed: false,
+            };
+        };
+        let span = |a: (f64, f64), b: (f64, f64)| calculate_distance(a.0, a.1, b.0, b.1);
+        let reversed =
+            span(*first, start) + span(*last, end) > span(*first, end) + span(*last, start);
+        EdgeGeometry {
+            points: GeometryPoints::Stored(&self.geometry),
+            reversed,
+        }
+    }
+}
+
+/// Which precomputed travel-time field a [`NetworkType`] is costed with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CostField {
+    Walk,
+    Bike,
+    Drive,
+}
+
+impl CostField {
+    pub(crate) const ALL: [CostField; 3] = [CostField::Walk, CostField::Bike, CostField::Drive];
+
+    #[inline]
+    pub(crate) fn of(network_type: NetworkType) -> Self {
+        match network_type {
+            NetworkType::Walk => CostField::Walk,
+            NetworkType::Bike => CostField::Bike,
+            NetworkType::Drive
+            | NetworkType::DriveService
+            | NetworkType::All
+            | NetworkType::AllPrivate => CostField::Drive,
+        }
+    }
+}
+
+/// Route geometry of one edge, oriented along the edge. See
+/// [`XmlWay::oriented_geometry`].
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeGeometry<'a> {
+    points: GeometryPoints<'a>,
+    reversed: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GeometryPoints<'a> {
+    Stored(&'a [(f64, f64)]),
+    Straight([(f64, f64); 2]),
+}
+
+impl EdgeGeometry<'_> {
+    fn as_slice(&self) -> &[(f64, f64)] {
+        match &self.points {
+            GeometryPoints::Stored(points) => points,
+            GeometryPoints::Straight(points) => points,
+        }
+    }
+
+    /// `(lat, lon)` points from the edge's source to its target (at least 2).
+    pub fn points(&self) -> impl DoubleEndedIterator<Item = (f64, f64)> + ExactSizeIterator + '_ {
+        let points = self.as_slice();
+        let last = points.len().saturating_sub(1);
+        let reversed = self.reversed;
+        (0..points.len()).map(move |i| points[if reversed { last - i } else { i }])
+    }
+}
+
+/// Oriented geometry of `edge` in `graph`. Panics if `edge` is not in `graph`.
+pub fn edge_geometry(graph: &DiGraph<XmlNode, XmlWay>, edge: EdgeIndex) -> EdgeGeometry<'_> {
+    let (source, target) = graph
+        .edge_endpoints(edge)
+        .expect("edge index belongs to this graph");
+    graph[edge].oriented_geometry(&graph[source], &graph[target])
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -94,6 +181,22 @@ enum Direction {
     Bidirectional,
     OneWayForward,
     OneWayReverse,
+}
+
+impl Direction {
+    /// Edges to emit for each way segment, as "is this the reversed copy?"
+    /// flags, primary (tagged) direction first. `force_bidirectional` adds
+    /// the contraflow copy for profiles that ignore one-way restrictions.
+    fn traversals(self, force_bidirectional: bool) -> &'static [bool] {
+        const FORWARD: bool = false;
+        const REVERSE: bool = true;
+        match (self, force_bidirectional) {
+            (Direction::Bidirectional, _) | (Direction::OneWayForward, true) => &[FORWARD, REVERSE],
+            (Direction::OneWayForward, false) => &[FORWARD],
+            (Direction::OneWayReverse, true) => &[REVERSE, FORWARD],
+            (Direction::OneWayReverse, false) => &[REVERSE],
+        }
+    }
 }
 
 // Function to parse the XML response
@@ -182,148 +285,84 @@ fn edge_way_from_template(
     }
 }
 
-// Function to create the network graph
+/// Build a directed road graph from parsed OSM nodes and ways.
+///
+/// Every consecutive node pair of a way becomes one edge per traversable
+/// direction. Way references to nodes missing from `nodes` (common in clipped
+/// extracts) are skipped rather than panicking. Unless `retain_all` is set the
+/// graph is then simplified: nearby intersection nodes are merged and
+/// degree-two chains are collapsed into single edges.
 pub fn create_graph(
     nodes: Vec<XmlNode>,
     ways: Vec<XmlWay>,
     retain_all: bool,
     bidirectional: bool,
 ) -> DiGraph<XmlNode, XmlWay> {
-    let mut graph = DiGraph::<XmlNode, XmlWay>::new();
-    let mut node_index_map = HashMap::new();
+    let segment_count: usize = ways.iter().map(|w| w.nodes.len().saturating_sub(1)).sum();
+    let mut graph = DiGraph::with_capacity(nodes.len(), segment_count * 2);
+    let mut node_index_map = HashMap::with_capacity(nodes.len());
 
-    // Add nodes to the graph and keep track of their indices
     for node in nodes {
         let id = node.id;
-        let node_index = graph.add_node(node); // move — no clone needed, nodes is already owned
-        node_index_map.insert(id, node_index);
+        node_index_map.insert(id, graph.add_node(node));
     }
 
-    // Add edges to the graph
     for mut way in ways {
-        // Extract node refs before consuming `way` so that edge weights are stored
-        // without the construction-only node list (saves memory for every edge in the graph).
+        // Edge weights don't need the construction-only node list.
         let node_refs = std::mem::take(&mut way.nodes);
-        let path_direction = assess_path_directionality(&way);
+        let traversals = assess_path_directionality(&way).traversals(bidirectional);
         let speed_kph = way_speed_kph(&way);
-        let filtered_way = way.filter_useful_tags();
+        let way = way.filter_useful_tags();
 
-        for window in node_refs.windows(2) {
-            if let [start_ref, end_ref] = window {
-                let start_index = node_index_map[&start_ref.node_id];
-                let end_index = node_index_map[&end_ref.node_id];
-                let (length, forward_geometry, reverse_geometry) = {
-                    let start_node = &graph[start_index];
-                    let end_node = &graph[end_index];
-                    let length = calculate_distance(
-                        start_node.lat,
-                        start_node.lon,
-                        end_node.lat,
-                        end_node.lon,
-                    );
-                    (
-                        length,
-                        vec![
-                            (start_node.lat, start_node.lon),
-                            (end_node.lat, end_node.lon),
-                        ],
-                        vec![
-                            (end_node.lat, end_node.lon),
-                            (start_node.lat, start_node.lon),
-                        ],
-                    )
+        for pair in node_refs.windows(2) {
+            let (Some(&a), Some(&b)) = (
+                node_index_map.get(&pair[0].node_id),
+                node_index_map.get(&pair[1].node_id),
+            ) else {
+                continue;
+            };
+            let (pa, pb) = (node_to_latlon(&graph, a), node_to_latlon(&graph, b));
+            let length = calculate_distance(pa.0, pa.1, pb.0, pb.1);
+
+            for &reversed in traversals {
+                let (from, to, geometry) = if reversed {
+                    (b, a, vec![pb, pa])
+                } else {
+                    (a, b, vec![pa, pb])
                 };
-                match path_direction {
-                    Direction::OneWayForward => {
-                        let edge_way = edge_way_from_template(
-                            &filtered_way,
-                            length,
-                            speed_kph,
-                            forward_geometry.clone(),
-                        );
-                        graph.add_edge(start_index, end_index, edge_way);
-                    }
-                    Direction::OneWayReverse => {
-                        let reverse_way = edge_way_from_template(
-                            &filtered_way,
-                            length,
-                            speed_kph,
-                            reverse_geometry.clone(),
-                        );
-                        graph.add_edge(end_index, start_index, reverse_way);
-                    }
-                    Direction::Bidirectional => {
-                        let edge_way = edge_way_from_template(
-                            &filtered_way,
-                            length,
-                            speed_kph,
-                            forward_geometry.clone(),
-                        );
-                        let reverse_way = edge_way_from_template(
-                            &filtered_way,
-                            length,
-                            speed_kph,
-                            reverse_geometry.clone(),
-                        );
-                        graph.add_edge(start_index, end_index, edge_way);
-                        graph.add_edge(end_index, start_index, reverse_way);
-                    }
-                }
-
-                if bidirectional && path_direction != Direction::Bidirectional {
-                    match path_direction {
-                        Direction::OneWayForward => {
-                            let reverse_way = edge_way_from_template(
-                                &filtered_way,
-                                length,
-                                speed_kph,
-                                reverse_geometry.clone(),
-                            );
-                            graph.add_edge(end_index, start_index, reverse_way);
-                        }
-                        Direction::OneWayReverse => {
-                            let reverse_way = edge_way_from_template(
-                                &filtered_way,
-                                length,
-                                speed_kph,
-                                forward_geometry.clone(),
-                            );
-                            graph.add_edge(start_index, end_index, reverse_way);
-                        }
-                        Direction::Bidirectional => {}
-                    }
-                }
+                graph.add_edge(
+                    from,
+                    to,
+                    edge_way_from_template(&way, length, speed_kph, geometry),
+                );
             }
         }
     }
 
-    // Simplify graph topology for faster downstream calculations
-    // Consolidates distance and speed from
-    if !retain_all {
-        graph = simplify_graph(&graph)
+    if retain_all {
+        graph
+    } else {
+        simplify_graph(graph)
     }
-    // ... other future logic
-
-    graph
 }
 
+/// Parse an OSM `maxspeed` value ("50", "30 mph", "50;30") into km/h.
 fn clean_maxspeed(maxspeed: &str) -> Option<f64> {
-    let mph_to_kph = 1.60934;
+    const MPH_TO_KPH: f64 = 1.60934;
     let trimmed = maxspeed.trim();
-    let numeric_prefix: String = trimmed
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    let speed = numeric_prefix.parse::<f64>().ok()?;
+    let numeric_len = trimmed
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(trimmed.len());
+    let speed = trimmed[..numeric_len].parse::<f64>().ok()?;
     if speed <= 0.0 {
         return None;
     }
 
-    if trimmed.to_ascii_lowercase().contains("mph") {
-        Some(speed * mph_to_kph)
-    } else {
-        Some(speed)
-    }
+    let is_mph = trimmed
+        .as_bytes()
+        .windows(3)
+        .any(|w| w.eq_ignore_ascii_case(b"mph"));
+    Some(if is_mph { speed * MPH_TO_KPH } else { speed })
 }
 
 pub fn node_to_latlon(graph: &DiGraph<XmlNode, XmlWay>, node_index: NodeIndex) -> (f64, f64) {
@@ -331,11 +370,20 @@ pub fn node_to_latlon(graph: &DiGraph<XmlNode, XmlWay>, node_index: NodeIndex) -
     (node.lat, node.lon)
 }
 
-/// R-tree entry pairing a node's coordinates with its NodeIndex.
-#[derive(Clone)]
-struct NodeEntry {
-    point: [f64; 2],
-    index: NodeIndex,
+/// R-tree entry pairing a node's projected coordinates with its NodeIndex.
+#[derive(Clone, Copy)]
+pub(crate) struct NodeEntry {
+    pub(crate) point: [f64; 2],
+    pub(crate) index: NodeIndex,
+}
+
+impl NodeEntry {
+    pub(crate) fn new(node: &XmlNode, index: NodeIndex) -> Self {
+        Self {
+            point: spatial_index_point(node.lat, node.lon),
+            index,
+        }
+    }
 }
 
 impl RTreeObject for NodeEntry {
@@ -345,11 +393,13 @@ impl RTreeObject for NodeEntry {
     }
 }
 
-fn spatial_index_point(lat: f64, lon: f64) -> [f64; 2] {
-    let meters_per_degree = 111_320.0;
+/// Local equirectangular projection to metres, good enough for nearest-node
+/// queries and small-radius clustering.
+pub(crate) fn spatial_index_point(lat: f64, lon: f64) -> [f64; 2] {
+    const METERS_PER_DEGREE: f64 = 111_320.0;
     [
-        lat * meters_per_degree,
-        lon * meters_per_degree * lat.to_radians().cos(),
+        lat * METERS_PER_DEGREE,
+        lon * METERS_PER_DEGREE * lat.to_radians().cos(),
     ]
 }
 
@@ -359,6 +409,39 @@ impl PointDistance for NodeEntry {
         let dlon = self.point[1] - point[1];
         dlat * dlat + dlon * dlon
     }
+}
+
+/// Per cost field, the largest `straight-line distance / travel time` over all
+/// edges. Because great-circle distance obeys the triangle inequality,
+/// `distance(n, goal) / max_speed` never exceeds the true remaining cost, and
+/// the resulting A* heuristic is consistent even for edges whose endpoints
+/// were moved by intersection consolidation.
+fn max_straight_line_speeds(graph: &DiGraph<XmlNode, XmlWay>) -> [f64; 3] {
+    let mut max_speed = [0.0_f64; 3];
+    for edge in graph.edge_references() {
+        let (a, b) = (&graph[edge.source()], &graph[edge.target()]);
+        let distance = calculate_distance(a.lat, a.lon, b.lat, b.lon);
+        if distance == 0.0 {
+            continue;
+        }
+        for field in CostField::ALL {
+            let time = match field {
+                CostField::Walk => edge.weight().walk_travel_time,
+                CostField::Bike => edge.weight().bike_travel_time,
+                CostField::Drive => edge.weight().drive_travel_time,
+            };
+            if time.is_finite() && time >= 0.0 {
+                let speed = if time > 0.0 {
+                    distance / time
+                } else {
+                    f64::INFINITY
+                };
+                max_speed[field as usize] = max_speed[field as usize].max(speed);
+            }
+        }
+    }
+    // Pad by a hair so floating-point rounding can't make the bound inadmissible.
+    max_speed.map(|speed| speed * (1.0 + 1e-9))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -391,32 +474,65 @@ pub struct SpatialGraph {
     /// `snap_pois`. `None` until called; `Some` map used by POI filtering
     /// for O(1) lookup instead of an R-tree query on every request.
     pub poi_snaps: Option<Arc<HashMap<i64, SnappedPoi>>>,
+    /// Upper bound on straight-line speed (m/s) over any edge, per cost
+    /// field, computed on first use by routing. See
+    /// [`SpatialGraph::max_straight_line_speed`].
+    max_speed_mps: Arc<OnceLock<[f64; 3]>>,
 }
 
 impl SpatialGraph {
     pub fn new(graph: DiGraph<XmlNode, XmlWay>) -> Self {
         let entries: Vec<NodeEntry> = graph
             .node_indices()
-            .map(|i| NodeEntry {
-                point: spatial_index_point(graph[i].lat, graph[i].lon),
-                index: i,
-            })
+            .map(|i| NodeEntry::new(&graph[i], i))
             .collect();
         let tree = Arc::new(RTree::bulk_load(entries));
-        let graph = Arc::new(graph);
         Self {
-            graph,
+            graph: Arc::new(graph),
             tree,
             poi_snaps: None,
+            max_speed_mps: Arc::default(),
         }
+    }
+
+    /// The fastest straight-line speed (m/s) any edge allows for
+    /// `network_type`: `straight_line_distance / max_straight_line_speed`
+    /// never exceeds the true travel time between two nodes, which makes it
+    /// an admissible and consistent A* heuristic. Computed once, lazily, so
+    /// graphs that never route don't pay for it.
+    pub(crate) fn max_straight_line_speed(&self, network_type: NetworkType) -> f64 {
+        self.max_speed_mps
+            .get_or_init(|| max_straight_line_speeds(&self.graph))
+            [CostField::of(network_type) as usize]
+    }
+
+    /// Copy the subgraph induced by the nodes for which `keep` returns true.
+    ///
+    /// Node and edge order follow the parent graph, so results are
+    /// deterministic. POI snaps are not carried over.
+    pub fn induced_subgraph(&self, mut keep: impl FnMut(NodeIndex) -> bool) -> SpatialGraph {
+        let mut remap = vec![NodeIndex::end(); self.graph.node_count()];
+        let mut subgraph = DiGraph::new();
+        for index in self.graph.node_indices() {
+            if keep(index) {
+                remap[index.index()] = subgraph.add_node(self.graph[index].clone());
+            }
+        }
+        for edge in self.graph.edge_references() {
+            let (source, target) = (remap[edge.source().index()], remap[edge.target().index()]);
+            if source != NodeIndex::end() && target != NodeIndex::end() {
+                subgraph.add_edge(source, target, edge.weight().clone());
+            }
+        }
+        SpatialGraph::new(subgraph)
     }
 
     pub(crate) fn from_parsed_osm(
         data: XmlData,
-        network_type: crate::overpass::NetworkType,
+        network_type: NetworkType,
         retain_all: bool,
     ) -> Self {
-        let bidirectional = matches!(network_type, crate::overpass::NetworkType::Walk);
+        let bidirectional = matches!(network_type, NetworkType::Walk);
         let graph = create_graph(data.nodes, data.ways, retain_all, bidirectional);
         Self::new(graph)
     }
@@ -424,7 +540,7 @@ impl SpatialGraph {
     /// Parse an OSM XML response and build a [`SpatialGraph`].
     pub fn from_osm(
         xml: &str,
-        network_type: crate::overpass::NetworkType,
+        network_type: NetworkType,
         retain_all: Option<bool>,
     ) -> Result<Self, quick_xml::DeError> {
         let data = parse_xml(xml)?;
@@ -553,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_graph_respects_maxspeed_tag() {
-        let nodes = vec![make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0)];
+        let nodes = [make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0)];
         let way = make_way_raw(
             vec![1, 2],
             vec![("highway", "residential"), ("maxspeed", "30")],
@@ -569,7 +685,7 @@ mod tests {
 
     #[test]
     fn test_graph_parses_mph_maxspeed_tag() {
-        let nodes = vec![make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0)];
+        let nodes = [make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0)];
         let way = make_way_raw(
             vec![1, 2],
             vec![("highway", "residential"), ("maxspeed", "30 mph")],
@@ -586,7 +702,7 @@ mod tests {
 
     #[test]
     fn test_graph_falls_back_when_maxspeed_is_non_numeric() {
-        let nodes = vec![make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0)];
+        let nodes = [make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0)];
         let way = make_way_raw(
             vec![1, 2],
             vec![("highway", "residential"), ("maxspeed", "signals")],
@@ -602,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_oneway_produces_single_edge() {
-        let nodes = vec![make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0)];
+        let nodes = [make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0)];
         let way = make_way_raw(
             vec![1, 2],
             vec![("highway", "residential"), ("oneway", "yes")],
@@ -687,7 +803,7 @@ mod tests {
 
     #[test]
     fn test_bidirectional_produces_two_edges() {
-        let nodes = vec![make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0)];
+        let nodes = [make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0)];
         let way = make_way_raw(vec![1, 2], vec![("highway", "residential")]);
         let graph = create_graph(
             vec![nodes[0].clone(), nodes[1].clone()],
@@ -696,6 +812,50 @@ mod tests {
             false,
         );
         assert_eq!(graph.edge_count(), 2);
+    }
+
+    #[test]
+    fn dangling_node_refs_are_skipped_instead_of_panicking() {
+        // Clipped extracts reference nodes outside the extract (id 99 here).
+        let nodes = vec![make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0)];
+        let way = make_way_raw(vec![99, 1, 2], vec![("highway", "residential")]);
+
+        let graph = create_graph(nodes, vec![way], true, false);
+
+        assert_eq!(edge_id_pairs(&graph), vec![(1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn oriented_geometry_follows_edge_direction() {
+        let (a, b) = (make_node(1, 0.0, 0.0), make_node(2, 0.001, 0.0));
+        let mut way = make_way_raw(vec![], vec![]);
+
+        let straight: Vec<_> = way.oriented_geometry(&a, &b).points().collect();
+        assert_eq!(straight, vec![(0.0, 0.0), (0.001, 0.0)]);
+
+        // Stored backwards relative to a → b: must be flipped.
+        way.geometry = vec![(0.001, 0.0), (0.0005, 0.0001), (0.0, 0.0)];
+        let flipped: Vec<_> = way.oriented_geometry(&a, &b).points().collect();
+        assert_eq!(flipped, vec![(0.0, 0.0), (0.0005, 0.0001), (0.001, 0.0)]);
+        let reverse: Vec<_> = way.oriented_geometry(&b, &a).points().collect();
+        assert_eq!(reverse, way.geometry);
+    }
+
+    #[test]
+    fn induced_subgraph_keeps_order_and_internal_edges() {
+        let nodes = vec![
+            make_node(1, 0.0, 0.0),
+            make_node(2, 0.001, 0.0),
+            make_node(3, 0.002, 0.0),
+        ];
+        let way = make_way_raw(vec![1, 2, 3], vec![("highway", "residential")]);
+        let sg = SpatialGraph::new(create_graph(nodes, vec![way], true, false));
+
+        let sub = sg.induced_subgraph(|idx| sg.graph[idx].id != 3);
+
+        let ids: Vec<i64> = sub.graph.node_weights().map(|n| n.id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        assert_eq!(edge_id_pairs(&sub.graph), vec![(1, 2), (2, 1)]);
     }
 
     #[test]
