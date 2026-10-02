@@ -1,7 +1,12 @@
+#[cfg(feature = "network")]
 use crate::cache;
+#[cfg(any(test, feature = "network"))]
 use crate::error::OsmGraphError;
+#[cfg(feature = "network")]
 use crate::graph::{OsmData, SpatialGraph};
+#[cfg(feature = "network")]
 use crate::overpass;
+#[cfg(feature = "network")]
 use crate::reachability::ReachabilityResult;
 #[cfg(any(test, feature = "extension-module"))]
 use geo::{Coord, LineString, MultiPolygon, Polygon};
@@ -36,6 +41,7 @@ pub struct ReachablePoi {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "network")]
 fn create_poi_query(bbox: &str) -> String {
     format!(
         "[out:xml];(\
@@ -64,6 +70,7 @@ fn bbox_from_area(area: &MultiPolygon<f64>) -> Option<String> {
     ))
 }
 
+#[cfg(feature = "network")]
 async fn fetch_xml_cached(query: &str) -> Result<String, OsmGraphError> {
     if let Some(cached) = cache::check_xml_cache(query)? {
         return Ok(cached);
@@ -101,14 +108,14 @@ pub(crate) fn parse_area(geojson_str: &str) -> Result<MultiPolygon<f64>, OsmGrap
             ))
         }
     };
-    let ring = |points: &Vec<Vec<f64>>| -> LineString<f64> {
+    let ring = |points: &Vec<geojson::Position>| -> LineString<f64> {
         points
             .iter()
             .map(|c| Coord { x: c[0], y: c[1] })
             .collect::<Vec<_>>()
             .into()
     };
-    let polygon = |rings: &Vec<Vec<Vec<f64>>>| -> Option<Polygon<f64>> {
+    let polygon = |rings: &Vec<Vec<geojson::Position>>| -> Option<Polygon<f64>> {
         let (exterior, interiors) = rings.split_first()?;
         Some(Polygon::new(
             ring(exterior),
@@ -116,8 +123,12 @@ pub(crate) fn parse_area(geojson_str: &str) -> Result<MultiPolygon<f64>, OsmGrap
         ))
     };
     let polygons = match &value {
-        geojson::Value::Polygon(rings) => polygon(rings).into_iter().collect(),
-        geojson::Value::MultiPolygon(parts) => parts.iter().filter_map(polygon).collect(),
+        geojson::GeometryValue::Polygon { coordinates: rings } => {
+            polygon(rings).into_iter().collect()
+        }
+        geojson::GeometryValue::MultiPolygon { coordinates: parts } => {
+            parts.iter().filter_map(polygon).collect()
+        }
         _ => {
             return Err(OsmGraphError::InvalidInput(
                 "expected Polygon or MultiPolygon geometry".into(),
@@ -159,6 +170,7 @@ pub(crate) async fn fetch_pois_within(area: &MultiPolygon<f64>) -> Result<Vec<Po
     Ok(pois)
 }
 
+#[cfg(feature = "network")]
 /// Fetch POIs and filter them by actual network travel time.
 ///
 /// Uses the [`ReachabilityResult`] from a prior graph search as the truth
@@ -221,7 +233,7 @@ pub(crate) fn pois_to_geojson(pois: &[Poi]) -> String {
     let features: Vec<geojson::Feature> = pois
         .iter()
         .map(|poi| {
-            let geometry = geojson::Geometry::new(geojson::Value::Point(vec![poi.lon, poi.lat]));
+            let geometry = geojson::Geometry::new_point((poi.lon, poi.lat));
             let props: geojson::JsonObject = poi
                 .tags
                 .iter()
@@ -320,7 +332,10 @@ mod tests {
         let gj: geojson::GeoJson = json.parse().unwrap();
         if let geojson::GeoJson::FeatureCollection(fc) = gj {
             let geom = fc.features[0].geometry.as_ref().unwrap();
-            if let geojson::Value::Point(coords) = &geom.value {
+            if let geojson::GeometryValue::Point {
+                coordinates: coords,
+            } = &geom.value
+            {
                 assert!((coords[0] - 11.0).abs() < 1e-9, "first coord should be lon");
                 assert!(
                     (coords[1] - 48.0).abs() < 1e-9,

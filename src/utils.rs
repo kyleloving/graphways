@@ -1,5 +1,5 @@
 use geo::{MultiPolygon, Polygon};
-use geojson::{GeoJson, Geometry, Value};
+use geojson::{GeoJson, Geometry, GeometryValue, Position};
 
 pub fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     const EARTH_RADIUS_M: f64 = 6_371_000.0;
@@ -24,12 +24,15 @@ pub fn calculate_travel_time(length: f64, speed_kph: f64) -> f64 {
     length / speed_m_per_s
 }
 
-fn ring_coords(ring: &geo::LineString<f64>) -> Vec<Vec<f64>> {
+fn ring_coords(ring: &geo::LineString<f64>) -> Vec<Position> {
     // geo coordinates are x = lon, y = lat, which is GeoJSON's order too.
-    ring.0.iter().map(|coord| vec![coord.x, coord.y]).collect()
+    ring.0
+        .iter()
+        .map(|coord| (coord.x, coord.y).into())
+        .collect()
 }
 
-fn polygon_rings(polygon: &Polygon<f64>) -> Vec<Vec<Vec<f64>>> {
+fn polygon_rings(polygon: &Polygon<f64>) -> Vec<Vec<Position>> {
     std::iter::once(polygon.exterior())
         .chain(polygon.interiors())
         .map(ring_coords)
@@ -38,7 +41,9 @@ fn polygon_rings(polygon: &Polygon<f64>) -> Vec<Vec<Vec<f64>>> {
 
 /// A polygon (x = lon, y = lat) as a GeoJSON Polygon geometry.
 pub fn polygon_to_geojson(polygon: &Polygon<f64>) -> GeoJson {
-    GeoJson::Geometry(Geometry::new(Value::Polygon(polygon_rings(polygon))))
+    GeoJson::Geometry(Geometry::new(GeometryValue::Polygon {
+        coordinates: polygon_rings(polygon),
+    }))
 }
 
 pub fn polygon_to_geojson_string(polygon: &Polygon<f64>) -> String {
@@ -47,9 +52,9 @@ pub fn polygon_to_geojson_string(polygon: &Polygon<f64>) -> String {
 
 /// A multipolygon (x = lon, y = lat) as a GeoJSON MultiPolygon geometry.
 pub fn multipolygon_to_geojson(area: &MultiPolygon<f64>) -> GeoJson {
-    GeoJson::Geometry(Geometry::new(Value::MultiPolygon(
-        area.0.iter().map(polygon_rings).collect(),
-    )))
+    GeoJson::Geometry(Geometry::new(GeometryValue::MultiPolygon {
+        coordinates: area.0.iter().map(polygon_rings).collect(),
+    }))
 }
 
 pub fn multipolygon_to_geojson_string(area: &MultiPolygon<f64>) -> String {
@@ -120,7 +125,7 @@ mod tests {
         let geojson = polygon_to_geojson(&polygon);
 
         if let GeoJson::Geometry(Geometry {
-            value: Value::Polygon(rings),
+            value: GeometryValue::Polygon { coordinates: rings },
             ..
         }) = geojson
         {

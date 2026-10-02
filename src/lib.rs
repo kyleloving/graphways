@@ -3,6 +3,7 @@
 pub mod error;
 pub mod feasibility;
 pub mod filters;
+#[cfg(feature = "network")]
 pub mod geocoding;
 pub mod graph;
 pub mod isochrone;
@@ -17,6 +18,7 @@ pub mod routing;
 pub mod utils;
 
 // Internal implementation details; not part of the public Rust API.
+#[cfg(feature = "network")]
 mod cache;
 mod ch;
 mod persist;

@@ -172,7 +172,7 @@ fn props<const N: usize>(entries: [(&str, geojson::JsonValue); N]) -> JsonObject
         .collect()
 }
 
-fn feature(value: geojson::Value, properties: JsonObject) -> Feature {
+fn feature(value: geojson::GeometryValue, properties: JsonObject) -> Feature {
     Feature {
         geometry: Some(geojson::Geometry::new(value)),
         properties: Some(properties),
@@ -189,15 +189,15 @@ fn feature_collection(features: impl IntoIterator<Item = Feature>) -> String {
     .to_string()
 }
 
-fn point(node: &OsmNode) -> geojson::Value {
-    geojson::Value::Point(vec![node.lon, node.lat])
+fn point(node: &OsmNode) -> geojson::GeometryValue {
+    geojson::GeometryValue::new_point((node.lon, node.lat))
 }
 
-fn edge_line(sg: &SpatialGraph, edge: EdgeReference<'_, Edge>) -> geojson::Value {
+fn edge_line(sg: &SpatialGraph, edge: EdgeReference<'_, Edge>) -> geojson::GeometryValue {
     let geometry = edge
         .weight()
         .oriented_geometry(&sg.graph[edge.source()], &sg.graph[edge.target()]);
-    geojson::Value::LineString(geometry.points().map(|(lat, lon)| vec![lon, lat]).collect())
+    geojson::GeometryValue::new_line_string(geometry.points().map(|(lat, lon)| (lon, lat)))
 }
 
 /// An edge's road class, length, speed and per-mode travel times.
@@ -234,11 +234,7 @@ fn snap_json(snap: SnapResult) -> geojson::JsonValue {
 }
 
 fn route_to_geojson(r: &routing::Route) -> String {
-    let coords = r
-        .coordinates
-        .iter()
-        .map(|&(lat, lon)| vec![lon, lat])
-        .collect();
+    let coords = r.coordinates.iter().map(|&(lat, lon)| (lon, lat));
     let properties = props([
         ("distance_m", r.distance_m.into()),
         ("duration_s", r.duration_s.into()),
@@ -249,7 +245,11 @@ fn route_to_geojson(r: &routing::Route) -> String {
             geojson::JsonValue::Array(r.cumulative_times_s.iter().map(|&t| t.into()).collect()),
         ),
     ]);
-    geojson::GeoJson::Feature(feature(geojson::Value::LineString(coords), properties)).to_string()
+    geojson::GeoJson::Feature(feature(
+        geojson::GeometryValue::new_line_string(coords),
+        properties,
+    ))
+    .to_string()
 }
 
 fn snap_to_dict(py: Python<'_>, snap: SnapResult) -> PyResult<Bound<'_, PyDict>> {

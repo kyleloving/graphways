@@ -1,5 +1,6 @@
 #[derive(Debug)]
 pub enum OsmGraphError {
+    #[cfg(feature = "network")]
     Network(reqwest::Error),
     XmlParse(quick_xml::DeError),
     EmptyGraph,
@@ -28,6 +29,7 @@ pub enum OsmGraphError {
 impl std::fmt::Display for OsmGraphError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "network")]
             OsmGraphError::Network(e) => write!(f, "Network error: {}", e),
             OsmGraphError::XmlParse(e) => write!(f, "XML parse error: {}", e),
             OsmGraphError::EmptyGraph => write!(f, "Graph is empty"),
@@ -65,6 +67,7 @@ impl std::fmt::Display for OsmGraphError {
 impl std::error::Error for OsmGraphError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            #[cfg(feature = "network")]
             OsmGraphError::Network(e) => Some(e),
             OsmGraphError::XmlParse(e) => Some(e),
             OsmGraphError::Io(e) => Some(e),
@@ -74,6 +77,7 @@ impl std::error::Error for OsmGraphError {
     }
 }
 
+#[cfg(feature = "network")]
 impl From<reqwest::Error> for OsmGraphError {
     fn from(e: reqwest::Error) -> Self {
         OsmGraphError::Network(e)

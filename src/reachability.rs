@@ -255,6 +255,7 @@ impl SpatialGraph {
     /// Runs a reachability search, then filters POIs from Overpass by the
     /// travel time to the road point each one snaps to, rather than by
     /// polygon containment.
+    #[cfg(feature = "network")]
     pub async fn reachable_pois(
         &self,
         origin: impl Into<LatLon>,
