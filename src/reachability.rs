@@ -135,7 +135,7 @@ where
     let sources = seeds(&sg.departure_roots(&departures));
     let out = &sg.search_index().out;
     let states = dijkstra(out, &sources, max_cost, |slot| {
-        cost(EdgeInfo::of(&sg.graph, out.edges[slot]))
+        out.slot_cost(slot, cost(EdgeInfo::of(&sg.graph, out.edges[slot])))
     });
     ReachabilityResult::from_states(sg, origin.snapped(), max_cost, states)
 }

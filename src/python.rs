@@ -52,6 +52,11 @@ const PROFILE_KEYS: &[&str] = &[
     "default_drive_speed_kph",
     "use_maxspeed",
     "merge_distance_m",
+    "traffic_signal_s",
+    "turn_penalty_s",
+    "turn_bias",
+    "u_turn_penalty_s",
+    "left_hand_traffic",
 ];
 
 /// Build options from `retain_all` and the optional speed-profile keyword
@@ -73,6 +78,11 @@ fn build_options(retain_all: bool, kwargs: Option<&Bound<'_, PyDict>>) -> PyResu
             "default_drive_speed_kph" => profile.default_drive_speed_kph = value.extract()?,
             "use_maxspeed" => profile.use_maxspeed = value.extract()?,
             "merge_distance_m" => profile.merge_distance_m = value.extract()?,
+            "traffic_signal_s" => profile.traffic_signal_s = value.extract()?,
+            "turn_penalty_s" => profile.turn_costs.turn_penalty_s = value.extract()?,
+            "turn_bias" => profile.turn_costs.turn_bias = value.extract()?,
+            "u_turn_penalty_s" => profile.turn_costs.u_turn_penalty_s = value.extract()?,
+            "left_hand_traffic" => profile.turn_costs.left_hand_traffic = value.extract()?,
             _ => {
                 return Err(PyTypeError::new_err(format!(
                     "unexpected keyword argument '{key}'; profile options are: {}",
@@ -560,8 +570,26 @@ impl PyPoiCollection {
 #[pyclass(name = "TravelTimeMatrix", frozen, skip_from_py_object)]
 struct PyTravelTimeMatrix {
     matrix: crate::matrix::TravelTimeMatrix,
-    /// The table as Python tuples, converted on first access.
+    /// The tables as Python tuples, converted on first access.
     durations: OnceLock<Py<PyTuple>>,
+    distances: OnceLock<Py<PyTuple>>,
+}
+
+/// `table` as a tuple of row tuples, converted once and cached in `cache`.
+fn cached_table<'py>(
+    py: Python<'py>,
+    cache: &OnceLock<Py<PyTuple>>,
+    table: &[Vec<Option<f64>>],
+) -> PyResult<Bound<'py, PyTuple>> {
+    if let Some(table) = cache.get() {
+        return Ok(table.bind(py).clone());
+    }
+    let rows = table
+        .iter()
+        .map(|row| PyTuple::new(py, row))
+        .collect::<PyResult<Vec<_>>>()?;
+    let converted = PyTuple::new(py, rows)?.unbind();
+    Ok(cache.get_or_init(|| converted).bind(py).clone())
 }
 
 #[pymethods]
@@ -571,17 +599,14 @@ impl PyTravelTimeMatrix {
     /// Immutable tuples, converted once, so repeated access is free.
     #[getter]
     fn durations_s<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
-        if let Some(table) = self.durations.get() {
-            return Ok(table.bind(py).clone());
-        }
-        let rows = self
-            .matrix
-            .durations_s
-            .iter()
-            .map(|row| PyTuple::new(py, row))
-            .collect::<PyResult<Vec<_>>>()?;
-        let table = PyTuple::new(py, rows)?.unbind();
-        Ok(self.durations.get_or_init(|| table).bind(py).clone())
+        cached_table(py, &self.durations, &self.matrix.durations_s)
+    }
+
+    /// `distances_m[i][j]`: length in metres of the fastest route from
+    /// origin `i` to destination `j`; `None` exactly where `durations_s` is.
+    #[getter]
+    fn distances_m<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        cached_table(py, &self.distances, &self.matrix.distances_m)
     }
 
     /// Where each origin joined the network (`None` if it was too far away).
@@ -834,6 +859,7 @@ impl PyGraph {
         PyTravelTimeMatrix {
             matrix,
             durations: OnceLock::new(),
+            distances: OnceLock::new(),
         }
     }
 

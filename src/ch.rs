@@ -14,6 +14,8 @@
 
 use petgraph::graph::{EdgeIndex, NodeIndex};
 
+use std::collections::HashMap;
+
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -77,7 +79,12 @@ pub(crate) struct ContractionHierarchy {
     /// Arcs `v → u` with `rank(v) > rank(u)`, owned by `u` (backward search).
     down: UpwardArcs,
     kinds: Vec<ArcKind>,
+    /// Length in metres of the road each arc stands for.
+    lengths: Vec<f64>,
 }
+
+/// A search seed: `(node, cost, distance in metres)`.
+pub(crate) type Seed = (u32, f64, f64);
 
 /// Mutable state while contracting.
 struct Builder {
@@ -328,14 +335,19 @@ impl ContractionHierarchy {
         self.node_count
     }
 
-    /// Contract the graph described by `index` with per-slot forward costs.
+    /// Contract the graph described by `index` with per-slot forward costs;
+    /// `edge_length` gives each graph edge's length for matrix distances.
     ///
     /// Works in rounds: every node whose priority is a local minimum among
     /// its neighbours is contracted in the same round, with the witness
     /// searches run in parallel. Those nodes are pairwise non-adjacent, so
     /// their shortcuts are independent; applying them in a fixed order keeps
     /// the result identical whatever the thread count.
-    pub(crate) fn build(index: &SearchIndex, costs: &[f64]) -> Self {
+    pub(crate) fn build(
+        index: &SearchIndex,
+        costs: &[f64],
+        edge_length: impl Fn(u32) -> f64,
+    ) -> Self {
         let n = index.node_count();
         let mut builder = Builder::new(index, costs);
 
@@ -396,11 +408,21 @@ impl ContractionHierarchy {
             }
         }
 
+        // Shortcuts only combine earlier arcs, so one pass sums their lengths.
+        let mut lengths: Vec<f64> = Vec::with_capacity(builder.kinds.len());
+        for kind in &builder.kinds {
+            let length = match *kind {
+                ArcKind::Edge(edge) => edge_length(edge),
+                ArcKind::Shortcut(a, b) => lengths[a as usize] + lengths[b as usize],
+            };
+            lengths.push(length);
+        }
         ContractionHierarchy {
             node_count: n,
             up: UpwardArcs::build(n, up),
             down: UpwardArcs::build(n, down),
             kinds: builder.kinds,
+            lengths,
         }
     }
 
@@ -426,6 +448,11 @@ impl ContractionHierarchy {
             {
                 return Err("routing hierarchy has an arc out of range");
             }
+        }
+        if self.lengths.len() != arc_count
+            || self.lengths.iter().any(|l| !(l.is_finite() && *l >= 0.0))
+        {
+            return Err("routing hierarchy has invalid arc lengths");
         }
         // Shortcuts only ever combine earlier arcs, which also rules out cycles.
         let consistent = self.kinds.iter().enumerate().all(|(i, kind)| match *kind {
@@ -534,16 +561,26 @@ impl ContractionHierarchy {
     }
 
     /// Every node an upward search from `seeds` settles without stalling,
-    /// with its cost: forward over `up` arcs, backward over `down` arcs.
-    fn upward_space(&self, seeds: &[(u32, f64)], forward: bool) -> Vec<(u32, f64)> {
+    /// with its cost and the length of road its best path covers: forward
+    /// over `up` arcs, backward over `down` arcs.
+    fn upward_space(&self, seeds: &[Seed], forward: bool) -> Vec<Seed> {
         let (arcs, stall_arcs) = if forward {
             (&self.up, &self.down)
         } else {
             (&self.down, &self.up)
         };
+        let mut seed_length: HashMap<u32, (f64, f64)> = HashMap::new();
+        for &(node, cost, length) in seeds {
+            let entry = seed_length.entry(node).or_insert((cost, length));
+            if cost < entry.0 {
+                *entry = (cost, length);
+            }
+        }
+        let costs: Vec<(u32, f64)> = seeds.iter().map(|&(node, cost, _)| (node, cost)).collect();
         let mut ws = workspace(self.node_count);
-        seed(&mut ws, seeds, self.node_count, |_| 0.0, None);
+        seed(&mut ws, &costs, self.node_count, |_| 0.0, None);
         let mut space = Vec::new();
+        let mut length_of: HashMap<u32, f64> = HashMap::new();
         while let Some(HeapEntry { cost, node, .. }) = ws.heap.pop() {
             if cost > ws.dist(node) || !ws.settle(node) {
                 continue;
@@ -554,7 +591,13 @@ impl ContractionHierarchy {
             if stalled {
                 continue;
             }
-            space.push((node, cost));
+            // Predecessors are always expanded (never stalled) nodes.
+            let length = match ws.pred(node) {
+                (NONE, _) => seed_length.get(&node).map_or(0.0, |&(_, l)| l),
+                (pred, arc) => length_of[&pred] + self.lengths[arc as usize],
+            };
+            length_of.insert(node, length);
+            space.push((node, cost, length));
             for i in arcs.range(node) {
                 let (head, next_cost) = (arcs.heads[i], cost + arcs.weights[i]);
                 if ws.relax(head, next_cost, node, arcs.arcs[i]) {
@@ -569,8 +612,9 @@ impl ContractionHierarchy {
         space
     }
 
-    /// Exact costs from every source to every target (each a set of
-    /// `(node, offset)` seeds), row-major, infinite where unreachable.
+    /// Exact costs from every source to every target (each a set of seeds),
+    /// row-major, infinite where unreachable, with the length in metres of
+    /// each optimal path.
     ///
     /// The bucket method: each target's backward upward search leaves
     /// `(target, cost)` in a bucket at every node it settles, then each
@@ -579,24 +623,24 @@ impl ContractionHierarchy {
     /// one forward and one backward search per point cover the whole table.
     pub(crate) fn many_to_many(
         &self,
-        sources: &[Vec<(u32, f64)>],
-        targets: &[Vec<(u32, f64)>],
-    ) -> Vec<f64> {
+        sources: &[Vec<Seed>],
+        targets: &[Vec<Seed>],
+    ) -> (Vec<f64>, Vec<f64>) {
         let width = targets.len();
-        let mut table = vec![f64::INFINITY; sources.len() * width];
+        let mut table = vec![(f64::INFINITY, f64::INFINITY); sources.len() * width];
         if width == 0 {
-            return table;
+            return (Vec::new(), Vec::new());
         }
-        let mut entries: Vec<(u32, u32, f64)> = targets
+        let mut entries: Vec<(u32, u32, f64, f64)> = targets
             .par_iter()
             .enumerate()
             .flat_map_iter(|(t, seeds)| {
                 self.upward_space(seeds, false)
                     .into_iter()
-                    .map(move |(node, cost)| (node, t as u32, cost))
+                    .map(move |(node, cost, length)| (node, t as u32, cost, length))
             })
             .collect();
-        entries.par_sort_unstable_by_key(|&(node, target, _)| (node, target));
+        entries.par_sort_unstable_by_key(|&(node, target, ..)| (node, target));
         let mut offsets = vec![0usize; self.node_count + 1];
         for &(node, ..) in &entries {
             offsets[node as usize + 1] += 1;
@@ -609,15 +653,17 @@ impl ContractionHierarchy {
             .par_chunks_mut(width)
             .zip(sources.par_iter())
             .for_each(|(row, seeds)| {
-                for (node, cost) in self.upward_space(seeds, true) {
+                for (node, cost, length) in self.upward_space(seeds, true) {
                     let bucket = &entries[offsets[node as usize]..offsets[node as usize + 1]];
-                    for &(_, target, back) in bucket {
+                    for &(_, target, back, back_length) in bucket {
                         let cell = &mut row[target as usize];
-                        *cell = cell.min(cost + back);
+                        if cost + back < cell.0 {
+                            *cell = (cost + back, length + back_length);
+                        }
                     }
                 }
             });
-        table
+        table.into_iter().unzip()
     }
 
     /// Expand shortcut arcs into original edges, preserving travel order.
@@ -680,14 +726,15 @@ mod tests {
     fn ch_matches_dijkstra_on_every_pair() {
         for seed in [1, 2, 3] {
             let g = grid(9, seed);
-            let index = SearchIndex::new(&g, &[]);
+            let index = SearchIndex::new(&g, &[], &[]);
             let costs: Vec<f64> = index
                 .out
                 .edges
                 .iter()
                 .map(|&e| g[EdgeIndex::new(e as usize)])
                 .collect();
-            let ch = ContractionHierarchy::build(&index, &costs);
+            // Lengths equal to costs: every path's length must equal its cost.
+            let ch = ContractionHierarchy::build(&index, &costs, |e| g[EdgeIndex::new(e as usize)]);
             assert!(ch.shortcut_count() > 0);
 
             for s in g.node_indices() {
@@ -717,20 +764,31 @@ mod tests {
                 }
             }
             // The bucket table agrees too, including multi-seed points.
-            let points: Vec<Vec<(u32, f64)>> = (0..g.node_count() as u32)
-                .map(|n| vec![(n, 0.5), ((n * 7 + 3) % g.node_count() as u32, 2.0)])
+            let points: Vec<Vec<Seed>> = (0..g.node_count() as u32)
+                .map(|n| {
+                    vec![
+                        (n, 0.5, 0.5),
+                        ((n * 7 + 3) % g.node_count() as u32, 2.0, 2.0),
+                    ]
+                })
                 .collect();
-            let table = ch.many_to_many(&points, &points);
+            let (table, lengths) = ch.many_to_many(&points, &points);
             for (i, from) in points.iter().enumerate() {
-                let exact = dijkstra(&index.out, from, f64::INFINITY, |slot| costs[slot]);
+                let from: Vec<(u32, f64)> = from.iter().map(|&(n, c, _)| (n, c)).collect();
+                let exact = dijkstra(&index.out, &from, f64::INFINITY, |slot| costs[slot]);
                 for (j, to) in points.iter().enumerate() {
                     let want = to
                         .iter()
-                        .filter_map(|&(n, off)| {
+                        .filter_map(|&(n, off, _)| {
                             exact.get(NodeIndex::new(n as usize)).map(|d| d + off)
                         })
                         .fold(f64::INFINITY, f64::min);
                     let got = table[i * points.len() + j];
+                    let length = lengths[i * points.len() + j];
+                    assert!(
+                        got == length || (got - length).abs() < 1e-9,
+                        "{got} vs {length}"
+                    );
                     assert!(
                         got == want || (got - want).abs() < 1e-9,
                         "{i}->{j}: {got} vs {want}"

@@ -111,14 +111,15 @@ slow = gw.SpatialGraph.from_pbf("dc.osm.pbf", "walk", walk_speed_kph=3.5)
 - Tune walking, cycling, and per-road-class driving speeds.
 - Snap coordinates to the nearest point on any road, not just the nearest
   intersection.
-- Respect turn restrictions (no left turn, only straight on, ...) when driving.
+- Respect turn restrictions (no left turn, only straight on, ...) when driving,
+  and price turns and traffic signals the way OSRM's car profile does.
 - Compute reachability over the road network from a single origin.
 - Generate isochrones as multipolygons, with holes for unreachable areas.
 - Route point-to-point with distance, duration, geometry, and cumulative
   times: exact, and well under a millisecond once routing is prepared
   (contraction hierarchies).
-- Compute many-to-many travel-time matrices (a million cells in tens of
-  milliseconds on a city graph).
+- Compute many-to-many travel-time and distance matrices (a million cells
+  in about a tenth of a second on a city graph).
 - Build network-time prisms for "what can I visit between A and B?" analysis.
 - Export nodes, edges, routes, POIs, and isochrones as GeoJSON.
 

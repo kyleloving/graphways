@@ -113,7 +113,16 @@ fn assemble(
     let mut duration_s = 0.0;
     let mut segment_lengths = Vec::new();
 
-    for piece in pieces.iter().filter(|p| p.share() > 0.0) {
+    let mut previous: Option<EdgeIndex> = None;
+    for piece in &pieces {
+        // Time lost turning onto this piece at the junction it starts from,
+        // counted even for an empty piece: the search priced that turn too.
+        if let Some(into) = previous.replace(piece.edge) {
+            duration_s += sg.turn_cost(into, piece.edge);
+        }
+        if piece.share() <= 0.0 {
+            continue;
+        }
         let points = piece.points(&sg.graph);
         let piece_time = cost(piece.edge) * piece.share();
         let piece_start_time = duration_s;
@@ -150,6 +159,9 @@ fn assemble(
         }
     }
 
+    if let Some(last) = cumulative_times_s.last_mut() {
+        *last = duration_s;
+    }
     if coordinates.is_empty() {
         // Origin and destination snapped to the same point.
         coordinates.push((origin_snap.snapped_lat, origin_snap.snapped_lon));
@@ -187,7 +199,9 @@ impl SpatialGraph {
     /// well under a millisecond. Routing works without it, just more slowly.
     pub fn prepare_routing(&self) {
         self.hierarchy_slot().get_or_init(|| {
-            ContractionHierarchy::build(self.search_index(), &self.slot_costs().out)
+            ContractionHierarchy::build(self.search_index(), &self.slot_costs().out, |edge| {
+                self.graph.raw_edges()[edge as usize].weight.length
+            })
         });
     }
 
@@ -249,7 +263,7 @@ impl SpatialGraph {
                     out,
                     sources,
                     targets,
-                    |slot| edge_cost(EdgeIndex::new(out.edges[slot] as usize)),
+                    |slot| out.slot_cost(slot, edge_cost(EdgeIndex::new(out.edges[slot] as usize))),
                     |_| 0.0,
                 )
             },

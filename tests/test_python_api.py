@@ -128,6 +128,15 @@ class PythonApiTests(unittest.TestCase):
             for j, destination in enumerate(points[:3]):
                 route = self.graph.route(origin, destination)
                 self.assertAlmostEqual(matrix.durations_s[i][j], route.duration_s)
+                self.assertAlmostEqual(matrix.distances_m[i][j], route.distance_m)
+
+    def test_turn_cost_keywords_are_accepted(self):
+        xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
+        plain = gw.SpatialGraph.from_osm(xml, "drive", turn_penalty_s=0, u_turn_penalty_s=0)
+        priced = gw.SpatialGraph.from_osm(xml, "drive", u_turn_penalty_s=100, traffic_signal_s=5)
+        self.assertEqual(plain.node_count(), priced.node_count())
+        with self.assertRaises(TypeError):
+            gw.SpatialGraph.from_osm(xml, "drive", turn_penalty=1)
 
     def test_profile_keywords_change_travel_times(self):
         xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")

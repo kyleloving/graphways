@@ -44,6 +44,18 @@ Every builder accepts keyword arguments that tune the travel-time model:
 | `default_drive_speed_kph` | `50.0` | Driving speed for classes without a configured speed |
 | `use_maxspeed` | `True` | Let a way's `maxspeed` tag override its class speed |
 | `merge_distance_m` | `5.0` | Merge intersections closer than this when simplifying |
+| `traffic_signal_s` | `2.0` | Seconds a driver loses at each traffic signal |
+| `turn_penalty_s` | `7.5` | Scale of the time lost turning at junctions when driving |
+| `turn_bias` | `1.075` | Above 1 makes turns across oncoming traffic dearer |
+| `u_turn_penalty_s` | `20.0` | Extra seconds for a U-turn |
+| `left_hand_traffic` | `False` | Traffic drives on the left, so left turns are the cheap ones |
+
+Driving graphs price turns the way OSRM's car profile does: nearly free
+straight on, about 2 s for a right turn and 5 s for a left turn (with the
+defaults, in right-hand traffic), and about 27 s for a U-turn. Pass
+`turn_penalty_s=0, u_turn_penalty_s=0` to switch turn costs off. Turn costs
+make the routing index larger: preparing the Munich driving graph takes
+about 1.5 s instead of 0.2 s, and routes about 0.2 ms instead of 0.1 ms.
 
 ```python
 slow_walk = gw.SpatialGraph.from_pbf("munich.osm.pbf", "walk", walk_speed_kph=3.5)
@@ -259,7 +271,7 @@ graph.travel_time_matrix(
 
 Fastest travel times from every origin to every destination, exactly as
 `route` would find them. Large matrices build the routing index first, after
-which a 1000 x 1000 matrix of Munich takes about 50 ms driving and 150 ms
+which a 1000 x 1000 matrix of Munich takes about 80 ms driving and 150 ms
 walking. Points farther than `max_snap_m` from any road get `None` times
 rather than failing the whole matrix.
 
@@ -268,6 +280,7 @@ rather than failing the whole matrix.
 | Property | Type | Description |
 |----------|------|-------------|
 | `durations_s` | tuple of tuples of `float` or `None` | `durations_s[i][j]`: seconds from origin `i` to destination `j`; `None` when unreachable or unsnapped |
+| `distances_m` | tuple of tuples of `float` or `None` | Length in metres of each of those fastest routes |
 | `origin_snaps` | list of `SnapResult` or `None` | Where each origin joined the network |
 | `destination_snaps` | list of `SnapResult` or `None` | Where each destination joined the network |
 | `shape` | `tuple[int, int]` | `(len(origins), len(destinations))` |

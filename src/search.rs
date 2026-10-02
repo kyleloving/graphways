@@ -24,19 +24,21 @@ use crate::graph::NodeMap;
 /// Adjacency in compressed sparse row form, for one direction.
 ///
 /// Slots `range(u)` hold the arcs of node `u`: `neighbors[slot]` is the node
-/// at the other end and `edges[slot]` the petgraph edge index.
+/// at the other end, `edges[slot]` the petgraph edge index and
+/// `penalties[slot]` the turn cost added on top of the edge's own cost.
 pub(crate) struct Adjacency {
     offsets: Vec<u32>,
     pub(crate) neighbors: Vec<u32>,
     pub(crate) edges: Vec<u32>,
+    penalties: Vec<f64>,
 }
 
 impl Adjacency {
-    /// Group `arcs` = `(owner, neighbor, edge)` by owner with a counting sort.
-    /// Arcs keep their relative order within each owner.
-    fn build(node_count: usize, arcs: &[(u32, u32, u32)]) -> Self {
+    /// Group `arcs` = `(owner, neighbor, edge, penalty)` by owner with a
+    /// counting sort. Arcs keep their relative order within each owner.
+    fn build(node_count: usize, arcs: &[(u32, u32, u32, f64)]) -> Self {
         let mut offsets = vec![0u32; node_count + 1];
-        for &(owner, _, _) in arcs {
+        for &(owner, ..) in arcs {
             offsets[owner as usize + 1] += 1;
         }
         for i in 0..node_count {
@@ -45,16 +47,30 @@ impl Adjacency {
         let mut cursor = offsets.clone();
         let mut neighbors = vec![0u32; arcs.len()];
         let mut edges = vec![0u32; arcs.len()];
-        for &(owner, neighbor, edge) in arcs {
+        let mut penalties = vec![0.0; arcs.len()];
+        for &(owner, neighbor, edge, penalty) in arcs {
             let slot = &mut cursor[owner as usize];
             neighbors[*slot as usize] = neighbor;
             edges[*slot as usize] = edge;
+            penalties[*slot as usize] = penalty;
             *slot += 1;
         }
         Self {
             offsets,
             neighbors,
             edges,
+            penalties,
+        }
+    }
+
+    /// The cost of slot `slot` given its edge's own cost: the edge cost plus
+    /// the slot's turn cost. Impassable edges stay impassable.
+    #[inline]
+    pub(crate) fn slot_cost(&self, slot: usize, edge_cost: f64) -> f64 {
+        if usable(edge_cost) {
+            edge_cost + self.penalties[slot]
+        } else {
+            edge_cost
         }
     }
 
@@ -77,10 +93,11 @@ pub(crate) struct SlotCosts {
 /// Forward and backward adjacency of a graph, plus per-mode slot costs.
 ///
 /// Searches run over *states*. Normally a state is a graph node, but a
-/// junction with turn restrictions gets extra states, one per distinct set of
-/// banned exits: an edge whose turn options are restricted leads into such a
-/// state, whose outgoing arcs omit the banned exits. States `0..n` are the
-/// graph's nodes; extra states follow.
+/// junction with turn rules gets extra states, one per distinct set of rules:
+/// an edge whose turns are restricted or priced leads into such a state,
+/// whose outgoing arcs omit the banned exits and carry the turn costs.
+/// States `0..n` are the graph's nodes (entered without turning, e.g. at the
+/// start of a search); extra states follow.
 pub(crate) struct SearchIndex {
     /// Arcs grouped by source state; neighbour = target state.
     pub(crate) out: Adjacency,
@@ -93,39 +110,66 @@ pub(crate) struct SearchIndex {
     head_override: HashMap<u32, u32>,
 }
 
-/// A restricted state of a junction: the node, and the exits it bans (sorted).
+/// A state of a junction entered along a road with turn rules: the node,
+/// and the cost of each exit that differs from free (sorted by exit edge;
+/// infinite = banned).
 struct ExtraState {
     node: u32,
-    banned: Vec<u32>,
+    exits: Vec<(u32, f64)>,
+}
+
+impl ExtraState {
+    /// The turn cost of taking `exit` from this state; `None` if banned.
+    fn exit_cost(&self, exit: u32) -> Option<f64> {
+        match self.exits.binary_search_by_key(&exit, |&(e, _)| e) {
+            Ok(i) => Some(self.exits[i].1).filter(|c| c.is_finite()),
+            Err(_) => Some(0.0),
+        }
+    }
 }
 
 impl SearchIndex {
     /// Build the index, splitting junctions so that no path takes any of the
-    /// `forbidden` `(into junction, out of junction)` edge pairs.
-    pub(crate) fn new<N, E>(graph: &DiGraph<N, E>, forbidden: &[(EdgeIndex, EdgeIndex)]) -> Self {
+    /// `forbidden` `(into junction, out of junction)` edge pairs and every
+    /// `(into, out, cost)` in `turn_costs` adds its cost to that turn.
+    pub(crate) fn new<N, E>(
+        graph: &DiGraph<N, E>,
+        forbidden: &[(EdgeIndex, EdgeIndex)],
+        turn_costs: &[(EdgeIndex, EdgeIndex, f64)],
+    ) -> Self {
         let n = graph.node_count();
         let raw = graph.raw_edges();
 
-        // Group incoming edges by (junction, banned exits); each group gets
-        // one extra state. Sorted input keeps state numbering deterministic.
-        let mut banned_by_entry: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        // Collect each incoming edge's rules; edges with the same rules into
+        // the same junction share one extra state. Sorted maps keep state
+        // numbering deterministic.
+        let mut rules: BTreeMap<u32, BTreeMap<u32, f64>> = BTreeMap::new();
+        for &(into, out, cost) in turn_costs {
+            if cost > 0.0 {
+                *rules
+                    .entry(into.index() as u32)
+                    .or_default()
+                    .entry(out.index() as u32)
+                    .or_default() += cost;
+            }
+        }
         for &(into, out) in forbidden {
-            banned_by_entry
+            rules
                 .entry(into.index() as u32)
                 .or_default()
-                .push(out.index() as u32);
+                .insert(out.index() as u32, f64::INFINITY);
         }
         let mut extra: Vec<ExtraState> = Vec::new();
         let mut extra_of: HashMap<u32, Vec<u32>> = HashMap::new();
         let mut head_override: HashMap<u32, u32> = HashMap::new();
-        let mut state_for: HashMap<(u32, Vec<u32>), u32> = HashMap::new();
-        for (entry, mut banned) in banned_by_entry {
-            banned.sort_unstable();
-            banned.dedup();
+        let mut state_for: HashMap<(u32, Vec<(u32, u64)>), u32> = HashMap::new();
+        for (entry, exits) in rules {
+            let exits: Vec<(u32, f64)> = exits.into_iter().collect();
+            let key: Vec<(u32, u64)> = exits.iter().map(|&(e, c)| (e, c.to_bits())).collect();
             let node = raw[entry as usize].target().index() as u32;
-            let state = *state_for.entry((node, banned.clone())).or_insert_with(|| {
+            let state = *state_for.entry((node, key)).or_insert_with(|| {
                 let state = (n + extra.len()) as u32;
-                extra.push(ExtraState { node, banned });
+                extra.push(ExtraState { node, exits });
                 extra_of.entry(node).or_default().push(state);
                 state
             });
@@ -133,21 +177,21 @@ impl SearchIndex {
         }
 
         let total = n + extra.len();
-        let mut arcs: Vec<(u32, u32, u32)> = Vec::with_capacity(raw.len());
+        let mut arcs: Vec<(u32, u32, u32, f64)> = Vec::with_capacity(raw.len());
         for (id, e) in raw.iter().enumerate() {
             let id = id as u32;
             let (source, target) = (e.source().index() as u32, e.target().index() as u32);
             let head = head_override.get(&id).copied().unwrap_or(target);
-            arcs.push((source, head, id));
+            arcs.push((source, head, id, 0.0));
             for &state in extra_of.get(&source).into_iter().flatten() {
-                if extra[state as usize - n].banned.binary_search(&id).is_err() {
-                    arcs.push((state, head, id));
+                if let Some(cost) = extra[state as usize - n].exit_cost(id) {
+                    arcs.push((state, head, id, cost));
                 }
             }
         }
         let out = Adjacency::build(total, &arcs);
         for arc in &mut arcs {
-            *arc = (arc.1, arc.0, arc.2);
+            *arc = (arc.1, arc.0, arc.2, arc.3);
         }
         let inc = Adjacency::build(total, &arcs);
         Self {
@@ -161,7 +205,7 @@ impl SearchIndex {
         }
     }
 
-    /// Whether any junction has restricted states.
+    /// Whether any junction has extra states (turn restrictions or costs).
     pub(crate) fn has_restricted_states(&self) -> bool {
         !self.extra.is_empty()
     }
@@ -190,19 +234,21 @@ impl SearchIndex {
         std::iter::once(node).chain(self.extra_of.get(&node).into_iter().flatten().copied())
     }
 
-    /// The states of `source` from which `edge` may be taken.
+    /// The states of `source` from which `edge` may be taken, with the turn
+    /// cost of taking it from each.
     pub(crate) fn tail_states(
         &self,
         edge: EdgeIndex,
         source: NodeIndex,
-    ) -> impl Iterator<Item = u32> + '_ {
+    ) -> impl Iterator<Item = (u32, f64)> + '_ {
         let id = edge.index() as u32;
-        self.states_of(source).filter(move |&state| {
-            (state as usize) < self.graph_nodes
-                || self.extra[state as usize - self.graph_nodes]
-                    .banned
-                    .binary_search(&id)
-                    .is_err()
+        self.states_of(source).filter_map(move |state| {
+            if (state as usize) < self.graph_nodes {
+                Some((state, 0.0))
+            } else {
+                let cost = self.extra[state as usize - self.graph_nodes].exit_cost(id)?;
+                Some((state, cost))
+            }
         })
     }
 
@@ -230,7 +276,10 @@ impl SearchIndex {
                 adjacency
                     .edges
                     .iter()
-                    .map(|&edge| edge_cost(EdgeIndex::new(edge as usize)))
+                    .enumerate()
+                    .map(|(slot, &edge)| {
+                        adjacency.slot_cost(slot, edge_cost(EdgeIndex::new(edge as usize)))
+                    })
                     .collect()
             };
             SlotCosts {
@@ -480,6 +529,69 @@ pub(crate) fn dijkstra(
     result
 }
 
+/// [`dijkstra`] over every reachable state (no budget) that also tracks the
+/// length of each state's best path: sources are `(state, cost, length)`
+/// and `length(slot)` gives the metres an arc covers. Labels are
+/// `(cost, length)`.
+pub(crate) fn dijkstra_with_lengths(
+    adjacency: &Adjacency,
+    sources: &[(u32, f64, f64)],
+    mut cost: impl FnMut(usize) -> f64,
+    mut length: impl FnMut(usize) -> f64,
+) -> NodeMap<(f64, f64)> {
+    let node_count = adjacency.node_count();
+    let mut result: NodeMap<(f64, f64)> = NodeMap::with_node_count(node_count);
+    let mut ws = workspace(node_count);
+    let mut source_length: HashMap<u32, (f64, f64)> = HashMap::new();
+    for &(node, c, l) in sources {
+        let entry = source_length.entry(node).or_insert((c, l));
+        if c < entry.0 {
+            *entry = (c, l);
+        }
+    }
+    let costs: Vec<(u32, f64)> = sources.iter().map(|&(n, c, _)| (n, c)).collect();
+    seed(&mut ws, &costs, node_count, |_| 0.0, None);
+
+    while let Some(HeapEntry {
+        cost: node_cost,
+        node,
+        ..
+    }) = ws.heap.pop()
+    {
+        if node_cost > ws.dist(node) || !ws.settle(node) {
+            continue;
+        }
+        let node_length = match ws.pred(node) {
+            (NONE, _) => source_length.get(&node).map_or(0.0, |&(_, l)| l),
+            (pred, slot) => {
+                let (_, pred_length) = result
+                    .get(NodeIndex::new(pred as usize))
+                    .copied()
+                    .expect("predecessors settle first");
+                pred_length + length(slot as usize)
+            }
+        };
+        result.insert(NodeIndex::new(node as usize), (node_cost, node_length));
+
+        for slot in adjacency.range(node) {
+            let edge_cost = cost(slot);
+            if !usable(edge_cost) {
+                continue;
+            }
+            let next_cost = node_cost + edge_cost;
+            let next = adjacency.neighbors[slot];
+            if ws.relax(next, next_cost, node, slot as u32) {
+                ws.heap.push(HeapEntry {
+                    key: next_cost,
+                    cost: next_cost,
+                    node: next,
+                });
+            }
+        }
+    }
+    result
+}
+
 /// Push each in-range source onto the workspace heap with its starting cost.
 pub(crate) fn seed(
     ws: &mut Workspace,
@@ -622,7 +734,7 @@ mod tests {
     #[test]
     fn dijkstra_forward_and_backward_agree_on_pair_costs() {
         let (g, [a, b, c, d]) = diamond();
-        let index = SearchIndex::new(&g, &[]);
+        let index = SearchIndex::new(&g, &[], &[]);
         let (out_w, inc_w) = (weights(&g, &index.out), weights(&g, &index.inc));
         let forward = dijkstra(&index.out, &[(a.index() as u32, 0.0)], f64::INFINITY, |s| {
             out_w[s]
@@ -643,7 +755,7 @@ mod tests {
     #[test]
     fn dijkstra_bound_is_inclusive_and_skips_bad_costs() {
         let (g, [a, b, c, d]) = diamond();
-        let index = SearchIndex::new(&g, &[]);
+        let index = SearchIndex::new(&g, &[], &[]);
         let w = weights(&g, &index.out);
         let bounded = dijkstra(&index.out, &[(a.index() as u32, 0.0)], 1.0, |s| w[s]);
         assert_eq!(bounded.get(b), Some(&1.0));
@@ -662,7 +774,7 @@ mod tests {
     #[test]
     fn astar_returns_cheapest_edge_sequence_and_pool_resets() {
         let (g, [a, b, c, d]) = diamond();
-        let index = SearchIndex::new(&g, &[]);
+        let index = SearchIndex::new(&g, &[], &[]);
         let w = weights(&g, &index.out);
         let at = |n: NodeIndex| [(n.index() as u32, 0.0)];
         for _ in 0..3 {

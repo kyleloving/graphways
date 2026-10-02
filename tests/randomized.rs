@@ -1,9 +1,10 @@
 //! Randomized cross-checks of every search against plain Dijkstra.
 //!
 //! Each seed builds a small street grid with random one-way streets, speeds,
-//! detours and turn restrictions, then routes between random points part-way
-//! along roads with A*, with the contraction hierarchy, and through both
-//! matrix paths. Every answer must match an exhaustive Dijkstra search.
+//! detours, turn restrictions and turn costs, then routes between random
+//! points part-way along roads with A*, with the contraction hierarchy, and
+//! through both matrix paths. Every answer must match an exhaustive Dijkstra
+//! search.
 
 use std::sync::Arc;
 
@@ -75,8 +76,10 @@ fn random_city(seed: u64) -> SpatialGraph {
             }
         }
     }
-    // Ban a random selection of turns (including some U-turns).
+    // Ban a random selection of turns (including some U-turns) and put a
+    // random cost on many of the rest.
     let mut forbidden = Vec::new();
+    let mut turn_costs = Vec::new();
     for node in graph.node_indices() {
         let into: Vec<EdgeIndex> = graph
             .edges_directed(node, petgraph::Direction::Incoming)
@@ -88,13 +91,16 @@ fn random_city(seed: u64) -> SpatialGraph {
             .collect();
         for &i in &into {
             for &o in &out {
-                if rng.unit() < 0.15 {
+                let roll = rng.unit();
+                if roll < 0.15 {
                     forbidden.push((i, o));
+                } else if roll < 0.6 {
+                    turn_costs.push((i, o, 30.0 * rng.unit()));
                 }
             }
         }
     }
-    SpatialGraph::with_forbidden_turns(graph, NetworkType::Drive, forbidden)
+    SpatialGraph::with_turns(graph, NetworkType::Drive, forbidden, turn_costs)
 }
 
 fn random_point(rng: &mut Rng) -> (f64, f64) {
@@ -171,6 +177,11 @@ fn every_search_agrees_with_dijkstra_on_random_cities() {
                     let last = *route.cumulative_times_s.last().unwrap();
                     assert!((last - route.duration_s).abs() < 1e-6, "{context}");
                     assert!(route.cumulative_times_s.windows(2).all(|w| w[1] >= w[0]));
+                    // Matrices report the length of that same fastest route.
+                    for m in [&unprepared_matrix, &prepared_matrix] {
+                        let length = m.distances_m[i][j].expect("routed pair has a length");
+                        assert!((length - route.distance_m).abs() < 1e-6, "{context}");
+                    }
                 }
             }
         }

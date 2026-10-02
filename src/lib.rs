@@ -26,6 +26,7 @@ mod download;
 mod persist;
 mod search;
 mod simplify;
+mod turns;
 
 // Python bindings: compiled only when maturin builds the extension module,
 // so plain Rust dependents get no pyo3 / Python linkage at all.

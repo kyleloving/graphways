@@ -1,5 +1,5 @@
 //! Travel-time matrices: the fastest time from each of many origins to each
-//! of many destinations.
+//! of many destinations, and the length of each of those fastest routes.
 //!
 //! With a prepared graph ([`SpatialGraph::prepare_routing`]) a matrix costs
 //! one small upward search per point over the contraction hierarchy, so
@@ -12,9 +12,10 @@ use std::collections::HashMap;
 use petgraph::graph::EdgeIndex;
 use rayon::prelude::*;
 
-use crate::graph::{seeds, LatLon, Role, SnapResult, SpatialGraph};
+use crate::ch::Seed;
+use crate::graph::{Anchor, LatLon, Role, Roots, SnapResult, SpatialGraph};
 use crate::reachability::EdgeInfo;
-use crate::search::dijkstra;
+use crate::search::dijkstra_with_lengths;
 
 /// Travel times between every origin and every destination.
 #[derive(Debug, Clone)]
@@ -23,6 +24,9 @@ pub struct TravelTimeMatrix {
     /// closure's units) from origin `i` to destination `j`; `None` when no
     /// route exists or either point could not be snapped.
     pub durations_s: Vec<Vec<Option<f64>>>,
+    /// `distances_m[i][j]` is the length in metres of that fastest route;
+    /// `None` exactly where `durations_s` is.
+    pub distances_m: Vec<Vec<Option<f64>>>,
     /// Where each origin joined the network; `None` if it was farther than
     /// `max_snap_m` from every road (or the graph has no roads).
     pub origin_snaps: Vec<Option<SnapResult>>,
@@ -50,6 +54,20 @@ fn snap_all(
         .collect()
 }
 
+/// `(state, cost, metres)` seeds for a point's roots: the metres are the
+/// share of road between the point and the junction each root stands for.
+fn seeds_with_lengths(sg: &SpatialGraph, anchors: &[Anchor], roots: &Roots) -> Vec<Seed> {
+    roots
+        .iter()
+        .map(|&(state, cost, i)| {
+            let length = anchors[i]
+                .piece
+                .map_or(0.0, |p| p.share() * sg.graph[p.edge].length);
+            (state, cost, length)
+        })
+        .collect()
+}
+
 fn matrix(
     sg: &SpatialGraph,
     origins: Vec<LatLon>,
@@ -63,22 +81,22 @@ fn matrix(
 
     // Seeds for each point: where it enters (or leaves) the search graph and
     // at what cost. Unsnapped points get none and stay unreachable.
-    let from: Vec<Vec<(u32, f64)>> = origin_snaps
+    let from: Vec<Vec<Seed>> = origin_snaps
         .par_iter()
         .map(|snap| match snap {
             Some(snap) => {
                 let anchors = sg.departures(snap, &mut |e| edge_cost(e));
-                seeds(&sg.departure_roots(&anchors))
+                seeds_with_lengths(sg, &anchors, &sg.departure_roots(&anchors))
             }
             None => Vec::new(),
         })
         .collect();
-    let to: Vec<Vec<(u32, f64)>> = destination_snaps
+    let to: Vec<Vec<Seed>> = destination_snaps
         .par_iter()
         .map(|snap| match snap {
             Some(snap) => {
                 let anchors = sg.arrivals(snap, &mut |e| edge_cost(e));
-                seeds(&sg.arrival_roots(&anchors))
+                seeds_with_lengths(sg, &anchors, &sg.arrival_roots(&anchors))
             }
             None => Vec::new(),
         })
@@ -86,7 +104,10 @@ fn matrix(
 
     let width = to.len();
     let mut table = match (&costs, sg.hierarchy_slot().get()) {
-        (Costs::Native, Some(hierarchy)) => hierarchy.many_to_many(&from, &to),
+        (Costs::Native, Some(hierarchy)) => {
+            let (costs, lengths) = hierarchy.many_to_many(&from, &to);
+            costs.into_iter().zip(lengths).collect()
+        }
         _ => {
             let (out, inc) = match costs {
                 Costs::Native => {
@@ -129,25 +150,33 @@ fn matrix(
                 same_road.dedup();
                 for j in same_road {
                     let destination = destination_snaps[j].as_ref().expect("indexed above");
-                    if let Some((cost, _)) =
+                    if let Some((cost, piece)) =
                         sg.direct_piece(origin, destination, &mut |e| edge_cost(e))
                     {
-                        row[j] = row[j].min(cost);
+                        if cost < row[j].0 {
+                            row[j] = (cost, piece.share() * sg.graph[piece.edge].length);
+                        }
                     }
                 }
             });
     }
 
-    let durations_s = if width == 0 {
-        vec![Vec::new(); from.len()]
-    } else {
+    let rows = |pick: fn(&(f64, f64)) -> f64| -> Vec<Vec<Option<f64>>> {
+        if width == 0 {
+            return vec![Vec::new(); from.len()];
+        }
         table
             .chunks(width)
-            .map(|row| row.iter().map(|&c| c.is_finite().then_some(c)).collect())
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.0.is_finite().then(|| pick(cell)))
+                    .collect()
+            })
             .collect()
     };
     TravelTimeMatrix {
-        durations_s,
+        durations_s: rows(|c| c.0),
+        distances_m: rows(|c| c.1),
         origin_snaps,
         destination_snaps,
     }
@@ -155,28 +184,34 @@ fn matrix(
 
 /// One Dijkstra search per point on the smaller side: forward from each
 /// origin, or backward from each destination when there are fewer of those.
+/// Cells are `(cost, metres)`.
 fn dijkstra_table(
     sg: &SpatialGraph,
-    from: &[Vec<(u32, f64)>],
-    to: &[Vec<(u32, f64)>],
+    from: &[Vec<Seed>],
+    to: &[Vec<Seed>],
     out_costs: &[f64],
     inc_costs: &[f64],
-) -> Vec<f64> {
+) -> Vec<(f64, f64)> {
     let index = sg.search_index();
     let width = to.len();
-    let mut table = vec![f64::INFINITY; from.len() * width];
+    let unreachable = (f64::INFINITY, f64::INFINITY);
+    let mut table = vec![unreachable; from.len() * width];
     if width == 0 || from.is_empty() {
         return table;
     }
-    let best = |labels: &crate::graph::NodeMap<f64>, seeds: &[(u32, f64)]| {
+    let edge_length = |adjacency: &crate::search::Adjacency, slot: usize| {
+        sg.graph.raw_edges()[adjacency.edges[slot] as usize]
+            .weight
+            .length
+    };
+    let best = |labels: &crate::graph::NodeMap<(f64, f64)>, seeds: &[Seed]| {
         seeds
             .iter()
-            .filter_map(|&(state, offset)| {
-                labels
-                    .get(petgraph::graph::NodeIndex::new(state as usize))
-                    .map(|d| d + offset)
+            .filter_map(|&(state, cost, length)| {
+                let &(c, l) = labels.get(petgraph::graph::NodeIndex::new(state as usize))?;
+                Some((c + cost, l + length))
             })
-            .fold(f64::INFINITY, f64::min)
+            .fold(unreachable, |a, b| if b.0 < a.0 { b } else { a })
     };
     if from.len() <= to.len() {
         table
@@ -186,25 +221,35 @@ fn dijkstra_table(
                 if sources.is_empty() {
                     return;
                 }
-                let labels = dijkstra(&index.out, sources, f64::INFINITY, |s| out_costs[s]);
+                let labels = dijkstra_with_lengths(
+                    &index.out,
+                    sources,
+                    |s| out_costs[s],
+                    |s| edge_length(&index.out, s),
+                );
                 for (cell, targets) in row.iter_mut().zip(to) {
                     *cell = best(&labels, targets);
                 }
             });
     } else {
-        let columns: Vec<Vec<f64>> = to
+        let columns: Vec<Vec<(f64, f64)>> = to
             .par_iter()
             .map(|targets| {
                 if targets.is_empty() {
-                    return vec![f64::INFINITY; from.len()];
+                    return vec![unreachable; from.len()];
                 }
-                let labels = dijkstra(&index.inc, targets, f64::INFINITY, |s| inc_costs[s]);
+                let labels = dijkstra_with_lengths(
+                    &index.inc,
+                    targets,
+                    |s| inc_costs[s],
+                    |s| edge_length(&index.inc, s),
+                );
                 from.iter().map(|sources| best(&labels, sources)).collect()
             })
             .collect();
         for (j, column) in columns.into_iter().enumerate() {
-            for (i, cost) in column.into_iter().enumerate() {
-                table[i * width + j] = cost;
+            for (i, cell) in column.into_iter().enumerate() {
+                table[i * width + j] = cell;
             }
         }
     }
@@ -258,13 +303,15 @@ impl SpatialGraph {
     {
         let edge_cost = |e: EdgeIndex| cost(EdgeInfo::of(&self.graph, e.index() as u32));
         let index = self.search_index();
-        let slot_costs = |edges: &[u32]| -> Vec<f64> {
-            edges
+        let slot_costs = |adjacency: &crate::search::Adjacency| -> Vec<f64> {
+            adjacency
+                .edges
                 .par_iter()
-                .map(|&e| edge_cost(EdgeIndex::new(e as usize)))
+                .enumerate()
+                .map(|(slot, &e)| adjacency.slot_cost(slot, edge_cost(EdgeIndex::new(e as usize))))
                 .collect()
         };
-        let (out, inc) = (slot_costs(&index.out.edges), slot_costs(&index.inc.edges));
+        let (out, inc) = (slot_costs(&index.out), slot_costs(&index.inc));
         matrix(
             self,
             origins.iter().map(|&p| p.into()).collect(),
@@ -332,11 +379,21 @@ mod tests {
                 assert_eq!(table.durations_s.len(), rows.len());
                 for (i, &o) in rows.iter().enumerate() {
                     for (j, &d) in cols.iter().enumerate() {
-                        let want = prepared.route(o, d, Some(100.0)).ok().map(|r| r.duration_s);
+                        let route = prepared.route(o, d, Some(100.0)).ok();
+                        let want = route.as_ref().map(|r| r.duration_s);
                         let got = table.durations_s[i][j];
+                        assert_eq!(got.is_some(), table.distances_m[i][j].is_some());
                         match (got, want) {
                             (Some(a), Some(b)) => {
-                                assert!((a - b).abs() < 1e-6, "table {t} {i}->{j}: {a} vs {b}")
+                                assert!((a - b).abs() < 1e-6, "table {t} {i}->{j}: {a} vs {b}");
+                                let (got, want) = (
+                                    table.distances_m[i][j].unwrap(),
+                                    route.as_ref().unwrap().distance_m,
+                                );
+                                assert!(
+                                    (got - want).abs() < 1e-6,
+                                    "table {t} {i}->{j}: {got} m vs {want} m"
+                                );
                             }
                             (None, None) => {}
                             other => panic!("table {t} {i}->{j}: {other:?}"),

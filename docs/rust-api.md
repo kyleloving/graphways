@@ -98,8 +98,17 @@ let graph = SpatialGraph::from_pbf_with("area.osm.pbf", NetworkType::Walk, &opti
 ```
 
 `Profile` holds walking and cycling speeds, a driving speed per `highway=*`
-class (with a fallback), whether `maxspeed` tags override them, and the
-distance under which intersections merge during simplification.
+class (with a fallback), whether `maxspeed` tags override them, the distance
+under which intersections merge during simplification, the delay at traffic
+signals, and `turn_costs: TurnCosts` for driving.
+
+`TurnCosts` follows OSRM's car profile: nearly free straight on, about 2 s for
+a right and 5 s for a left turn in right-hand traffic, plus 20 s for a
+U-turn; `left_hand_traffic` mirrors it and `TurnCosts::none()` turns it off.
+Driving graphs built from OSM data get these costs automatically; for your
+own graphs pass `(into, out, seconds)` triples to
+`SpatialGraph::with_turns`. Turn costs are added to whatever edge cost a
+query uses, including custom cost closures.
 
 ### Saving and loading
 
@@ -140,7 +149,7 @@ the closest point on a road, so searches start and end part-way along edges.
 
 ### Routing
 
-`prepare_routing()` builds a contraction hierarchy (about 0.2 s for a city's
+`prepare_routing()` builds a contraction hierarchy (about 1.5 s for a city's
 driving graph and 5 s for a dense walking graph, on all cores). Routes then
 take well under a millisecond. Without it, `route` uses A\* with a
 straight-line lower bound; both are exact. The hierarchy is shared by every
@@ -166,10 +175,11 @@ negative, NaN or infinite costs make an edge impassable.
 ```rust
 let matrix = graph.travel_time_matrix(&homes, &clinics, Some(250.0));
 let seconds: Option<f64> = matrix.durations_s[i][j];
+let metres: Option<f64> = matrix.distances_m[i][j]; // length of that fastest route
 ```
 
 With routing prepared, a matrix costs one small search per point (Munich,
-1000 x 1000: about 50 ms driving, 150 ms walking). Unprepared graphs and
+1000 x 1000: about 80 ms driving, 150 ms walking). Unprepared graphs and
 custom costs run one Dijkstra search per point on the smaller side. Points
 too far from any road get a `None` snap and `None` times instead of failing
 the whole matrix.
@@ -347,5 +357,8 @@ pub enum OsmGraphError {
   the snapped `origin`; `FeasibilityResult::feasible` is a
   `NodeMap<FeasibleNode>` and its `origin`/`destination` are `SnapResult`s.
   `NodeMap::get` takes a `NodeIndex` by value.
-- Driving graphs obey turn restrictions, so some driving times rise where a
-  shorter path used a banned turn.
+- Driving graphs obey turn restrictions and price turns and traffic signals
+  (see [Speed profiles](#speed-profiles)), so driving times are longer than
+  0.4's, typically by 10-15% in a city. Build with
+  `Profile { turn_costs: TurnCosts::none(), traffic_signal_s: 0.0, .. }` to
+  get the old model back.

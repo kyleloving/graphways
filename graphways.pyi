@@ -174,6 +174,15 @@ class TravelTimeMatrix:
         ...
 
     @property
+    def distances_m(self) -> tuple[tuple[float | None, ...], ...]:
+        """
+        ``distances_m[i][j]``: length in metres of the fastest route from
+        origin ``i`` to destination ``j``; ``None`` exactly where
+        ``durations_s`` is.
+        """
+        ...
+
+    @property
     def origin_snaps(self) -> list[SnapResult | None]:
         """Where each origin joined the network (``None`` if too far away)."""
         ...
@@ -386,7 +395,9 @@ class SpatialGraph:
         ``"bike"``, ``"all"``, or ``"all_private"``. Speed-profile keywords:
         ``walk_speed_kph``, ``bike_speed_kph``, ``drive_speeds_kph`` (a
         ``{highway_class: kph}`` dict), ``default_drive_speed_kph``,
-        ``use_maxspeed`` and ``merge_distance_m``.
+        ``use_maxspeed``, ``merge_distance_m``, ``traffic_signal_s``, and the
+        driving turn costs ``turn_penalty_s``, ``turn_bias``,
+        ``u_turn_penalty_s`` and ``left_hand_traffic``.
         """
         ...
 

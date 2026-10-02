@@ -24,6 +24,77 @@ pub struct Profile {
     /// Intersection nodes closer than this (metres) are merged when the
     /// graph is simplified. 0 disables merging.
     pub merge_distance_m: f64,
+    /// Seconds added to the driving time for passing a traffic signal
+    /// (`highway=traffic_signals`, honouring `traffic_signals:direction`).
+    pub traffic_signal_s: f64,
+    /// Time lost turning at junctions when driving.
+    pub turn_costs: TurnCosts,
+}
+
+/// Time lost turning at a junction when driving, modelled on OSRM's car
+/// profile so travel times are comparable.
+///
+/// A turn through angle `a` (degrees, 0 = straight on, positive = right)
+/// costs `turn_penalty_s / (1 + exp(-(13 / bias * a / 180 - 6.5 * bias)))`
+/// for right turns and the mirror image, with `1 / bias`, for left turns,
+/// where `bias` favours turns away from oncoming traffic: nearly free
+/// straight on, about 2 s for a right and 5 s for a left turn with the
+/// defaults. U-turns add `u_turn_penalty_s`. Turns are priced only at real
+/// junctions (three or more roads) and for U-turns. All zeros disables it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnCosts {
+    pub turn_penalty_s: f64,
+    /// Above 1 makes turns across oncoming traffic dearer.
+    pub turn_bias: f64,
+    pub u_turn_penalty_s: f64,
+    /// Traffic drives on the left (UK, Japan, ...): left turns are the cheap ones.
+    pub left_hand_traffic: bool,
+}
+
+impl TurnCosts {
+    /// No turn costs at all.
+    pub fn none() -> Self {
+        TurnCosts {
+            turn_penalty_s: 0.0,
+            turn_bias: 1.0,
+            u_turn_penalty_s: 0.0,
+            left_hand_traffic: false,
+        }
+    }
+
+    /// Whether any turn costs time.
+    pub fn is_none(&self) -> bool {
+        self.turn_penalty_s <= 0.0 && self.u_turn_penalty_s <= 0.0
+    }
+
+    /// Seconds for a turn through `angle_deg` (0 = straight, positive =
+    /// right, within ±180); `u_turn` adds the U-turn penalty.
+    pub fn cost(&self, angle_deg: f64, u_turn: bool) -> f64 {
+        let bias = if self.left_hand_traffic {
+            1.0 / self.turn_bias
+        } else {
+            self.turn_bias
+        };
+        let share = angle_deg.abs().min(180.0) / 180.0;
+        let exponent = if angle_deg >= 0.0 {
+            13.0 / bias * share - 6.5 * bias
+        } else {
+            13.0 * bias * share - 6.5 / bias
+        };
+        let turn = self.turn_penalty_s / (1.0 + (-exponent).exp());
+        turn + if u_turn { self.u_turn_penalty_s } else { 0.0 }
+    }
+}
+
+impl Default for TurnCosts {
+    fn default() -> Self {
+        TurnCosts {
+            turn_penalty_s: 7.5,
+            turn_bias: 1.075,
+            u_turn_penalty_s: 20.0,
+            left_hand_traffic: false,
+        }
+    }
 }
 
 impl Profile {
@@ -72,6 +143,8 @@ impl Default for Profile {
             default_drive_speed_kph: 50.0,
             use_maxspeed: true,
             merge_distance_m: 5.0,
+            traffic_signal_s: 2.0,
+            turn_costs: TurnCosts::default(),
         }
     }
 }
@@ -91,5 +164,26 @@ impl BuildOptions {
             retain_all,
             ..Self::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_costs_match_osrm_car_profile() {
+        let costs = TurnCosts::default();
+        assert!(costs.cost(0.0, false) < 0.01, "straight on is nearly free");
+        let (right, left) = (costs.cost(90.0, false), costs.cost(-90.0, false));
+        assert!((right - 2.1).abs() < 0.05, "{right}");
+        assert!((left - 5.4).abs() < 0.05, "{left}");
+        assert!((costs.cost(180.0, true) - 27.5).abs() < 0.1);
+        let uk = TurnCosts {
+            left_hand_traffic: true,
+            ..TurnCosts::default()
+        };
+        assert!((uk.cost(-90.0, false) - right).abs() < 1e-9, "mirror image");
+        assert_eq!(TurnCosts::none().cost(-120.0, true), 0.0);
     }
 }

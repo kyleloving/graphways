@@ -28,7 +28,7 @@ use crate::graph::{Edge, OsmNode, OsmTag, RoadGraph, SnapResult, SnappedPoi, Spa
 use crate::overpass::NetworkType;
 
 const MAGIC: &[u8; 8] = b"GRAPHWAY";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize)]
 struct SavedGraph {
@@ -37,6 +37,7 @@ struct SavedGraph {
     tag_sets: Vec<Vec<OsmTag>>,
     edges: Vec<SavedEdge>,
     forbidden_turns: Vec<(u32, u32)>,
+    turn_costs: Vec<(u32, u32, f64)>,
     poi_snaps: Option<Vec<SavedSnap>>,
     hierarchy: Option<ContractionHierarchy>,
 }
@@ -164,6 +165,11 @@ impl SpatialGraph {
                 .iter()
                 .map(|&(a, b)| (a.index() as u32, b.index() as u32))
                 .collect(),
+            turn_costs: self
+                .turn_costs()
+                .iter()
+                .map(|&(a, b, c)| (a.index() as u32, b.index() as u32, c))
+                .collect(),
             poi_snaps,
             hierarchy: self.hierarchy_slot().get().cloned(),
         }
@@ -225,7 +231,19 @@ impl SpatialGraph {
             .map(|&(a, b)| (EdgeIndex::new(a as usize), EdgeIndex::new(b as usize)))
             .collect();
 
-        let mut sg = SpatialGraph::with_forbidden_turns(graph, saved.network_type, turns);
+        if !saved
+            .turn_costs
+            .iter()
+            .all(|&(a, b, c)| in_range(a) && in_range(b) && c.is_finite() && c >= 0.0)
+        {
+            return Err(invalid("turn cost refers to a missing edge or is invalid"));
+        }
+        let turn_costs = saved
+            .turn_costs
+            .iter()
+            .map(|&(a, b, c)| (EdgeIndex::new(a as usize), EdgeIndex::new(b as usize), c))
+            .collect();
+        let mut sg = SpatialGraph::with_turns(graph, saved.network_type, turns, turn_costs);
         if let Some(snaps) = saved.poi_snaps {
             let mut by_id = HashMap::with_capacity(snaps.len());
             for s in snaps {
@@ -346,6 +364,8 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         assert_eq!(loaded.forbidden_turns(), sg.forbidden_turns());
+        assert_eq!(loaded.turn_costs(), sg.turn_costs());
+        assert!(!loaded.turn_costs().is_empty());
         assert!(!loaded.forbidden_turns().is_empty());
         let route = |g: &SpatialGraph| {
             g.route((0.0, 0.0), (0.001, 0.001), None)

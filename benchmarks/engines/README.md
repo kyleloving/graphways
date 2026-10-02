@@ -48,13 +48,14 @@ These are latencies, **not** like-for-like answers. Each engine has its own
 travel-time model, and the script prints how far each engine's matrix
 durations are from graphways':
 
-- OSRM's car profile adds turn penalties, traffic-signal delays and its own
-  road speeds. Its driving times differ from graphways' by a median of 37%
-  on Munich; walking times agree to about 2%.
+- OSRM's car profile uses its own road speeds (it drives 80% of the posted
+  limit, for example). Both engines price turns and traffic signals the same
+  way, yet OSRM's driving times still differ from graphways' by a median of
+  25% on Munich; walking times agree to about 2%.
 - Valhalla prices every query on the fly (dynamic costing, no
   precomputation), which is what makes it flexible and why its single
   queries are slower. Its durations agree with graphways' to within about
-  7% (driving) and 1% (walking).
+  3% (driving) and 1% (walking).
 - OSRM and Valhalla also do things graphways does not: turn-by-turn
   instructions (disabled for Valhalla here), map matching, trip planning.
 
@@ -65,20 +66,21 @@ queries, wall time for matrices.
 
 | | graphways | OSRM CH | OSRM MLD | Valhalla |
 |---|---|---|---|---|
-| Drive route | 0.09 ms | 0.74 ms | 0.85 ms | 30 ms |
-| Drive matrix 100 x 100 | 5 ms | 39 ms | 108 ms | 10 s* |
-| Drive matrix 1000 x 1000 | 37 ms | 680 ms | 2.4 s | - |
-| Drive isochrone (5/10/15 min) | 8 ms | - | - | 200 ms |
+| Drive route | 0.18 ms | 0.64 ms | 0.85 ms | 28 ms |
+| Drive matrix 100 x 100 | 13 ms | 37 ms | 103 ms | 10 s* |
+| Drive matrix 1000 x 1000 | 74 ms | 590 ms | 2.3 s | - |
+| Drive isochrone (5/10/15 min) | 11 ms | - | - | 210 ms |
 | Walk route | 0.33 ms | 1.3 ms | 3.3 ms | 33 ms |
 | Walk matrix 1000 x 1000 | 126 ms | 1.7 s | 10 s | - |
 | Walk isochrone (10/20/30 min) | 6 ms | - | - | 33 ms |
-| Drive setup | 1.6 s | 53 s | 18 s | 19 s (tiles, both modes) |
+| Drive setup | 3.0 s | 53 s | 18 s | 19 s (tiles, both modes) |
 | Walk setup | 9 s | 248 s | 17 s | (shared) |
 
 \* Valhalla's CostMatrix with default `thor` settings; it was not tuned
 further and is likely not representative of a production deployment.
 
-The graphways matrix uses all cores (rayon); single-threaded it took 54 ms
-(drive) and 250 ms (walk) for 1000 x 1000, while OSRM answers each table
-request on one thread. Treat the comparison as indicative: graphways' driving
-model is simpler than OSRM's, and part of OSRM's extra time pays for it.
+Graphways' drive numbers include turn costs and signal delays (switching
+them off makes routes and matrices about twice as fast and preparation ten
+times faster). The graphways matrix uses all cores (rayon), while OSRM
+answers each table request on one thread; on one thread graphways took about
+twice as long. Treat the comparison as indicative.

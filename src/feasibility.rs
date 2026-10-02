@@ -282,7 +282,7 @@ where
                 Side::Out => &index.out,
                 Side::In => &index.inc,
             };
-            price_edge(adjacency.edges[slot])
+            adjacency.slot_cost(slot, price_edge(adjacency.edges[slot]))
         },
     )
 }

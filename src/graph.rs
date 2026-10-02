@@ -452,8 +452,16 @@ fn build_graph(
     let mut graph = DiGraph::with_capacity(nodes.len(), segment_count * 2);
     let mut node_index_map = HashMap::with_capacity(nodes.len());
 
+    // Traffic signals delay drivers entering their node: in both directions,
+    // or only along/against the way per `traffic_signals:direction`.
+    let mut signals: HashMap<i64, SignalDirection> = HashMap::new();
     for node in nodes {
         let id = node.id;
+        if profile.traffic_signal_s > 0.0 {
+            if let Some(direction) = signal_direction(&node.tags) {
+                signals.insert(id, direction);
+            }
+        }
         node_index_map.insert(id, graph.add_node(node));
     }
 
@@ -473,8 +481,18 @@ fn build_graph(
             let length = calculate_distance(pa.0, pa.1, pb.0, pb.1);
             for &reversed in traversals {
                 let (from, to) = if reversed { (b, a) } else { (a, b) };
-                let edge =
+                let mut edge =
                     Edge::with_profile(way.id, Arc::clone(&tags), length, speed_kph, profile);
+                let entered = if reversed { &pair[0] } else { &pair[1] };
+                let delayed = match signals.get(&entered.node_id) {
+                    Some(SignalDirection::Both) => true,
+                    Some(SignalDirection::Forward) => !reversed,
+                    Some(SignalDirection::Backward) => reversed,
+                    None => false,
+                };
+                if delayed && edge.drive_travel_time.is_finite() {
+                    edge.drive_travel_time += profile.traffic_signal_s;
+                }
                 graph.add_edge(from, to, edge);
             }
         }
@@ -485,6 +503,28 @@ fn build_graph(
     } else {
         simplify_graph(graph, profile, protected)
     }
+}
+
+#[derive(Clone, Copy)]
+enum SignalDirection {
+    Both,
+    Forward,
+    Backward,
+}
+
+/// Whether a node is a traffic signal for drivers, and for which direction
+/// along its way.
+fn signal_direction(tags: &[OsmTag]) -> Option<SignalDirection> {
+    if find_tag(tags, "highway").map(|t| t.value.as_str()) != Some("traffic_signals") {
+        return None;
+    }
+    Some(
+        match find_tag(tags, "traffic_signals:direction").map(|t| t.value.as_str()) {
+            Some("forward") => SignalDirection::Forward,
+            Some("backward") => SignalDirection::Backward,
+            _ => SignalDirection::Both,
+        },
+    )
 }
 
 /// Parse an OSM `maxspeed` value ("50", "30 mph", "50;30") into km/h.
@@ -811,6 +851,7 @@ pub struct SpatialGraph {
 /// on first use and then shared by every clone.
 struct GraphIndex {
     forbidden_turns: Vec<(EdgeIndex, EdgeIndex)>,
+    turn_costs: Vec<(EdgeIndex, EdgeIndex, f64)>,
     tree: RTree<NodeEntry>,
     segments: RTree<SegmentEntry>,
     search: SearchIndex,
@@ -831,17 +872,34 @@ impl SpatialGraph {
     pub fn with_forbidden_turns(
         graph: RoadGraph,
         network_type: NetworkType,
+        forbidden_turns: Vec<(EdgeIndex, EdgeIndex)>,
+    ) -> Self {
+        Self::with_turns(graph, network_type, forbidden_turns, Vec::new())
+    }
+
+    /// Wrap a road graph with banned turns and with turn costs: each
+    /// `(into junction, out of junction, seconds)` in `turn_costs` adds that
+    /// many seconds to the turn (e.g. from [`crate::profile::TurnCosts`]).
+    /// Turn costs add to whatever edge cost a query uses, including the
+    /// closures of the `_with` queries.
+    pub fn with_turns(
+        graph: RoadGraph,
+        network_type: NetworkType,
         mut forbidden_turns: Vec<(EdgeIndex, EdgeIndex)>,
+        mut turn_costs: Vec<(EdgeIndex, EdgeIndex, f64)>,
     ) -> Self {
         forbidden_turns.sort_unstable();
         forbidden_turns.dedup();
+        turn_costs.retain(|&(_, _, cost)| cost.is_finite() && cost > 0.0);
+        turn_costs.sort_unstable_by_key(|&(a, b, _)| (a, b));
+        turn_costs.dedup_by_key(|&mut (a, b, _)| (a, b));
         let tree = RTree::bulk_load(
             graph
                 .node_indices()
                 .map(|i| NodeEntry::new(&graph[i], i))
                 .collect(),
         );
-        let search = SearchIndex::new(&graph, &forbidden_turns);
+        let search = SearchIndex::new(&graph, &forbidden_turns, &turn_costs);
         let segments = RTree::bulk_load(segment_entries(&graph));
         Self {
             graph: Arc::new(graph),
@@ -849,6 +907,7 @@ impl SpatialGraph {
             network_type,
             index: Arc::new(GraphIndex {
                 forbidden_turns,
+                turn_costs,
                 tree,
                 segments,
                 search,
@@ -879,7 +938,12 @@ impl SpatialGraph {
         let protected = restrictions::via_nodes(&restrictions);
         let graph = build_graph(data.nodes, data.ways, bidirectional, options, &protected);
         let turns = restrictions::forbidden_turns(&graph, &restrictions);
-        Self::with_forbidden_turns(graph, network_type, turns)
+        let turn_costs = if restrictions::applies_to(network_type) {
+            crate::turns::turn_costs(&graph, &options.profile.turn_costs)
+        } else {
+            Vec::new()
+        };
+        Self::with_turns(graph, network_type, turns, turn_costs)
     }
 
     /// Parse an OSM XML document (e.g. an Overpass response) and build a
@@ -914,6 +978,19 @@ impl SpatialGraph {
     /// edge pairs.
     pub fn forbidden_turns(&self) -> &[(EdgeIndex, EdgeIndex)] {
         &self.index.forbidden_turns
+    }
+
+    /// Seconds added to turns, as `(into junction, out of junction, cost)`.
+    pub fn turn_costs(&self) -> &[(EdgeIndex, EdgeIndex, f64)] {
+        &self.index.turn_costs
+    }
+
+    /// The cost of turning from edge `into` onto edge `out` (0 if free).
+    pub fn turn_cost(&self, into: EdgeIndex, out: EdgeIndex) -> f64 {
+        let costs = &self.index.turn_costs;
+        costs
+            .binary_search_by_key(&(into, out), |&(a, b, _)| (a, b))
+            .map_or(0.0, |i| costs[i].2)
     }
 
     pub(crate) fn cost_field(&self) -> CostField {
@@ -986,13 +1063,21 @@ impl SpatialGraph {
                     subgraph.add_edge(source, target, edge.weight().clone());
             }
         }
+        let kept = |a: EdgeIndex, b: EdgeIndex| {
+            let (a, b) = (edge_remap[a.index()], edge_remap[b.index()]);
+            (a != EdgeIndex::end() && b != EdgeIndex::end()).then_some((a, b))
+        };
         let turns = self
             .forbidden_turns()
             .iter()
-            .map(|&(a, b)| (edge_remap[a.index()], edge_remap[b.index()]))
-            .filter(|&(a, b)| a != EdgeIndex::end() && b != EdgeIndex::end())
+            .filter_map(|&(a, b)| kept(a, b))
             .collect();
-        SpatialGraph::with_forbidden_turns(subgraph, self.network_type, turns)
+        let turn_costs = self
+            .turn_costs()
+            .iter()
+            .filter_map(|&(a, b, cost)| kept(a, b).map(|(a, b)| (a, b, cost)))
+            .collect();
+        SpatialGraph::with_turns(subgraph, self.network_type, turns, turn_costs)
     }
 
     /// Pre-snap a set of POI nodes to their nearest graph nodes, storing the
@@ -1170,11 +1255,13 @@ impl SpatialGraph {
             .iter()
             .enumerate()
             .flat_map(|(i, a)| {
-                let states: Vec<u32> = match a.piece {
+                let states: Vec<(u32, f64)> = match a.piece {
                     Some(piece) => index.tail_states(piece.edge, a.node).collect(),
-                    None => index.states_of(a.node).collect(),
+                    None => index.states_of(a.node).map(|state| (state, 0.0)).collect(),
                 };
-                states.into_iter().map(move |state| (state, a.cost, i))
+                states
+                    .into_iter()
+                    .map(move |(state, turn)| (state, a.cost + turn, i))
             })
             .collect()
     }
