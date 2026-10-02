@@ -551,7 +551,7 @@ mod tests {
     fn ch_matches_dijkstra_on_every_pair() {
         for seed in [1, 2, 3] {
             let g = grid(9, seed);
-            let index = SearchIndex::new(&g);
+            let index = SearchIndex::new(&g, &[]);
             let costs: Vec<f64> = index
                 .out
                 .edges

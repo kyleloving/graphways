@@ -6,6 +6,8 @@
 //! maps, and edge weights are moved rather than cloned wherever the old graph
 //! is no longer needed.
 
+use std::collections::{HashMap, HashSet};
+
 use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
 use petgraph::visit::EdgeRef;
 use petgraph::Direction::{Incoming, Outgoing};
@@ -15,13 +17,16 @@ use crate::graph::{edge_geometry, Edge, NodeEntry, OsmNode, RoadGraph};
 use crate::profile::Profile;
 use crate::utils::calculate_distance;
 
-pub fn simplify_graph(graph: RoadGraph, profile: &Profile) -> RoadGraph {
-    let (graph, _) = consolidate_intersections(graph, profile);
+/// Simplify a raw road graph. Nodes whose OSM ids are in `protected` (the
+/// via nodes of turn restrictions) are never merged or collapsed away.
+pub fn simplify_graph(graph: RoadGraph, profile: &Profile, protected: &HashSet<i64>) -> RoadGraph {
+    let (graph, _) = consolidate_intersections(graph, profile, protected);
 
-    let is_endpoint: Vec<bool> = graph
+    let mut is_endpoint: Vec<bool> = graph
         .node_indices()
-        .map(|node| is_endpoint(&graph, node))
+        .map(|node| protected.contains(&graph[node].id) || is_endpoint(&graph, node))
         .collect();
+    keep_roads_distinct(&graph, &mut is_endpoint);
     let endpoints = || graph.node_indices().filter(|n| is_endpoint[n.index()]);
 
     let mut simplified = DiGraph::new();
@@ -63,6 +68,48 @@ fn add_or_keep_fastest(graph: &mut RoadGraph, source: NodeIndex, target: NodeInd
             if way.drive_travel_time < kept.drive_travel_time {
                 *kept = way;
             }
+        }
+    }
+}
+
+/// Collapsing chains must not lose roads. A chain that comes back to its own
+/// start would become a self-loop, and two different chains joining the same
+/// ordered pair of junctions would become parallel edges, of which
+/// deduplication keeps only the faster. Keep the middle node of each such
+/// chain (repeating until none is left) so every road survives as its own
+/// edge, which matters once points snap onto roads.
+fn keep_roads_distinct(graph: &RoadGraph, is_endpoint: &mut [bool]) {
+    let mut chain = Vec::new();
+    loop {
+        let mut first_chain: HashMap<(NodeIndex, NodeIndex), EdgeIndex> = HashMap::new();
+        let mut split = Vec::new();
+        for start in graph.node_indices() {
+            if !is_endpoint[start.index()] {
+                continue;
+            }
+            for first in graph.edges(start) {
+                chain.clear();
+                chain.push(first.id());
+                let end = follow_chain(graph, is_endpoint, start, first.target(), &mut chain);
+                if !is_endpoint[end.index()] || chain.len() < 2 {
+                    continue;
+                }
+                let duplicate = end == start
+                    || *first_chain.entry((start, end)).or_insert(first.id()) != first.id();
+                if duplicate {
+                    let middle = graph
+                        .edge_endpoints(chain[(chain.len() - 1) / 2])
+                        .unwrap()
+                        .1;
+                    split.push(middle);
+                }
+            }
+        }
+        if split.is_empty() {
+            break;
+        }
+        for node in split {
+            is_endpoint[node.index()] = true;
         }
     }
 }
@@ -118,6 +165,7 @@ fn collapse_path_edges(graph: &RoadGraph, edges: &[EdgeIndex]) -> Edge {
     let first = &graph[edges[0]];
     let mut way = Edge {
         way_id: first.way_id,
+        last_way_id: graph[edges[edges.len() - 1]].last_way_id,
         tags: first.tags.clone(),
         ..Edge::default()
     };
@@ -189,7 +237,11 @@ fn is_endpoint(graph: &RoadGraph, node: NodeIndex) -> bool {
 /// stretched if its endpoints now lie farther apart than its length. Travel
 /// times scale with length, keeping each edge's speed, and no edge ends up
 /// "faster than straight" (which would also break the A* lower bound).
-fn consolidate_intersections(graph: RoadGraph, profile: &Profile) -> (RoadGraph, Vec<NodeIndex>) {
+fn consolidate_intersections(
+    graph: RoadGraph,
+    profile: &Profile,
+    protected: &HashSet<i64>,
+) -> (RoadGraph, Vec<NodeIndex>) {
     let merge_distance_m = profile.merge_distance_m;
     let tree = RTree::bulk_load(
         graph
@@ -197,7 +249,7 @@ fn consolidate_intersections(graph: RoadGraph, profile: &Profile) -> (RoadGraph,
             .map(|index| NodeEntry::new(&graph[index], index))
             .collect(),
     );
-    let clusters = cluster_nodes_by_distance(&graph, &tree, merge_distance_m);
+    let clusters = cluster_nodes_by_distance(&graph, &tree, merge_distance_m, protected);
 
     let mut new_graph = DiGraph::with_capacity(clusters.len(), graph.edge_count());
     let mut old_to_new = vec![NodeIndex::end(); graph.node_count()];
@@ -260,19 +312,26 @@ fn cluster_nodes_by_distance(
     graph: &RoadGraph,
     tree: &RTree<NodeEntry>,
     merge_distance_m: f64,
+    protected: &HashSet<i64>,
 ) -> Vec<Vec<NodeIndex>> {
     let mut clusters = Vec::new();
     let mut assigned = vec![false; graph.node_count()];
+    let is_protected = |idx: NodeIndex| protected.contains(&graph[idx].id);
 
     for idx in graph.node_indices() {
         if assigned[idx.index()] {
+            continue;
+        }
+        if is_protected(idx) {
+            assigned[idx.index()] = true;
+            clusters.push(vec![idx]);
             continue;
         }
         let node = &graph[idx];
         let center = NodeEntry::new(node, idx).point;
         let members: Vec<NodeIndex> = tree
             .locate_within_distance(center, merge_distance_m * merge_distance_m)
-            .filter(|entry| !assigned[entry.index.index()])
+            .filter(|entry| !assigned[entry.index.index()] && !is_protected(entry.index))
             .filter(|entry| {
                 let candidate = &graph[entry.index];
                 calculate_distance(node.lat, node.lon, candidate.lat, candidate.lon)
@@ -363,7 +422,7 @@ mod tests {
         graph.add_edge(a, b, make_way(2, 50.0));
 
         assert_eq!(graph.edge_count(), 2);
-        let deduped = simplify_graph(graph, &Profile::default());
+        let deduped = simplify_graph(graph, &Profile::default(), &HashSet::new());
         assert!(
             deduped.edge_count() <= 1,
             "Expected at most 1 edge, got {}",
@@ -378,7 +437,8 @@ mod tests {
         let b = graph.add_node(make_node(2, 38.0001, -77.0));
         graph.add_edge(a, b, make_way(1, 1.0));
 
-        let (consolidated, map) = consolidate_intersections(graph, &Profile::default());
+        let (consolidated, map) =
+            consolidate_intersections(graph, &Profile::default(), &HashSet::new());
 
         assert_eq!(consolidated.node_count(), 2);
         assert_ne!(map[a.index()], map[b.index()]);
@@ -424,7 +484,7 @@ mod tests {
         graph.add_edge(b, c, make_way_with_length(2, 20.0, 200.0));
         graph.add_edge(c, d, make_way_with_length(3, 30.0, 300.0));
 
-        let simplified = simplify_graph(graph, &Profile::default());
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
 
         assert_eq!(simplified.node_count(), 2);
         assert_eq!(simplified.edge_count(), 1);
@@ -456,7 +516,7 @@ mod tests {
             make_way_with_geometry(3, 30.0, vec![(0.002, 0.0), (0.0025, 0.0002), (0.003, 0.0)]),
         );
 
-        let simplified = simplify_graph(graph, &Profile::default());
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
         let edge = simplified.edge_weights().next().unwrap();
 
         assert_eq!(
@@ -485,7 +545,7 @@ mod tests {
         graph.add_edge(x, b, make_way(2, 50.0));
         graph.add_edge(a, x, make_way(3, 50.0));
 
-        let simplified = simplify_graph(graph, &Profile::default());
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
 
         assert_eq!(simplified.edge_count(), 1);
         assert_eq!(
@@ -504,7 +564,8 @@ mod tests {
         graph.add_edge(a, b1, make_way_with_length(1, 30.0, 120.0));
         graph.add_edge(a, b2, make_way_with_length(2, 20.0, 120.0));
 
-        let (consolidated, _) = consolidate_intersections(graph, &Profile::default());
+        let (consolidated, _) =
+            consolidate_intersections(graph, &Profile::default(), &HashSet::new());
 
         assert_eq!(consolidated.edge_count(), 1);
         // The 20 s edge wins; its length is then refit to the merged span.
@@ -527,7 +588,7 @@ mod tests {
         graph.add_edge(b2, c, make_way(2, 10.0));
         graph.add_edge(b1, d, make_way(3, 10.0));
 
-        let simplified = simplify_graph(graph, &Profile::default());
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
         let mut ids: Vec<i64> = simplified.node_weights().map(|n| n.id).collect();
         ids.sort_unstable();
 
@@ -548,7 +609,8 @@ mod tests {
         graph.add_edge(b2, c, make_way_with_length(1, 0.1, 1.0));
         graph.add_edge(b1, b2, make_way(2, 1.0));
 
-        let (consolidated, map) = consolidate_intersections(graph, &Profile::default());
+        let (consolidated, map) =
+            consolidate_intersections(graph, &Profile::default(), &HashSet::new());
         assert_eq!(map[b1.index()], map[b2.index()]);
         let edge = consolidated.edge_weights().next().unwrap();
         let (a, b) = (
@@ -564,6 +626,31 @@ mod tests {
     }
 
     #[test]
+    fn loop_road_keeps_both_directions() {
+        // A two-way loop V → A → B → V hanging off junction V, plus a spur.
+        let mut graph = DiGraph::new();
+        let spur = graph.add_node(make_node(1, -0.001, 0.0));
+        let v = graph.add_node(make_node(2, 0.0, 0.0));
+        let a = graph.add_node(make_node(3, 0.001, 0.0));
+        let b = graph.add_node(make_node(4, 0.001, 0.001));
+        for (x, y) in [(spur, v), (v, a), (a, b), (b, v)] {
+            graph.add_edge(x, y, make_way(1, 10.0));
+            graph.add_edge(y, x, make_way(2, 10.0));
+        }
+
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
+
+        assert!(
+            simplified
+                .edge_references()
+                .all(|e| e.source() != e.target()),
+            "no self-loops"
+        );
+        // Spur both ways + the three sides of the loop, each both ways.
+        assert_eq!(simplified.edge_count(), 8);
+    }
+
+    #[test]
     fn t_junction_preserves_decision_node() {
         let mut graph = DiGraph::new();
         let west = graph.add_node(make_node(1, 0.0, 0.0));
@@ -574,7 +661,7 @@ mod tests {
         graph.add_edge(center, east, make_way(2, 10.0));
         graph.add_edge(center, north, make_way(3, 10.0));
 
-        let simplified = simplify_graph(graph, &Profile::default());
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
 
         assert_eq!(simplified.node_count(), 4);
         assert_eq!(simplified.edge_count(), 3);
@@ -589,7 +676,7 @@ mod tests {
         graph.add_edge(a, b, make_way(1, 10.0));
         graph.add_edge(b, c, make_way(2, 10.0));
 
-        let simplified = simplify_graph(graph, &Profile::default());
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
         let edge = simplified.edge_references().next().unwrap();
         let source = &simplified[edge.source()];
         let target = &simplified[edge.target()];
@@ -608,7 +695,7 @@ mod tests {
         graph.add_edge(west, east, make_way(1, 10.0));
         graph.add_edge(south, north, make_way(2, 10.0));
 
-        let simplified = simplify_graph(graph, &Profile::default());
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
 
         assert_eq!(simplified.node_count(), 4);
         assert_eq!(simplified.edge_count(), 2);

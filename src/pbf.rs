@@ -12,12 +12,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use osmpbf::{BlobDecode, BlobReader, Element, PrimitiveBlock};
+use osmpbf::{BlobDecode, BlobReader, Element, PrimitiveBlock, RelMemberType};
 use rayon::prelude::*;
 
 use crate::error::OsmGraphError;
 use crate::filters::{is_poi_node, way_passes_road_filter};
-use crate::graph::{OsmData, OsmNode, OsmNodeRef, OsmTag, OsmWay, SpatialGraph};
+use crate::graph::{
+    OsmData, OsmMember, OsmNode, OsmNodeRef, OsmRelation, OsmTag, OsmWay, SpatialGraph,
+};
 use crate::overpass::NetworkType;
 use crate::poi::Poi;
 use crate::profile::BuildOptions;
@@ -95,6 +97,8 @@ struct PbfScan {
     pois: Vec<Poi>,
     /// Ways passing the road filter, one list per requested network type.
     roads: Vec<Vec<RawWay>>,
+    /// Turn-restriction relations.
+    restrictions: Vec<OsmRelation>,
 }
 
 struct RawWay {
@@ -132,6 +136,7 @@ fn scan_pbf(path: &Path, network_types: &[NetworkType]) -> Result<PbfScan, OsmGr
         scan.coords.extend(chunk.coords);
         scan.node_tags.extend(chunk.node_tags);
         scan.pois.extend(chunk.pois);
+        scan.restrictions.extend(chunk.restrictions);
         for (all, part) in scan.roads.iter_mut().zip(chunk.roads) {
             all.extend(part);
         }
@@ -189,7 +194,37 @@ fn scan_block(block: &PrimitiveBlock, network_types: &[NetworkType]) -> PbfScan 
                 }
                 continue;
             }
-            Element::Relation(_) => continue,
+            Element::Relation(relation) => {
+                let is_restriction = relation
+                    .tags()
+                    .any(|(k, v)| k == "type" && v == "restriction");
+                if is_restriction {
+                    chunk.restrictions.push(OsmRelation {
+                        id: relation.id(),
+                        members: relation
+                            .members()
+                            .map(|m| OsmMember {
+                                kind: match m.member_type {
+                                    RelMemberType::Node => "node",
+                                    RelMemberType::Way => "way",
+                                    RelMemberType::Relation => "relation",
+                                }
+                                .to_owned(),
+                                reference: m.member_id,
+                                role: m.role().unwrap_or_default().to_owned(),
+                            })
+                            .collect(),
+                        tags: relation
+                            .tags()
+                            .map(|(k, v)| OsmTag {
+                                key: k.to_owned(),
+                                value: v.to_owned(),
+                            })
+                            .collect(),
+                    });
+                }
+                continue;
+            }
         };
 
         chunk.coords.push((id, lat, lon));
@@ -249,7 +284,11 @@ impl PbfScan {
             })
             .collect();
 
-        OsmData { nodes, ways }
+        OsmData {
+            nodes,
+            ways,
+            relations: self.restrictions.clone(),
+        }
     }
 }
 

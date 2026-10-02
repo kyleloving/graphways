@@ -59,12 +59,18 @@ pub fn get_osm_filter(network_type: NetworkType) -> Result<&'static str, Overpas
 }
 
 // Function to create the Overpass query string
+/// The Overpass query for a road network in a bounding box. Driving queries
+/// also fetch the turn-restriction relations on those roads.
 pub fn create_overpass_query(polygon_coord_str: &str, network_type: NetworkType) -> String {
     let filter = get_osm_filter(network_type).unwrap_or("");
-    format!(
-        "[out:xml][timeout:50];(way{}({});>;);out;",
-        filter, polygon_coord_str
-    )
+    if crate::restrictions::applies_to(network_type) {
+        format!(
+            "[out:xml][timeout:50];(way{filter}({polygon_coord_str});>;)->.roads;\
+             (.roads;rel(bw.roads)[\"type\"=\"restriction\"];);out;"
+        )
+    } else {
+        format!("[out:xml][timeout:50];(way{filter}({polygon_coord_str});>;);out;")
+    }
 }
 
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();

@@ -11,7 +11,7 @@ use petgraph::graph::EdgeIndex;
 
 use crate::ch::ContractionHierarchy;
 use crate::error::OsmGraphError;
-use crate::graph::{anchor_at, Anchor, LatLon, Piece, Role, SnapResult, SpatialGraph};
+use crate::graph::{anchor_at, seeds, LatLon, Piece, Role, SnapResult, SpatialGraph};
 use crate::reachability::EdgeInfo;
 use crate::search::{astar, SearchPath};
 
@@ -41,17 +41,22 @@ pub(crate) fn best_pieces(
     origin: &SnapResult,
     destination: &SnapResult,
     cost: &mut dyn FnMut(EdgeIndex) -> f64,
-    search: impl FnOnce(&[Anchor], &[Anchor], &mut dyn FnMut(EdgeIndex) -> f64) -> Option<SearchPath>,
+    search: impl FnOnce(
+        &[(u32, f64)],
+        &[(u32, f64)],
+        &mut dyn FnMut(EdgeIndex) -> f64,
+    ) -> Option<SearchPath>,
 ) -> Option<(f64, Vec<Piece>)> {
     let departures = sg.departures(origin, cost);
     let arrivals = sg.arrivals(destination, cost);
     let direct = sg.direct_piece(origin, destination, cost);
+    let (from, to) = (sg.departure_roots(&departures), sg.arrival_roots(&arrivals));
 
-    let via_network = search(&departures, &arrivals, cost).map(|path| {
+    let via_network = search(&seeds(&from), &seeds(&to), cost).map(|path| {
         let mut pieces = Vec::with_capacity(path.edges.len() + 2);
-        pieces.extend(anchor_at(&departures, path.first).and_then(|a| a.piece));
+        pieces.extend(anchor_at(&departures, &from, path.first).and_then(|a| a.piece));
         pieces.extend(path.edges.iter().map(|&e| Piece::whole(e)));
-        pieces.extend(anchor_at(&arrivals, path.last).and_then(|a| a.piece));
+        pieces.extend(anchor_at(&arrivals, &to, path.last).and_then(|a| a.piece));
         (path.cost, pieces)
     });
     match (direct, via_network) {
@@ -71,36 +76,27 @@ fn shortest_pieces(
 ) -> Option<(f64, Vec<Piece>)> {
     let nt = sg.network_type();
     let mut cost = |e: EdgeIndex| sg.graph[e].travel_time(nt);
-    best_pieces(
-        sg,
-        origin,
-        destination,
-        &mut cost,
-        |departures, arrivals, _| {
-            let sources: Vec<(u32, f64)> = departures.iter().map(Anchor::root).collect();
-            let targets: Vec<(u32, f64)> = arrivals.iter().map(Anchor::root).collect();
-            if let Some(hierarchy) = sg.hierarchy_slot().get() {
-                return hierarchy.shortest_path(&sources, &targets);
+    best_pieces(sg, origin, destination, &mut cost, |sources, targets, _| {
+        if let Some(hierarchy) = sg.hierarchy_slot().get() {
+            return hierarchy.shortest_path(sources, targets);
+        }
+        let speed = sg.max_straight_line_speed();
+        let goal = destination.snapped();
+        let remaining_lower_bound = |state: u32| {
+            if !(speed.is_finite() && speed > 0.0) {
+                return 0.0;
             }
-            let speed = sg.max_straight_line_speed();
-            let goal = destination.snapped();
-            let remaining_lower_bound = |node: u32| {
-                if !(speed.is_finite() && speed > 0.0) {
-                    return 0.0;
-                }
-                let n = &sg.graph[petgraph::graph::NodeIndex::new(node as usize)];
-                LatLon::from(n).distance_m(goal) / speed
-            };
-            let costs = &sg.slot_costs().out;
-            astar(
-                &sg.search_index().out,
-                &sources,
-                &targets,
-                |slot| costs[slot],
-                remaining_lower_bound,
-            )
-        },
-    )
+            sg.state_point(state).distance_m(goal) / speed
+        };
+        let costs = &sg.slot_costs().out;
+        astar(
+            &sg.search_index().out,
+            sources,
+            targets,
+            |slot| costs[slot],
+            remaining_lower_bound,
+        )
+    })
 }
 
 /// Route coordinates with travel time interpolated along each piece's shape
@@ -248,13 +244,11 @@ impl SpatialGraph {
             &snaps.0,
             &snaps.1,
             &mut edge_cost,
-            |dep, arr, edge_cost| {
-                let sources: Vec<(u32, f64)> = dep.iter().map(Anchor::root).collect();
-                let targets: Vec<(u32, f64)> = arr.iter().map(Anchor::root).collect();
+            |sources, targets, edge_cost| {
                 astar(
                     out,
-                    &sources,
-                    &targets,
+                    sources,
+                    targets,
                     |slot| edge_cost(EdgeIndex::new(out.edges[slot] as usize)),
                     |_| 0.0,
                 )
@@ -284,6 +278,7 @@ mod tests {
     fn make_way(drive_travel_time: f64, length: f64) -> Edge {
         Edge {
             way_id: 1,
+            last_way_id: 1,
             tags: vec![OsmTag {
                 key: "highway".into(),
                 value: "residential".into(),
@@ -301,6 +296,7 @@ mod tests {
     fn make_profile_way(drive_travel_time: f64, walk_travel_time: f64, length: f64) -> Edge {
         Edge {
             way_id: 1,
+            last_way_id: 1,
             tags: vec![OsmTag {
                 key: "highway".into(),
                 value: "residential".into(),

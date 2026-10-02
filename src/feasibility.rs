@@ -37,11 +37,12 @@
 use std::cell::RefCell;
 
 use geo::{ConvexHull, MultiPoint, Polygon};
-use petgraph::graph::EdgeIndex;
+use petgraph::graph::{EdgeIndex, NodeIndex};
 
 use crate::error::OsmGraphError;
+use crate::graph::seeds;
 use crate::graph::{LatLon, NodeMap, RoadGraph, Role, SnapResult, SpatialGraph};
-use crate::reachability::{induced_edge_count, roots, EdgeInfo};
+use crate::reachability::{induced_edge_count, EdgeInfo};
 use crate::search::{astar, dijkstra};
 
 // ---------------------------------------------------------------------------
@@ -151,8 +152,8 @@ fn feasibility(
     mut price: impl FnMut(Side, usize) -> f64,
 ) -> Result<FeasibilityResult, InfeasibleReason> {
     let index = sg.search_index();
-    let departures = roots(&sg.departures(origin, edge_cost));
-    let arrivals = roots(&sg.arrivals(destination, edge_cost));
+    let departures = seeds(&sg.departure_roots(&sg.departures(origin, edge_cost)));
+    let arrivals = seeds(&sg.arrival_roots(&sg.arrivals(destination, edge_cost)));
     let direct = sg
         .direct_piece(origin, destination, edge_cost)
         .map(|(cost, _)| cost);
@@ -201,16 +202,17 @@ fn feasibility(
         price(Side::In, slot)
     });
 
-    // Intersect: keep nodes present in both searches whose combined cost fits.
-    let mut feasible = NodeMap::with_node_count(index.node_count());
-    for (&node, &inbound) in &forward {
-        let Some(&outbound) = backward.get(node) else {
+    // Intersect: keep search states present in both searches whose combined
+    // cost fits, then report each node through its state with most slack.
+    let mut by_state = NodeMap::with_node_count(index.node_count());
+    for (&state, &inbound) in &forward {
+        let Some(&outbound) = backward.get(state) else {
             continue;
         };
         let total = inbound + outbound;
         if total <= available_time {
-            feasible.insert(
-                node,
+            by_state.insert(
+                state,
                 FeasibleNode {
                     inbound_time: inbound,
                     outbound_time: outbound,
@@ -219,6 +221,18 @@ fn feasibility(
             );
         }
     }
+    let feasible = if index.has_restricted_states() {
+        let mut nodes: NodeMap<FeasibleNode> = NodeMap::with_node_count(sg.graph.node_count());
+        for (state, node) in by_state.into_entries() {
+            let key = NodeIndex::new(index.node_of(state.index() as u32) as usize);
+            if nodes.get(key).is_none_or(|kept| node.slack > kept.slack) {
+                nodes.insert(key, node);
+            }
+        }
+        nodes
+    } else {
+        by_state
+    };
 
     Ok(FeasibilityResult {
         origin: *origin,

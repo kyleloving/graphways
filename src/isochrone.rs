@@ -74,9 +74,10 @@ fn frontier(sg: &SpatialGraph, result: &ReachabilityResult) -> Vec<(NodeIndex, f
     let out = &sg.search_index().out;
     let costs = &sg.slot_costs().out;
     let mut best: HashMap<u32, f64> = HashMap::new();
+    let index = sg.search_index();
     for (&node, &time) in &result.times {
         for slot in out.range(node.index() as u32) {
-            let next = out.neighbors[slot];
+            let next = index.node_of(out.neighbors[slot]);
             let cost = costs[slot];
             if cost.is_finite()
                 && cost >= 0.0
@@ -544,11 +545,7 @@ mod tests {
     #[test]
     fn empty_reachability_returns_empty_polygons_in_input_order() {
         let graph = SpatialGraph::new(RoadGraph::new(), NetworkType::Drive);
-        let result = ReachabilityResult {
-            origin: LatLon::default(),
-            max_cost: 0.0,
-            times: NodeMap::with_node_count(0),
-        };
+        let result = ReachabilityResult::new(LatLon::default(), 0.0, NodeMap::with_node_count(0));
 
         let polygons = build_isochrone_polygons(&graph, &result, &[60.0, 30.0]);
 

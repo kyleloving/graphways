@@ -13,7 +13,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::ops::Range;
 use std::sync::OnceLock;
 
@@ -75,38 +75,151 @@ pub(crate) struct SlotCosts {
 }
 
 /// Forward and backward adjacency of a graph, plus per-mode slot costs.
+///
+/// Searches run over *states*. Normally a state is a graph node, but a
+/// junction with turn restrictions gets extra states, one per distinct set of
+/// banned exits: an edge whose turn options are restricted leads into such a
+/// state, whose outgoing arcs omit the banned exits. States `0..n` are the
+/// graph's nodes; extra states follow.
 pub(crate) struct SearchIndex {
-    /// Arcs grouped by source; neighbour = target.
+    /// Arcs grouped by source state; neighbour = target state.
     pub(crate) out: Adjacency,
-    /// Arcs grouped by target; neighbour = source.
+    /// Arcs grouped by target state; neighbour = source state.
     pub(crate) inc: Adjacency,
     costs: [OnceLock<SlotCosts>; 3],
+    graph_nodes: usize,
+    extra: Vec<ExtraState>,
+    extra_of: HashMap<u32, Vec<u32>>,
+    head_override: HashMap<u32, u32>,
+}
+
+/// A restricted state of a junction: the node, and the exits it bans (sorted).
+struct ExtraState {
+    node: u32,
+    banned: Vec<u32>,
 }
 
 impl SearchIndex {
-    pub(crate) fn new<N, E>(graph: &DiGraph<N, E>) -> Self {
+    /// Build the index, splitting junctions so that no path takes any of the
+    /// `forbidden` `(into junction, out of junction)` edge pairs.
+    pub(crate) fn new<N, E>(graph: &DiGraph<N, E>, forbidden: &[(EdgeIndex, EdgeIndex)]) -> Self {
+        let n = graph.node_count();
         let raw = graph.raw_edges();
-        let mut arcs: Vec<(u32, u32, u32)> = raw
-            .iter()
-            .enumerate()
-            .map(|(id, e)| {
-                (
-                    e.source().index() as u32,
-                    e.target().index() as u32,
-                    id as u32,
-                )
-            })
-            .collect();
-        let out = Adjacency::build(graph.node_count(), &arcs);
+
+        // Group incoming edges by (junction, banned exits); each group gets
+        // one extra state. Sorted input keeps state numbering deterministic.
+        let mut banned_by_entry: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+        for &(into, out) in forbidden {
+            banned_by_entry
+                .entry(into.index() as u32)
+                .or_default()
+                .push(out.index() as u32);
+        }
+        let mut extra: Vec<ExtraState> = Vec::new();
+        let mut extra_of: HashMap<u32, Vec<u32>> = HashMap::new();
+        let mut head_override: HashMap<u32, u32> = HashMap::new();
+        let mut state_for: HashMap<(u32, Vec<u32>), u32> = HashMap::new();
+        for (entry, mut banned) in banned_by_entry {
+            banned.sort_unstable();
+            banned.dedup();
+            let node = raw[entry as usize].target().index() as u32;
+            let state = *state_for.entry((node, banned.clone())).or_insert_with(|| {
+                let state = (n + extra.len()) as u32;
+                extra.push(ExtraState { node, banned });
+                extra_of.entry(node).or_default().push(state);
+                state
+            });
+            head_override.insert(entry, state);
+        }
+
+        let total = n + extra.len();
+        let mut arcs: Vec<(u32, u32, u32)> = Vec::with_capacity(raw.len());
+        for (id, e) in raw.iter().enumerate() {
+            let id = id as u32;
+            let (source, target) = (e.source().index() as u32, e.target().index() as u32);
+            let head = head_override.get(&id).copied().unwrap_or(target);
+            arcs.push((source, head, id));
+            for &state in extra_of.get(&source).into_iter().flatten() {
+                if extra[state as usize - n].banned.binary_search(&id).is_err() {
+                    arcs.push((state, head, id));
+                }
+            }
+        }
+        let out = Adjacency::build(total, &arcs);
         for arc in &mut arcs {
             *arc = (arc.1, arc.0, arc.2);
         }
-        let inc = Adjacency::build(graph.node_count(), &arcs);
+        let inc = Adjacency::build(total, &arcs);
         Self {
             out,
             inc,
             costs: Default::default(),
+            graph_nodes: n,
+            extra,
+            extra_of,
+            head_override,
         }
+    }
+
+    /// Whether any junction has restricted states.
+    pub(crate) fn has_restricted_states(&self) -> bool {
+        !self.extra.is_empty()
+    }
+
+    /// The graph node a state belongs to.
+    #[inline]
+    pub(crate) fn node_of(&self, state: u32) -> u32 {
+        if (state as usize) < self.graph_nodes {
+            state
+        } else {
+            self.extra[state as usize - self.graph_nodes].node
+        }
+    }
+
+    /// The state reached by travelling along `edge` into `target`.
+    pub(crate) fn head_state(&self, edge: EdgeIndex, target: NodeIndex) -> u32 {
+        self.head_override
+            .get(&(edge.index() as u32))
+            .copied()
+            .unwrap_or(target.index() as u32)
+    }
+
+    /// Every state of `node`.
+    pub(crate) fn states_of(&self, node: NodeIndex) -> impl Iterator<Item = u32> + '_ {
+        let node = node.index() as u32;
+        std::iter::once(node).chain(self.extra_of.get(&node).into_iter().flatten().copied())
+    }
+
+    /// The states of `source` from which `edge` may be taken.
+    pub(crate) fn tail_states(
+        &self,
+        edge: EdgeIndex,
+        source: NodeIndex,
+    ) -> impl Iterator<Item = u32> + '_ {
+        let id = edge.index() as u32;
+        self.states_of(source).filter(move |&state| {
+            (state as usize) < self.graph_nodes
+                || self.extra[state as usize - self.graph_nodes]
+                    .banned
+                    .binary_search(&id)
+                    .is_err()
+        })
+    }
+
+    /// Collapse per-state labels (in settle order) to per-node labels,
+    /// keeping each node's first, i.e. cheapest, state.
+    pub(crate) fn fold_states<T>(&self, labels: NodeMap<T>) -> NodeMap<T> {
+        if self.extra.is_empty() {
+            return labels;
+        }
+        let mut nodes = NodeMap::with_node_count(self.graph_nodes);
+        for (state, value) in labels.into_entries() {
+            let node = NodeIndex::new(self.node_of(state.index() as u32) as usize);
+            if !nodes.contains_key(node) {
+                nodes.insert(node, value);
+            }
+        }
+        nodes
     }
 
     /// Slot costs for mode `field`, computing them with `edge_cost` the first
@@ -509,7 +622,7 @@ mod tests {
     #[test]
     fn dijkstra_forward_and_backward_agree_on_pair_costs() {
         let (g, [a, b, c, d]) = diamond();
-        let index = SearchIndex::new(&g);
+        let index = SearchIndex::new(&g, &[]);
         let (out_w, inc_w) = (weights(&g, &index.out), weights(&g, &index.inc));
         let forward = dijkstra(&index.out, &[(a.index() as u32, 0.0)], f64::INFINITY, |s| {
             out_w[s]
@@ -530,7 +643,7 @@ mod tests {
     #[test]
     fn dijkstra_bound_is_inclusive_and_skips_bad_costs() {
         let (g, [a, b, c, d]) = diamond();
-        let index = SearchIndex::new(&g);
+        let index = SearchIndex::new(&g, &[]);
         let w = weights(&g, &index.out);
         let bounded = dijkstra(&index.out, &[(a.index() as u32, 0.0)], 1.0, |s| w[s]);
         assert_eq!(bounded.get(b), Some(&1.0));
@@ -549,7 +662,7 @@ mod tests {
     #[test]
     fn astar_returns_cheapest_edge_sequence_and_pool_resets() {
         let (g, [a, b, c, d]) = diamond();
-        let index = SearchIndex::new(&g);
+        let index = SearchIndex::new(&g, &[]);
         let w = weights(&g, &index.out);
         let at = |n: NodeIndex| [(n.index() as u32, 0.0)];
         for _ in 0..3 {

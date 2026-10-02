@@ -11,6 +11,7 @@ pub mod pbf;
 pub mod poi;
 pub mod profile;
 pub mod reachability;
+pub mod restrictions;
 pub mod routing;
 pub mod utils;
 

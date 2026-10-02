@@ -6,6 +6,7 @@ use crate::ch::ContractionHierarchy;
 use crate::error::OsmGraphError;
 use crate::overpass::NetworkType;
 use crate::profile::{BuildOptions, Profile};
+use crate::restrictions;
 use crate::search::{SearchIndex, SlotCosts};
 use crate::simplify::simplify_graph;
 use crate::utils::{calculate_distance, calculate_travel_time};
@@ -14,7 +15,7 @@ use petgraph::visit::EdgeRef;
 use rstar::primitives::{GeomWithData, Line};
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Index;
 use std::sync::{Arc, OnceLock};
 
@@ -22,12 +23,37 @@ use std::sync::{Arc, OnceLock};
 // OSM input shapes (Overpass XML and PBF both produce these)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct OsmData {
     #[serde(rename = "node", default)]
     pub nodes: Vec<OsmNode>,
     #[serde(rename = "way", default)]
     pub ways: Vec<OsmWay>,
+    /// Relations; only turn restrictions are used.
+    #[serde(rename = "relation", default)]
+    pub relations: Vec<OsmRelation>,
+}
+
+/// An OSM relation (only `type=restriction` ones are read).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct OsmRelation {
+    #[serde(rename = "@id")]
+    pub id: i64,
+    #[serde(rename = "member", default)]
+    pub members: Vec<OsmMember>,
+    #[serde(rename = "tag", default)]
+    pub tags: Vec<OsmTag>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct OsmMember {
+    /// `node`, `way` or `relation`.
+    #[serde(rename = "@type")]
+    pub kind: String,
+    #[serde(rename = "@ref")]
+    pub reference: i64,
+    #[serde(rename = "@role", default)]
+    pub role: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -96,6 +122,9 @@ pub type RoadGraph = DiGraph<OsmNode, Edge>;
 pub struct Edge {
     /// OSM id of the way this edge was cut from (the first way of a chain).
     pub way_id: i64,
+    /// OSM id of the way of the edge's last segment: the same as `way_id`
+    /// unless simplification joined several ways into one edge.
+    pub last_way_id: i64,
     /// Routing-relevant tags of that way, shared by every edge cut from it.
     pub tags: Arc<[OsmTag]>,
     /// Length in metres.
@@ -130,6 +159,7 @@ impl Edge {
     ) -> Self {
         let mut edge = Edge {
             way_id,
+            last_way_id: way_id,
             tags,
             speed_kph,
             ..Edge::default()
@@ -362,7 +392,9 @@ fn way_speed_kph(tags: &[OsmTag], profile: &Profile) -> f64 {
         .use_maxspeed
         .then(|| find_tag(tags, "maxspeed").and_then(|tag| clean_maxspeed(&tag.value)))
         .flatten()
-        .unwrap_or_else(|| profile.drive_speed_kph(find_tag(tags, "highway").map(|t| t.value.as_str())))
+        .unwrap_or_else(|| {
+            profile.drive_speed_kph(find_tag(tags, "highway").map(|t| t.value.as_str()))
+        })
 }
 
 /// The tags edges keep; everything else is dropped at build time.
@@ -380,7 +412,12 @@ pub fn create_graph(
     retain_all: bool,
     bidirectional: bool,
 ) -> RoadGraph {
-    create_graph_with(nodes, ways, bidirectional, &BuildOptions::retain_all(retain_all))
+    create_graph_with(
+        nodes,
+        ways,
+        bidirectional,
+        &BuildOptions::retain_all(retain_all),
+    )
 }
 
 /// Build a directed road graph from parsed OSM nodes and ways.
@@ -397,6 +434,18 @@ pub fn create_graph_with(
     ways: Vec<OsmWay>,
     bidirectional: bool,
     options: &BuildOptions,
+) -> RoadGraph {
+    build_graph(nodes, ways, bidirectional, options, &HashSet::new())
+}
+
+/// [`create_graph_with`], keeping the nodes with OSM ids in `protected`
+/// intact through simplification (turn-restriction via nodes).
+fn build_graph(
+    nodes: Vec<OsmNode>,
+    ways: Vec<OsmWay>,
+    bidirectional: bool,
+    options: &BuildOptions,
+    protected: &HashSet<i64>,
 ) -> RoadGraph {
     let profile = &options.profile;
     let segment_count: usize = ways.iter().map(|w| w.nodes.len().saturating_sub(1)).sum();
@@ -434,7 +483,7 @@ pub fn create_graph_with(
     if options.retain_all {
         graph
     } else {
-        simplify_graph(graph, profile)
+        simplify_graph(graph, profile, protected)
     }
 }
 
@@ -587,6 +636,11 @@ impl<T> NodeMap<T> {
     pub fn as_slice(&self) -> &[(NodeIndex, T)] {
         &self.entries
     }
+
+    /// The entries by value, in insertion order.
+    pub fn into_entries(self) -> Vec<(NodeIndex, T)> {
+        self.entries
+    }
 }
 
 impl<T> Index<NodeIndex> for NodeMap<T> {
@@ -688,18 +742,28 @@ pub(crate) struct Anchor {
     pub(crate) piece: Option<Piece>,
 }
 
-impl Anchor {
-    pub(crate) fn root(&self) -> (u32, f64) {
-        (self.node.index() as u32, self.cost)
-    }
+/// Search roots for a set of anchors: `(state, cost, anchor index)`.
+pub(crate) type Roots = Vec<(u32, f64, usize)>;
+
+/// `(state, cost)` pairs for seeding a search.
+pub(crate) fn seeds(roots: &Roots) -> Vec<(u32, f64)> {
+    roots
+        .iter()
+        .map(|&(state, cost, _)| (state, cost))
+        .collect()
 }
 
-/// The cheapest anchor at `node`, if any.
-pub(crate) fn anchor_at(anchors: &[Anchor], node: NodeIndex) -> Option<&Anchor> {
-    anchors
+/// The cheapest anchor rooted at search state `state`, if any.
+pub(crate) fn anchor_at<'a>(
+    anchors: &'a [Anchor],
+    roots: &Roots,
+    state: NodeIndex,
+) -> Option<&'a Anchor> {
+    roots
         .iter()
-        .filter(|a| a.node == node)
-        .min_by(|a, b| a.cost.total_cmp(&b.cost))
+        .filter(|&&(s, _, _)| s as usize == state.index())
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|&(_, _, i)| &anchors[i])
 }
 
 /// R-tree entry for one straight segment of an edge's geometry, in the
@@ -741,6 +805,7 @@ pub struct SpatialGraph {
 /// Indexes derived from the graph. The cheap ones are built eagerly, the rest
 /// on first use and then shared by every clone.
 struct GraphIndex {
+    forbidden_turns: Vec<(EdgeIndex, EdgeIndex)>,
     tree: RTree<NodeEntry>,
     segments: RTree<SegmentEntry>,
     search: SearchIndex,
@@ -752,19 +817,33 @@ struct GraphIndex {
 impl SpatialGraph {
     /// Wrap a road graph whose edges are costed for `network_type`.
     pub fn new(graph: RoadGraph, network_type: NetworkType) -> Self {
+        Self::with_forbidden_turns(graph, network_type, Vec::new())
+    }
+
+    /// Wrap a road graph in which every search must avoid the given
+    /// `(into junction, out of junction)` edge pairs, e.g. from
+    /// [`crate::restrictions::forbidden_turns`].
+    pub fn with_forbidden_turns(
+        graph: RoadGraph,
+        network_type: NetworkType,
+        mut forbidden_turns: Vec<(EdgeIndex, EdgeIndex)>,
+    ) -> Self {
+        forbidden_turns.sort_unstable();
+        forbidden_turns.dedup();
         let tree = RTree::bulk_load(
             graph
                 .node_indices()
                 .map(|i| NodeEntry::new(&graph[i], i))
                 .collect(),
         );
-        let search = SearchIndex::new(&graph);
+        let search = SearchIndex::new(&graph, &forbidden_turns);
         let segments = RTree::bulk_load(segment_entries(&graph));
         Self {
             graph: Arc::new(graph),
             poi_snaps: None,
             network_type,
             index: Arc::new(GraphIndex {
+                forbidden_turns,
                 tree,
                 segments,
                 search,
@@ -787,8 +866,15 @@ impl SpatialGraph {
         options: &BuildOptions,
     ) -> Self {
         let bidirectional = matches!(network_type, NetworkType::Walk);
-        let graph = create_graph_with(data.nodes, data.ways, bidirectional, options);
-        Self::new(graph, network_type)
+        let restrictions = if restrictions::applies_to(network_type) {
+            restrictions::parse_restrictions(&data.relations)
+        } else {
+            Vec::new()
+        };
+        let protected = restrictions::via_nodes(&restrictions);
+        let graph = build_graph(data.nodes, data.ways, bidirectional, options, &protected);
+        let turns = restrictions::forbidden_turns(&graph, &restrictions);
+        Self::with_forbidden_turns(graph, network_type, turns)
     }
 
     /// Parse an OSM XML document (e.g. an Overpass response) and build a
@@ -817,6 +903,12 @@ impl SpatialGraph {
     /// The network type whose travel times every query uses.
     pub fn network_type(&self) -> NetworkType {
         self.network_type
+    }
+
+    /// Turns every search avoids, as `(into junction, out of junction)`
+    /// edge pairs.
+    pub fn forbidden_turns(&self) -> &[(EdgeIndex, EdgeIndex)] {
+        &self.index.forbidden_turns
     }
 
     pub(crate) fn cost_field(&self) -> CostField {
@@ -875,6 +967,7 @@ impl SpatialGraph {
     /// deterministic. POI snaps and prepared hierarchies are not carried over.
     pub fn induced_subgraph(&self, mut keep: impl FnMut(NodeIndex) -> bool) -> SpatialGraph {
         let mut remap = vec![NodeIndex::end(); self.graph.node_count()];
+        let mut edge_remap = vec![EdgeIndex::end(); self.graph.edge_count()];
         let mut subgraph = DiGraph::new();
         for index in self.graph.node_indices() {
             if keep(index) {
@@ -884,10 +977,17 @@ impl SpatialGraph {
         for edge in self.graph.edge_references() {
             let (source, target) = (remap[edge.source().index()], remap[edge.target().index()]);
             if source != NodeIndex::end() && target != NodeIndex::end() {
-                subgraph.add_edge(source, target, edge.weight().clone());
+                edge_remap[edge.id().index()] =
+                    subgraph.add_edge(source, target, edge.weight().clone());
             }
         }
-        SpatialGraph::new(subgraph, self.network_type)
+        let turns = self
+            .forbidden_turns()
+            .iter()
+            .map(|&(a, b)| (edge_remap[a.index()], edge_remap[b.index()]))
+            .filter(|&(a, b)| a != EdgeIndex::end() && b != EdgeIndex::end())
+            .collect();
+        SpatialGraph::with_forbidden_turns(subgraph, self.network_type, turns)
     }
 
     /// Pre-snap a set of POI nodes to their nearest graph nodes, storing the
@@ -1035,6 +1135,46 @@ impl SpatialGraph {
                     .total_cmp(&(b.weight().length - length).abs())
             })
             .map(|r| r.id())
+    }
+
+    /// Search states a search leaving through `anchors` starts from: the
+    /// state reached along the anchor's partial edge, or the node itself.
+    pub(crate) fn departure_roots(&self, anchors: &[Anchor]) -> Roots {
+        let index = self.search_index();
+        anchors
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let state = match a.piece {
+                    Some(piece) => index.head_state(piece.edge, a.node),
+                    None => a.node.index() as u32,
+                };
+                (state, a.cost, i)
+            })
+            .collect()
+    }
+
+    /// Search states a search arriving through `anchors` may end in: those
+    /// allowed to take the anchor's partial edge, or any state of the node.
+    pub(crate) fn arrival_roots(&self, anchors: &[Anchor]) -> Roots {
+        let index = self.search_index();
+        anchors
+            .iter()
+            .enumerate()
+            .flat_map(|(i, a)| {
+                let states: Vec<u32> = match a.piece {
+                    Some(piece) => index.tail_states(piece.edge, a.node).collect(),
+                    None => index.states_of(a.node).collect(),
+                };
+                states.into_iter().map(move |state| (state, a.cost, i))
+            })
+            .collect()
+    }
+
+    /// Coordinates of the graph node a search state belongs to.
+    pub(crate) fn state_point(&self, state: u32) -> LatLon {
+        let node = self.search_index().node_of(state);
+        (&self.graph[NodeIndex::new(node as usize)]).into()
     }
 
     /// Ways onto the network from `snap`, priced by `cost`.
