@@ -19,7 +19,7 @@ use crate::error::OsmGraphError;
 use crate::graph::{Edge, NodeMap, OsmNode, SnapResult, SpatialGraph};
 use crate::overpass::NetworkType;
 use crate::profile::{BuildOptions, Profile};
-use crate::{cache, feasibility, geocoding, isochrone, poi, reachability, routing, utils};
+use crate::{cache, feasibility, geocoding, poi, reachability, routing, utils};
 
 static TOKIO_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
@@ -682,17 +682,14 @@ impl PyGraph {
     ) -> PyResult<Self> {
         let network_type = parse_network_type(&network)?;
         let options = build_options(retain_all, profile)?;
-        let sg = py.detach(|| -> Result<SpatialGraph, OsmGraphError> {
-            let (lat, lon) = tokio_rt().block_on(geocoding::geocode(&place))?;
-            let (_, sg) = tokio_rt().block_on(isochrone::calculate_isochrones_from_point(
-                lat,
-                lon,
-                Some(max_dist.unwrap_or(5_000.0)),
-                vec![],
+        let radius_m = max_dist.unwrap_or(5_000.0);
+        let sg = py.detach(|| {
+            tokio_rt().block_on(SpatialGraph::from_place(
+                &place,
+                radius_m,
                 network_type,
                 &options,
-            ))?;
-            Ok(sg)
+            ))
         })?;
         Ok(Self::new(sg))
     }

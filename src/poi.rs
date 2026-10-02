@@ -1,5 +1,3 @@
-#[cfg(feature = "network")]
-use crate::cache;
 #[cfg(any(test, feature = "network"))]
 use crate::error::OsmGraphError;
 #[cfg(feature = "network")]
@@ -70,21 +68,6 @@ fn bbox_from_area(area: &MultiPolygon<f64>) -> Option<String> {
     ))
 }
 
-#[cfg(feature = "network")]
-async fn fetch_xml_cached(query: &str) -> Result<String, OsmGraphError> {
-    if let Some(cached) = cache::check_xml_cache(query)? {
-        return Ok(cached);
-    }
-    if let Some(disk) = cache::check_disk_xml_cache(query) {
-        cache::insert_into_xml_cache(query.to_string(), disk.clone())?;
-        return Ok(disk);
-    }
-    let fetched = overpass::make_request(&overpass::overpass_url(), query).await?;
-    cache::write_disk_xml_cache(query, &fetched);
-    cache::insert_into_xml_cache(query.to_string(), fetched.clone())?;
-    Ok(fetched)
-}
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -152,7 +135,7 @@ pub(crate) async fn fetch_pois_within(area: &MultiPolygon<f64>) -> Result<Vec<Po
         return Ok(Vec::new());
     };
     let query = create_poi_query(&bbox);
-    let xml = fetch_xml_cached(&query).await?;
+    let xml = crate::download::fetch_cached(&query).await?;
     let data: OsmData = quick_xml::de::from_str(&xml)?;
 
     let pois = data
@@ -196,7 +179,7 @@ pub(crate) async fn fetch_pois_within_reachability(
     let radius_m = reachability.max_cost * max_speed_m_per_s * 1.2;
     let bbox = overpass::bbox_from_point(origin.lat, origin.lon, radius_m);
     let query = create_poi_query(&bbox);
-    let xml = fetch_xml_cached(&query).await?;
+    let xml = crate::download::fetch_cached(&query).await?;
     let data: OsmData = quick_xml::de::from_str(&xml)?;
 
     let pois = data

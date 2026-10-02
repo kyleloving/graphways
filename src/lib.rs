@@ -21,6 +21,8 @@ pub mod utils;
 #[cfg(feature = "network")]
 mod cache;
 mod ch;
+#[cfg(feature = "network")]
+mod download;
 mod persist;
 mod search;
 mod simplify;
