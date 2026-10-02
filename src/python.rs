@@ -556,6 +556,54 @@ impl PyPoiCollection {
     }
 }
 
+/// Travel times between every origin and every destination.
+#[pyclass(name = "TravelTimeMatrix", frozen, skip_from_py_object)]
+struct PyTravelTimeMatrix {
+    matrix: crate::matrix::TravelTimeMatrix,
+}
+
+#[pymethods]
+impl PyTravelTimeMatrix {
+    /// `durations_s[i][j]`: seconds from origin `i` to destination `j`,
+    /// `None` when there is no route or a point could not be snapped.
+    #[getter]
+    fn durations_s(&self) -> Vec<Vec<Option<f64>>> {
+        self.matrix.durations_s.clone()
+    }
+
+    /// Where each origin joined the network (`None` if it was too far away).
+    #[getter]
+    fn origin_snaps(&self) -> Vec<Option<PySnapResult>> {
+        snaps(&self.matrix.origin_snaps)
+    }
+
+    /// Where each destination joined the network (`None` if too far away).
+    #[getter]
+    fn destination_snaps(&self) -> Vec<Option<PySnapResult>> {
+        snaps(&self.matrix.destination_snaps)
+    }
+
+    /// `(len(origins), len(destinations))`.
+    #[getter]
+    fn shape(&self) -> (usize, usize) {
+        (
+            self.matrix.origin_snaps.len(),
+            self.matrix.destination_snaps.len(),
+        )
+    }
+
+    fn __repr__(&self) -> String {
+        let (rows, cols) = self.shape();
+        format!("TravelTimeMatrix({rows} origins x {cols} destinations)")
+    }
+}
+
+fn snaps(list: &[Option<SnapResult>]) -> Vec<Option<PySnapResult>> {
+    list.iter()
+        .map(|s| s.map(|snap| PySnapResult { snap }))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // SpatialGraph
 // ---------------------------------------------------------------------------
@@ -744,6 +792,36 @@ impl PyGraph {
         self.prepare_routing_in_background();
         let route = py.detach(|| self.sg.route(origin, destination, max_snap_m))?;
         Ok(PyRouteResult { route })
+    }
+
+    /// Fastest travel times from every origin to every destination.
+    ///
+    /// Points farther than `max_snap_m` from any road get `None` times
+    /// instead of failing the whole matrix. Large matrices build the routing
+    /// index first (see `prepare_routing`), which makes them fast.
+    #[pyo3(signature = (origins, destinations, max_snap_m = Some(100.0)))]
+    fn travel_time_matrix(
+        &self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        max_snap_m: Option<f64>,
+    ) -> PyTravelTimeMatrix {
+        // A handful of Dijkstra searches beats building the index; beyond
+        // that the index pays for itself within the same call.
+        let prepare_now = origins.len().min(destinations.len()) > 16;
+        if !prepare_now {
+            self.prepare_routing_in_background();
+        }
+        let matrix = py.detach(|| {
+            if prepare_now {
+                self.routing_requested.store(true, Ordering::Relaxed);
+                self.sg.prepare_routing();
+            }
+            self.sg
+                .travel_time_matrix(&origins, &destinations, max_snap_m)
+        });
+        PyTravelTimeMatrix { matrix }
     }
 
     fn fetch_pois(
@@ -1246,6 +1324,7 @@ fn graphways(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPrismGraph>()?;
     m.add_class::<PySnapResult>()?;
     m.add_class::<PyRouteResult>()?;
+    m.add_class::<PyTravelTimeMatrix>()?;
     m.add_class::<PyIsochroneResult>()?;
     m.add_class::<PyPoi>()?;
     m.add_class::<PyPoiCollection>()?;

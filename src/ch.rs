@@ -499,6 +499,93 @@ impl ContractionHierarchy {
         })
     }
 
+    /// Every node an upward search from `seeds` settles without stalling,
+    /// with its cost: forward over `up` arcs, backward over `down` arcs.
+    fn upward_space(&self, seeds: &[(u32, f64)], forward: bool) -> Vec<(u32, f64)> {
+        let (arcs, stall_arcs) = if forward {
+            (&self.up, &self.down)
+        } else {
+            (&self.down, &self.up)
+        };
+        let mut ws = workspace(self.node_count);
+        seed(&mut ws, seeds, self.node_count, |_| 0.0, None);
+        let mut space = Vec::new();
+        while let Some(HeapEntry { cost, node, .. }) = ws.heap.pop() {
+            if cost > ws.dist(node) || !ws.settle(node) {
+                continue;
+            }
+            let stalled = stall_arcs
+                .range(node)
+                .any(|i| ws.dist(stall_arcs.heads[i]) + stall_arcs.weights[i] < cost);
+            if stalled {
+                continue;
+            }
+            space.push((node, cost));
+            for i in arcs.range(node) {
+                let (head, next_cost) = (arcs.heads[i], cost + arcs.weights[i]);
+                if ws.relax(head, next_cost, node, arcs.arcs[i]) {
+                    ws.heap.push(HeapEntry {
+                        key: next_cost,
+                        cost: next_cost,
+                        node: head,
+                    });
+                }
+            }
+        }
+        space
+    }
+
+    /// Exact costs from every source to every target (each a set of
+    /// `(node, offset)` seeds), row-major, infinite where unreachable.
+    ///
+    /// The bucket method: each target's backward upward search leaves
+    /// `(target, cost)` in a bucket at every node it settles, then each
+    /// source's forward upward search combines its costs with the buckets it
+    /// passes. A shortest path's highest node is in both search spaces, so
+    /// one forward and one backward search per point cover the whole table.
+    pub(crate) fn many_to_many(
+        &self,
+        sources: &[Vec<(u32, f64)>],
+        targets: &[Vec<(u32, f64)>],
+    ) -> Vec<f64> {
+        let width = targets.len();
+        let mut table = vec![f64::INFINITY; sources.len() * width];
+        if width == 0 {
+            return table;
+        }
+        let mut entries: Vec<(u32, u32, f64)> = targets
+            .par_iter()
+            .enumerate()
+            .flat_map_iter(|(t, seeds)| {
+                self.upward_space(seeds, false)
+                    .into_iter()
+                    .map(move |(node, cost)| (node, t as u32, cost))
+            })
+            .collect();
+        entries.par_sort_unstable_by_key(|&(node, target, _)| (node, target));
+        let mut offsets = vec![0usize; self.node_count + 1];
+        for &(node, ..) in &entries {
+            offsets[node as usize + 1] += 1;
+        }
+        for i in 0..self.node_count {
+            offsets[i + 1] += offsets[i];
+        }
+
+        table
+            .par_chunks_mut(width)
+            .zip(sources.par_iter())
+            .for_each(|(row, seeds)| {
+                for (node, cost) in self.upward_space(seeds, true) {
+                    let bucket = &entries[offsets[node as usize]..offsets[node as usize + 1]];
+                    for &(_, target, back) in bucket {
+                        let cell = &mut row[target as usize];
+                        *cell = cell.min(cost + back);
+                    }
+                }
+            });
+        table
+    }
+
     /// Expand shortcut arcs into original edges, preserving travel order.
     fn unpack(&self, arcs: &[u32]) -> Vec<EdgeIndex> {
         let mut edges = Vec::with_capacity(arcs.len() * 4);
@@ -593,6 +680,27 @@ mod tests {
                         }
                         other => panic!("{s:?}->{t:?} reachability differs: {other:?}"),
                     }
+                }
+            }
+            // The bucket table agrees too, including multi-seed points.
+            let points: Vec<Vec<(u32, f64)>> = (0..g.node_count() as u32)
+                .map(|n| vec![(n, 0.5), ((n * 7 + 3) % g.node_count() as u32, 2.0)])
+                .collect();
+            let table = ch.many_to_many(&points, &points);
+            for (i, from) in points.iter().enumerate() {
+                let exact = dijkstra(&index.out, from, f64::INFINITY, |slot| costs[slot]);
+                for (j, to) in points.iter().enumerate() {
+                    let want = to
+                        .iter()
+                        .filter_map(|&(n, off)| {
+                            exact.get(NodeIndex::new(n as usize)).map(|d| d + off)
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                    let got = table[i * points.len() + j];
+                    assert!(
+                        got == want || (got - want).abs() < 1e-9,
+                        "{i}->{j}: {got} vs {want}"
+                    );
                 }
             }
             // And agrees with A* on a sample.

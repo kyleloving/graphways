@@ -6,6 +6,7 @@ pub mod filters;
 pub mod geocoding;
 pub mod graph;
 pub mod isochrone;
+pub mod matrix;
 pub mod overpass;
 pub mod pbf;
 pub mod poi;

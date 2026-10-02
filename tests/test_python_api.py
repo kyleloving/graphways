@@ -115,6 +115,20 @@ class PythonApiTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 gw.SpatialGraph.load(Path(tmp) / "missing")
 
+    def test_travel_time_matrix_matches_routes(self):
+        points = [(48.0, 11.0), (48.001, 11.0), (48.0005, 11.0), (10.0, 10.0)]
+        matrix = self.graph.travel_time_matrix(points, points[:3])
+
+        self.assertEqual(matrix.shape, (4, 3))
+        self.assertEqual(len(matrix.durations_s), 4)
+        self.assertIsNone(matrix.origin_snaps[3])
+        self.assertEqual(matrix.durations_s[3], [None, None, None])
+        self.assertEqual(matrix.durations_s[0][0], 0.0)
+        for i, origin in enumerate(points[:3]):
+            for j, destination in enumerate(points[:3]):
+                route = self.graph.route(origin, destination)
+                self.assertAlmostEqual(matrix.durations_s[i][j], route.duration_s)
+
     def test_profile_keywords_change_travel_times(self):
         xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
         slow = gw.SpatialGraph.from_osm(xml, "walk", walk_speed_kph=2.5)

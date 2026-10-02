@@ -282,7 +282,32 @@ mod tests {
                 );
 
                 let unprepared = sg.route((0.0, 0.0), (0.001, 0.001), None).unwrap();
+                let points = [(0.0, 0.0), (0.0, 0.002), (0.001, 0.001), (0.0005, 0.001)];
+                let route_table = |sg: &crate::graph::SpatialGraph| -> Vec<Vec<Option<f64>>> {
+                    points
+                        .iter()
+                        .map(|&o| {
+                            points
+                                .iter()
+                                .map(|&d| sg.route(o, d, None).ok().map(|r| r.duration_s))
+                                .collect()
+                        })
+                        .collect()
+                };
+                let close = |a: &[Vec<Option<f64>>], b: &[Vec<Option<f64>>]| {
+                    a.iter().flatten().zip(b.iter().flatten()).all(|p| match p {
+                        (Some(x), Some(y)) => (x - y).abs() < 1e-9,
+                        (x, y) => x.is_none() && y.is_none(),
+                    })
+                };
+                let by_dijkstra = sg.travel_time_matrix(&points, &points, None).durations_s;
+                assert!(
+                    close(&by_dijkstra, &route_table(&sg)),
+                    "{restriction} {network:?}"
+                );
                 sg.prepare_routing();
+                let by_ch = sg.travel_time_matrix(&points, &points, None).durations_s;
+                assert!(close(&by_ch, &by_dijkstra), "{restriction} {network:?}");
                 let prepared = sg.route((0.0, 0.0), (0.001, 0.001), None).unwrap();
                 for route in [&unprepared, &prepared] {
                     assert_eq!(
