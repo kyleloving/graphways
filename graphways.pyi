@@ -546,6 +546,39 @@ class SpatialGraph:
         """
         ...
 
+    def accessibility(
+        self,
+        origins: Sequence[tuple[float, float]],
+        opportunities: Sequence[tuple[float, float]],
+        minutes: Sequence[float],
+        weights: Sequence[float] | None = None,
+        decay: str = "step",
+        max_snap_m: float | None = 100.0,
+    ) -> list[list[float] | None]:
+        """
+        Accessibility score of every origin: the sum over opportunities of
+        ``weight x decay(travel time)``, one score per value in ``minutes``.
+
+        ``decay`` is ``"step"`` (count within ``minutes``), ``"linear"``
+        (falling to 0 at ``minutes``), ``"exponential"`` (halving every
+        ``minutes``) or ``"gaussian"`` (standard deviation ``minutes``).
+        Weights default to 1. Origins too far from any road score ``None``.
+        """
+        ...
+
+    def nearest_destinations(
+        self,
+        origins: Sequence[tuple[float, float]],
+        destinations: Sequence[tuple[float, float]],
+        k: int = 1,
+        max_snap_m: float | None = 100.0,
+    ) -> list[list[tuple[int, float, float]]]:
+        """
+        The ``k`` destinations each origin reaches fastest, nearest first, as
+        ``(index into destinations, duration_s, distance_m)`` tuples.
+        """
+        ...
+
     def fetch_pois(self, isochrone: IsochroneResult | str) -> PoiCollection:
         """
         Fetch OSM points of interest within a given isochrone polygon.

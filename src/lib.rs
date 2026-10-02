@@ -1,5 +1,6 @@
 // Public modules — available to any Rust crate that depends on this library.
 // None of these import pyo3, so they compile cleanly without the extension-module feature.
+pub mod accessibility;
 pub mod error;
 pub mod feasibility;
 pub mod filters;

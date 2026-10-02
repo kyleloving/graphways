@@ -35,7 +35,7 @@ pub struct TravelTimeMatrix {
 }
 
 /// How to cross the network between anchors.
-enum Costs<'a> {
+pub(crate) enum Costs<'a> {
     /// The graph's own travel times, through the hierarchy if prepared.
     Native,
     /// Caller-supplied per-slot costs (forward, backward adjacency).
@@ -68,6 +68,216 @@ fn seeds_with_lengths(sg: &SpatialGraph, anchors: &[Anchor], roots: &Roots) -> V
         .collect()
 }
 
+/// Snapped points and search seeds for one origins x destinations query,
+/// computed row by row so callers can reduce each row as it is produced.
+pub(crate) struct Table<'g> {
+    sg: &'g SpatialGraph,
+    edge_cost: Box<dyn Fn(EdgeIndex) -> f64 + Sync + 'g>,
+    pub(crate) origin_snaps: Vec<Option<SnapResult>>,
+    pub(crate) destination_snaps: Vec<Option<SnapResult>>,
+    from: Vec<Vec<Seed>>,
+    to: Vec<Vec<Seed>>,
+    /// Destinations by the road they snapped to (and its twin), for trips
+    /// that never leave one road.
+    by_edge: HashMap<EdgeIndex, Vec<usize>>,
+}
+
+/// A cell of a table: `(cost, metres)`, infinite when unreachable.
+pub(crate) type Cell = (f64, f64);
+const UNREACHABLE: Cell = (f64::INFINITY, f64::INFINITY);
+
+impl<'g> Table<'g> {
+    pub(crate) fn new(
+        sg: &'g SpatialGraph,
+        origins: &[LatLon],
+        destinations: &[LatLon],
+        max_snap_m: Option<f64>,
+        edge_cost: impl Fn(EdgeIndex) -> f64 + Sync + 'g,
+    ) -> Self {
+        let origin_snaps = snap_all(sg, origins, Role::Origin, max_snap_m);
+        let destination_snaps = snap_all(sg, destinations, Role::Destination, max_snap_m);
+
+        // Seeds for each point: where it enters (or leaves) the search graph
+        // and at what cost. Unsnapped points get none and stay unreachable.
+        let from: Vec<Vec<Seed>> = origin_snaps
+            .par_iter()
+            .map(|snap| match snap {
+                Some(snap) => {
+                    let anchors = sg.departures(snap, &mut |e| edge_cost(e));
+                    seeds_with_lengths(sg, &anchors, &sg.departure_roots(&anchors))
+                }
+                None => Vec::new(),
+            })
+            .collect();
+        let to: Vec<Vec<Seed>> = destination_snaps
+            .par_iter()
+            .map(|snap| match snap {
+                Some(snap) => {
+                    let anchors = sg.arrivals(snap, &mut |e| edge_cost(e));
+                    seeds_with_lengths(sg, &anchors, &sg.arrival_roots(&anchors))
+                }
+                None => Vec::new(),
+            })
+            .collect();
+
+        let mut by_edge: HashMap<EdgeIndex, Vec<usize>> = HashMap::new();
+        for (j, snap) in destination_snaps.iter().enumerate() {
+            // Indexed under the road's twin too: `twin` is not symmetric when
+            // parallel edges join the same nodes, and `direct_piece` checks both.
+            if let Some(edge) = snap.as_ref().and_then(|s| s.edge) {
+                for key in std::iter::once(edge).chain(sg.twin(edge)) {
+                    by_edge.entry(key).or_default().push(j);
+                }
+            }
+        }
+        Table {
+            sg,
+            edge_cost: Box::new(edge_cost),
+            origin_snaps,
+            destination_snaps,
+            from,
+            to,
+            by_edge,
+        }
+    }
+
+    /// A trip along a single road can beat any path through a junction.
+    fn same_road(&self, origin: usize, row: &mut [Cell]) {
+        let Some(origin) = &self.origin_snaps[origin] else {
+            return;
+        };
+        let Some(edge) = origin.edge else { return };
+        let candidates = [Some(edge), self.sg.twin(edge)];
+        let mut same_road: Vec<usize> = candidates
+            .iter()
+            .flatten()
+            .filter_map(|e| self.by_edge.get(e))
+            .flatten()
+            .copied()
+            .collect();
+        same_road.sort_unstable();
+        same_road.dedup();
+        for j in same_road {
+            let destination = self.destination_snaps[j].as_ref().expect("indexed above");
+            if let Some((cost, piece)) = self
+                .sg
+                .direct_piece(origin, destination, &mut |e| (self.edge_cost)(e))
+            {
+                if cost < row[j].0 {
+                    row[j] = (cost, piece.share() * self.sg.graph[piece.edge].length);
+                }
+            }
+        }
+    }
+
+    /// Compute every origin's row of cells and pass it to `reduce`, in
+    /// parallel. With the graph's own costs and a prepared hierarchy this
+    /// uses the bucket method; otherwise one Dijkstra search per origin, or,
+    /// unless `bounded_memory`, one per destination when those are fewer
+    /// (which holds the whole table in memory).
+    pub(crate) fn rows<R: Send>(
+        &self,
+        costs: Costs<'_>,
+        bounded_memory: bool,
+        reduce: impl Fn(usize, &[Cell]) -> R + Sync,
+    ) -> Vec<R> {
+        let width = self.to.len();
+        let finish = |i: usize, mut row: Vec<Cell>| {
+            self.same_road(i, &mut row);
+            reduce(i, &row)
+        };
+        if let (Costs::Native, Some(hierarchy)) = (&costs, self.sg.hierarchy_slot().get()) {
+            let buckets = hierarchy.buckets(&self.to);
+            return self
+                .from
+                .par_iter()
+                .enumerate()
+                .map(|(i, seeds)| {
+                    let mut row = vec![UNREACHABLE; width];
+                    if !seeds.is_empty() {
+                        hierarchy.fill_row(&buckets, seeds, &mut row);
+                    }
+                    finish(i, row)
+                })
+                .collect();
+        }
+
+        let slot_costs;
+        let (out_costs, inc_costs) = match costs {
+            Costs::Native => {
+                slot_costs = self.sg.slot_costs();
+                (&slot_costs.out[..], &slot_costs.inc[..])
+            }
+            Costs::Custom { out, inc } => (out, inc),
+        };
+        let index = self.sg.search_index();
+        let edge_length = |adjacency: &crate::search::Adjacency, slot: usize| {
+            self.sg.graph.raw_edges()[adjacency.edges[slot] as usize]
+                .weight
+                .length
+        };
+        let best = |labels: &crate::graph::NodeMap<Cell>, seeds: &[Seed]| {
+            seeds
+                .iter()
+                .filter_map(|&(state, cost, length)| {
+                    let &(c, l) = labels.get(petgraph::graph::NodeIndex::new(state as usize))?;
+                    Some((c + cost, l + length))
+                })
+                .fold(UNREACHABLE, |a, b| if b.0 < a.0 { b } else { a })
+        };
+
+        if bounded_memory || self.from.len() <= width {
+            return self
+                .from
+                .par_iter()
+                .enumerate()
+                .map(|(i, sources)| {
+                    let row = if sources.is_empty() || width == 0 {
+                        vec![UNREACHABLE; width]
+                    } else {
+                        let labels = dijkstra_with_lengths(
+                            &index.out,
+                            sources,
+                            |s| out_costs[s],
+                            |s| edge_length(&index.out, s),
+                        );
+                        self.to
+                            .iter()
+                            .map(|targets| best(&labels, targets))
+                            .collect()
+                    };
+                    finish(i, row)
+                })
+                .collect();
+        }
+
+        // Fewer destinations: search backward from each, then read rows out.
+        let columns: Vec<Vec<Cell>> = self
+            .to
+            .par_iter()
+            .map(|targets| {
+                if targets.is_empty() {
+                    return vec![UNREACHABLE; self.from.len()];
+                }
+                let labels = dijkstra_with_lengths(
+                    &index.inc,
+                    targets,
+                    |s| inc_costs[s],
+                    |s| edge_length(&index.inc, s),
+                );
+                self.from
+                    .iter()
+                    .map(|sources| best(&labels, sources))
+                    .collect()
+            })
+            .collect();
+        (0..self.from.len())
+            .into_par_iter()
+            .map(|i| finish(i, columns.iter().map(|column| column[i]).collect()))
+            .collect()
+    }
+}
+
 fn matrix(
     sg: &SpatialGraph,
     origins: Vec<LatLon>,
@@ -76,184 +286,22 @@ fn matrix(
     edge_cost: &(dyn Fn(EdgeIndex) -> f64 + Sync),
     costs: Costs<'_>,
 ) -> TravelTimeMatrix {
-    let origin_snaps = snap_all(sg, &origins, Role::Origin, max_snap_m);
-    let destination_snaps = snap_all(sg, &destinations, Role::Destination, max_snap_m);
-
-    // Seeds for each point: where it enters (or leaves) the search graph and
-    // at what cost. Unsnapped points get none and stay unreachable.
-    let from: Vec<Vec<Seed>> = origin_snaps
-        .par_iter()
-        .map(|snap| match snap {
-            Some(snap) => {
-                let anchors = sg.departures(snap, &mut |e| edge_cost(e));
-                seeds_with_lengths(sg, &anchors, &sg.departure_roots(&anchors))
-            }
-            None => Vec::new(),
-        })
-        .collect();
-    let to: Vec<Vec<Seed>> = destination_snaps
-        .par_iter()
-        .map(|snap| match snap {
-            Some(snap) => {
-                let anchors = sg.arrivals(snap, &mut |e| edge_cost(e));
-                seeds_with_lengths(sg, &anchors, &sg.arrival_roots(&anchors))
-            }
-            None => Vec::new(),
-        })
-        .collect();
-
-    let width = to.len();
-    let mut table = match (&costs, sg.hierarchy_slot().get()) {
-        (Costs::Native, Some(hierarchy)) => {
-            let (costs, lengths) = hierarchy.many_to_many(&from, &to);
-            costs.into_iter().zip(lengths).collect()
-        }
-        _ => {
-            let (out, inc) = match costs {
-                Costs::Native => {
-                    let slot_costs = sg.slot_costs();
-                    (&slot_costs.out[..], &slot_costs.inc[..])
-                }
-                Costs::Custom { out, inc } => (out, inc),
-            };
-            dijkstra_table(sg, &from, &to, out, inc)
-        }
-    };
-
-    // A trip along a single road can beat any path through a junction.
-    let mut by_edge: HashMap<EdgeIndex, Vec<usize>> = HashMap::new();
-    for (j, snap) in destination_snaps.iter().enumerate() {
-        // Indexed under the road's twin too: `twin` is not symmetric when
-        // parallel edges join the same nodes, and `direct_piece` checks both.
-        if let Some(edge) = snap.as_ref().and_then(|s| s.edge) {
-            for key in std::iter::once(edge).chain(sg.twin(edge)) {
-                by_edge.entry(key).or_default().push(j);
-            }
-        }
-    }
-    if !by_edge.is_empty() && width > 0 {
-        table
-            .par_chunks_mut(width)
-            .zip(origin_snaps.par_iter())
-            .for_each(|(row, origin)| {
-                let Some(origin) = origin else { return };
-                let Some(edge) = origin.edge else { return };
-                let candidates = [Some(edge), sg.twin(edge)];
-                let mut same_road: Vec<usize> = candidates
-                    .iter()
-                    .flatten()
-                    .filter_map(|e| by_edge.get(e))
-                    .flatten()
-                    .copied()
-                    .collect();
-                same_road.sort_unstable();
-                same_road.dedup();
-                for j in same_road {
-                    let destination = destination_snaps[j].as_ref().expect("indexed above");
-                    if let Some((cost, piece)) =
-                        sg.direct_piece(origin, destination, &mut |e| edge_cost(e))
-                    {
-                        if cost < row[j].0 {
-                            row[j] = (cost, piece.share() * sg.graph[piece.edge].length);
-                        }
-                    }
-                }
-            });
-    }
-
-    let rows = |pick: fn(&(f64, f64)) -> f64| -> Vec<Vec<Option<f64>>> {
-        if width == 0 {
-            return vec![Vec::new(); from.len()];
-        }
-        table
-            .chunks(width)
-            .map(|row| {
-                row.iter()
-                    .map(|cell| cell.0.is_finite().then(|| pick(cell)))
-                    .collect()
-            })
-            .collect()
-    };
+    let table = Table::new(sg, &origins, &destinations, max_snap_m, edge_cost);
+    let known = |x: f64, cell: &Cell| cell.0.is_finite().then_some(x);
+    type Row = Vec<Option<f64>>;
+    let rows: Vec<(Row, Row)> = table.rows(costs, false, |_, row| {
+        (
+            row.iter().map(|c| known(c.0, c)).collect(),
+            row.iter().map(|c| known(c.1, c)).collect(),
+        )
+    });
+    let (durations_s, distances_m) = rows.into_iter().unzip();
     TravelTimeMatrix {
-        durations_s: rows(|c| c.0),
-        distances_m: rows(|c| c.1),
-        origin_snaps,
-        destination_snaps,
+        durations_s,
+        distances_m,
+        origin_snaps: table.origin_snaps,
+        destination_snaps: table.destination_snaps,
     }
-}
-
-/// One Dijkstra search per point on the smaller side: forward from each
-/// origin, or backward from each destination when there are fewer of those.
-/// Cells are `(cost, metres)`.
-fn dijkstra_table(
-    sg: &SpatialGraph,
-    from: &[Vec<Seed>],
-    to: &[Vec<Seed>],
-    out_costs: &[f64],
-    inc_costs: &[f64],
-) -> Vec<(f64, f64)> {
-    let index = sg.search_index();
-    let width = to.len();
-    let unreachable = (f64::INFINITY, f64::INFINITY);
-    let mut table = vec![unreachable; from.len() * width];
-    if width == 0 || from.is_empty() {
-        return table;
-    }
-    let edge_length = |adjacency: &crate::search::Adjacency, slot: usize| {
-        sg.graph.raw_edges()[adjacency.edges[slot] as usize]
-            .weight
-            .length
-    };
-    let best = |labels: &crate::graph::NodeMap<(f64, f64)>, seeds: &[Seed]| {
-        seeds
-            .iter()
-            .filter_map(|&(state, cost, length)| {
-                let &(c, l) = labels.get(petgraph::graph::NodeIndex::new(state as usize))?;
-                Some((c + cost, l + length))
-            })
-            .fold(unreachable, |a, b| if b.0 < a.0 { b } else { a })
-    };
-    if from.len() <= to.len() {
-        table
-            .par_chunks_mut(width)
-            .zip(from.par_iter())
-            .for_each(|(row, sources)| {
-                if sources.is_empty() {
-                    return;
-                }
-                let labels = dijkstra_with_lengths(
-                    &index.out,
-                    sources,
-                    |s| out_costs[s],
-                    |s| edge_length(&index.out, s),
-                );
-                for (cell, targets) in row.iter_mut().zip(to) {
-                    *cell = best(&labels, targets);
-                }
-            });
-    } else {
-        let columns: Vec<Vec<(f64, f64)>> = to
-            .par_iter()
-            .map(|targets| {
-                if targets.is_empty() {
-                    return vec![unreachable; from.len()];
-                }
-                let labels = dijkstra_with_lengths(
-                    &index.inc,
-                    targets,
-                    |s| inc_costs[s],
-                    |s| edge_length(&index.inc, s),
-                );
-                from.iter().map(|sources| best(&labels, sources)).collect()
-            })
-            .collect();
-        for (j, column) in columns.into_iter().enumerate() {
-            for (i, cell) in column.into_iter().enumerate() {
-                table[i * width + j] = cell;
-            }
-        }
-    }
-    table
 }
 
 impl SpatialGraph {

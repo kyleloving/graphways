@@ -130,6 +130,28 @@ class PythonApiTests(unittest.TestCase):
                 self.assertAlmostEqual(matrix.durations_s[i][j], route.duration_s)
                 self.assertAlmostEqual(matrix.distances_m[i][j], route.distance_m)
 
+    def test_accessibility_and_nearest_destinations(self):
+        points = [(48.0, 11.0), (48.001, 11.0), (48.0005, 11.0), (10.0, 10.0)]
+        matrix = self.graph.travel_time_matrix(points, points)
+        scores = self.graph.accessibility(points, points, minutes=[1, 60], weights=[1, 2, 3, 4])
+        self.assertIsNone(scores[3])
+        for i in range(3):
+            within = [w for t, w in zip(matrix.durations_s[i], [1, 2, 3, 4]) if t is not None and t <= 60]
+            self.assertAlmostEqual(scores[i][0], sum(within))
+            self.assertAlmostEqual(scores[i][1], 6)
+        decayed = self.graph.accessibility(points, points, minutes=[2], decay="exponential")
+        self.assertTrue(0 < decayed[0][0] < 3)
+        with self.assertRaises(ValueError):
+            self.graph.accessibility(points, points, minutes=[5], decay="cubic")
+        with self.assertRaises(ValueError):
+            self.graph.accessibility(points, points, minutes=[5], weights=[1])
+
+        nearest = self.graph.nearest_destinations(points, points[1:3], k=1)
+        self.assertEqual(nearest[3], [])
+        index, seconds, metres = nearest[0][0]
+        self.assertEqual(seconds, min(t for t in matrix.durations_s[0][1:3] if t is not None))
+        self.assertGreater(metres, 0)
+
     def test_turn_cost_keywords_are_accepted(self):
         xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
         plain = gw.SpatialGraph.from_osm(xml, "drive", turn_penalty_s=0, u_turn_penalty_s=0)

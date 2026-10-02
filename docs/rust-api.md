@@ -136,6 +136,8 @@ an incompatible or damaged file fails with `OsmGraphError::InvalidGraphFile`.
 | `route_with(origin, destination, max_snap_m, cost)` | `Result<Route, _>` under a custom edge cost |
 | `travel_time_matrix(origins, destinations, max_snap_m)` | `TravelTimeMatrix` |
 | `travel_time_matrix_with(origins, destinations, max_snap_m, cost)` | `TravelTimeMatrix` under a custom edge cost |
+| `accessibility(origins, opportunities, weights, &decays, max_snap_m)` | `Result<Vec<Option<Vec<f64>>>, _>` |
+| `nearest_destinations(origins, destinations, k, max_snap_m)` | `Vec<Vec<NearbyDestination>>` |
 | `reachability(origin, max_time, max_snap_m)` | `Result<ReachabilityResult, _>` |
 | `reachable_graph(origin, max_time, max_snap_m)` | `Result<ReachableGraph, _>` |
 | `isochrones(origin, &limits, max_snap_m)` | `Result<Vec<MultiPolygon>, _>` |
@@ -183,6 +185,24 @@ With routing prepared, a matrix costs one small search per point (Munich,
 custom costs run one Dijkstra search per point on the smaller side. Points
 too far from any road get a `None` snap and `None` times instead of failing
 the whole matrix.
+
+### Accessibility
+
+```rust
+use graphways::accessibility::Decay;
+
+let decays = [Decay::Step { cutoff_s: 900.0 }, Decay::Exponential { half_life_s: 600.0 }];
+let scores = graph.accessibility(&homes, &jobs, Some(&job_counts), &decays, Some(250.0))?;
+// scores[i] is None for an unsnapped origin, else one score per decay.
+let nearest = graph.nearest_destinations(&homes, &clinics, 3, Some(250.0));
+```
+
+`accessibility` sums `weight × decay(travel time)` over opportunities for
+each origin (`Decay::Step`, `Linear`, `Exponential`, `Gaussian`).
+`nearest_destinations` returns each origin's `k` fastest destinations with
+their index, duration and route length. Both reduce each origin's row as it
+is computed, so memory grows with the number of points, not with origins ×
+destinations; prepare routing first for more than a handful of origins.
 
 ### Reachability, isochrones and prisms
 

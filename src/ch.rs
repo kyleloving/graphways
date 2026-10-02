@@ -83,6 +83,13 @@ pub(crate) struct ContractionHierarchy {
     lengths: Vec<f64>,
 }
 
+/// Target-side search spaces for many-to-many tables, grouped by node:
+/// `(node, target, cost, metres)`.
+pub(crate) struct Buckets {
+    entries: Vec<(u32, u32, f64, f64)>,
+    offsets: Vec<usize>,
+}
+
 /// A search seed: `(node, cost, distance in metres)`.
 pub(crate) type Seed = (u32, f64, f64);
 
@@ -612,25 +619,14 @@ impl ContractionHierarchy {
         space
     }
 
-    /// Exact costs from every source to every target (each a set of seeds),
-    /// row-major, infinite where unreachable, with the length in metres of
-    /// each optimal path.
+    /// Buckets for a set of targets: every node each target's backward
+    /// upward search settles, with the cost and length from there to it.
     ///
-    /// The bucket method: each target's backward upward search leaves
-    /// `(target, cost)` in a bucket at every node it settles, then each
-    /// source's forward upward search combines its costs with the buckets it
-    /// passes. A shortest path's highest node is in both search spaces, so
-    /// one forward and one backward search per point cover the whole table.
-    pub(crate) fn many_to_many(
-        &self,
-        sources: &[Vec<Seed>],
-        targets: &[Vec<Seed>],
-    ) -> (Vec<f64>, Vec<f64>) {
-        let width = targets.len();
-        let mut table = vec![(f64::INFINITY, f64::INFINITY); sources.len() * width];
-        if width == 0 {
-            return (Vec::new(), Vec::new());
-        }
+    /// This is the first half of the bucket method for many-to-many tables.
+    /// A shortest path's highest node is in both the source's forward and the
+    /// target's backward search space, so one search per point covers a
+    /// whole table: see [`ContractionHierarchy::fill_row`].
+    pub(crate) fn buckets(&self, targets: &[Vec<Seed>]) -> Buckets {
         let mut entries: Vec<(u32, u32, f64, f64)> = targets
             .par_iter()
             .enumerate()
@@ -648,21 +644,38 @@ impl ContractionHierarchy {
         for i in 0..self.node_count {
             offsets[i + 1] += offsets[i];
         }
+        Buckets { entries, offsets }
+    }
 
-        table
-            .par_chunks_mut(width)
-            .zip(sources.par_iter())
-            .for_each(|(row, seeds)| {
-                for (node, cost, length) in self.upward_space(seeds, true) {
-                    let bucket = &entries[offsets[node as usize]..offsets[node as usize + 1]];
-                    for &(_, target, back, back_length) in bucket {
-                        let cell = &mut row[target as usize];
-                        if cost + back < cell.0 {
-                            *cell = (cost + back, length + back_length);
-                        }
-                    }
+    /// One row of a many-to-many table: lower each target's `(cost, length)`
+    /// in `row` to the best path from `seeds` through the buckets.
+    pub(crate) fn fill_row(&self, buckets: &Buckets, seeds: &[Seed], row: &mut [(f64, f64)]) {
+        for (node, cost, length) in self.upward_space(seeds, true) {
+            let range = buckets.offsets[node as usize]..buckets.offsets[node as usize + 1];
+            for &(_, target, back, back_length) in &buckets.entries[range] {
+                let cell = &mut row[target as usize];
+                if cost + back < cell.0 {
+                    *cell = (cost + back, length + back_length);
                 }
-            });
+            }
+        }
+    }
+
+    /// Exact costs from every source to every target (each a set of seeds),
+    /// row-major, infinite where unreachable, with the length in metres of
+    /// each optimal path.
+    #[cfg(test)]
+    pub(crate) fn many_to_many(
+        &self,
+        sources: &[Vec<Seed>],
+        targets: &[Vec<Seed>],
+    ) -> (Vec<f64>, Vec<f64>) {
+        let width = targets.len();
+        let buckets = self.buckets(targets);
+        let mut table = vec![(f64::INFINITY, f64::INFINITY); sources.len() * width];
+        for (row, seeds) in table.chunks_mut(width.max(1)).zip(sources) {
+            self.fill_row(&buckets, seeds, row);
+        }
         table.into_iter().unzip()
     }
 

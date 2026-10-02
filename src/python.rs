@@ -15,6 +15,7 @@ use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+use crate::accessibility::Decay;
 use crate::error::OsmGraphError;
 use crate::graph::{Edge, NodeMap, OsmNode, SnapResult, SpatialGraph};
 use crate::overpass::NetworkType;
@@ -664,6 +665,18 @@ impl PyGraph {
         }
     }
 
+    /// Before a query needing `searches` one-to-many searches: build the
+    /// routing index now when that many Dijkstra searches would cost more
+    /// than building it, otherwise start it in the background for next time.
+    fn prepare_for(&self, searches: usize) {
+        if searches > 16 {
+            self.routing_requested.store(true, Ordering::Relaxed);
+            self.sg.prepare_routing();
+        } else {
+            self.prepare_routing_in_background();
+        }
+    }
+
     /// Start building the routing index on a background thread, once.
     /// Routes are answered with A* until it is ready, so no call waits on it.
     fn prepare_routing_in_background(&self) {
@@ -844,15 +857,9 @@ impl PyGraph {
     ) -> PyTravelTimeMatrix {
         // A handful of Dijkstra searches beats building the index; beyond
         // that the index pays for itself within the same call.
-        let prepare_now = origins.len().min(destinations.len()) > 16;
-        if !prepare_now {
-            self.prepare_routing_in_background();
-        }
+        let searches = origins.len().min(destinations.len());
         let matrix = py.detach(|| {
-            if prepare_now {
-                self.routing_requested.store(true, Ordering::Relaxed);
-                self.sg.prepare_routing();
-            }
+            self.prepare_for(searches);
             self.sg
                 .travel_time_matrix(&origins, &destinations, max_snap_m)
         });
@@ -861,6 +868,82 @@ impl PyGraph {
             durations: OnceLock::new(),
             distances: OnceLock::new(),
         }
+    }
+
+    /// Accessibility score of every origin: the sum over opportunities of
+    /// `weight x decay(travel time)`, one score per value in `minutes`.
+    ///
+    /// `decay` is `"step"` (count opportunities within `minutes`, the
+    /// default), `"linear"` (falling to 0 at `minutes`), `"exponential"`
+    /// (halving every `minutes`) or `"gaussian"` (standard deviation
+    /// `minutes`). Weights default to 1. Origins too far from any road
+    /// score `None`.
+    #[pyo3(signature = (origins, opportunities, minutes, weights = None, decay = "step", max_snap_m = Some(100.0)))]
+    #[allow(clippy::too_many_arguments)]
+    fn accessibility(
+        &self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        opportunities: Vec<(f64, f64)>,
+        minutes: Vec<f64>,
+        weights: Option<Vec<f64>>,
+        decay: &str,
+        max_snap_m: Option<f64>,
+    ) -> PyResult<Vec<Option<Vec<f64>>>> {
+        let decays = minutes
+            .iter()
+            .map(|&m| {
+                let s = m * 60.0;
+                Ok(match decay {
+                    "step" => Decay::Step { cutoff_s: s },
+                    "linear" => Decay::Linear { cutoff_s: s },
+                    "exponential" => Decay::Exponential { half_life_s: s },
+                    "gaussian" => Decay::Gaussian { sigma_s: s },
+                    other => {
+                        return Err(PyValueError::new_err(format!(
+                            "unknown decay '{other}'; use 'step', 'linear', 'exponential' or 'gaussian'"
+                        )))
+                    }
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let scores = py.detach(|| {
+            self.prepare_for(origins.len());
+            self.sg.accessibility(
+                &origins,
+                &opportunities,
+                weights.as_deref(),
+                &decays,
+                max_snap_m,
+            )
+        })?;
+        Ok(scores)
+    }
+
+    /// The `k` destinations each origin reaches fastest, nearest first, as
+    /// `(index into destinations, duration_s, distance_m)` tuples. Fewer
+    /// when fewer are reachable; empty for an origin too far from any road.
+    #[pyo3(signature = (origins, destinations, k = 1, max_snap_m = Some(100.0)))]
+    fn nearest_destinations(
+        &self,
+        py: Python<'_>,
+        origins: Vec<(f64, f64)>,
+        destinations: Vec<(f64, f64)>,
+        k: usize,
+        max_snap_m: Option<f64>,
+    ) -> Vec<Vec<(usize, f64, f64)>> {
+        py.detach(|| {
+            self.prepare_for(origins.len());
+            self.sg
+                .nearest_destinations(&origins, &destinations, k, max_snap_m)
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|d| (d.index, d.duration_s, d.distance_m))
+                        .collect()
+                })
+                .collect()
+        })
     }
 
     fn fetch_pois(

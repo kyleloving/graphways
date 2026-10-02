@@ -120,6 +120,9 @@ slow = gw.SpatialGraph.from_pbf("dc.osm.pbf", "walk", walk_speed_kph=3.5)
   (contraction hierarchies).
 - Compute many-to-many travel-time and distance matrices (a million cells
   in about a tenth of a second on a city graph).
+- Score accessibility (opportunities within reach, gravity-style decay) and
+  find each origin's nearest destinations, without holding the full table
+  in memory.
 - Build network-time prisms for "what can I visit between A and B?" analysis.
 - Export nodes, edges, routes, POIs, and isochrones as GeoJSON.
 

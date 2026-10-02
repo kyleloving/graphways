@@ -300,6 +300,66 @@ nearest_clinic_minutes = np.nanmin(times, axis=1) / 60
 
 ---
 
+## Accessibility
+
+### `accessibility`
+
+```python
+graph.accessibility(
+    origins: list[tuple[float, float]],
+    opportunities: list[tuple[float, float]],
+    minutes: list[float],
+    weights: list[float] | None = None,
+    decay: str = "step",
+    max_snap_m: float | None = 100.0,
+) -> list[list[float] | None]
+```
+
+How much each origin can reach: the sum over opportunities (jobs, schools,
+clinics, ...) of `weight x decay(travel time)`, one score per value in
+`minutes`. Weights default to 1, so the default `"step"` decay counts the
+opportunities reachable within each number of minutes.
+
+| `decay` | Weight of an opportunity `t` minutes away |
+|---------|--------------------------------------------|
+| `"step"` | 1 within `minutes`, 0 beyond (cumulative opportunities) |
+| `"linear"` | falls from 1 to 0 at `minutes` |
+| `"exponential"` | halves every `minutes` |
+| `"gaussian"` | `exp(-t^2 / (2 * minutes^2))` |
+
+Origins too far from any road score `None`; opportunities that can't be
+snapped or reached add nothing. Scores are computed origin by origin without
+ever holding the full origins x opportunities table, so large problems fit
+in memory: 10,000 homes against 10,000 weighted jobs at three cutoffs takes
+about 3 s driving and 7 s walking on Munich (2 cores).
+
+```python
+jobs_within = graph.accessibility(homes, workplaces, minutes=[15, 30, 45], weights=job_counts)
+gravity = graph.accessibility(homes, workplaces, minutes=[10], weights=job_counts, decay="exponential")
+```
+
+### `nearest_destinations`
+
+```python
+graph.nearest_destinations(
+    origins: list[tuple[float, float]],
+    destinations: list[tuple[float, float]],
+    k: int = 1,
+    max_snap_m: float | None = 100.0,
+) -> list[list[tuple[int, float, float]]]
+```
+
+The `k` destinations each origin reaches fastest, nearest first, as
+`(index into destinations, duration_s, distance_m)` tuples: fewer when fewer
+are reachable, none for an origin too far from any road.
+
+```python
+nearest = graph.nearest_destinations(homes, clinics, k=1)
+minutes_to_clinic = [row[0][1] / 60 if row else None for row in nearest]
+```
+
+---
+
 ## Reachability
 
 ### `reachable`
