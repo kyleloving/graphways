@@ -1,18 +1,22 @@
 """
 Type stubs for graphways -- the compiled Rust extension.
 
-Geometry results are structured Python objects. Use ``to_geojson()`` when you
-need serialized GeoJSON for Folium, GeoPandas, or web maps.
+Geometry results are structured Python objects implementing
+``__geo_interface__``, so GeoPandas and Shapely accept them directly. Use
+``to_geojson()`` when you need serialized GeoJSON for Folium or web maps.
 """
 
 from __future__ import annotations
+
+from os import PathLike
+from typing import Any, Sequence
 
 # ---------------------------------------------------------------------------
 # Result objects
 # ---------------------------------------------------------------------------
 
 class SnapResult:
-    """Nearest-network-node snap diagnostics for coordinate-based operations."""
+    """Where a coordinate joined the road network: the closest point on any road."""
 
     @property
     def input_lat(self) -> float: ...
@@ -21,7 +25,19 @@ class SnapResult:
     def input_lon(self) -> float: ...
 
     @property
-    def node_id(self) -> int: ...
+    def snapped_lat(self) -> float:
+        """Latitude of the point on the road the input snapped to."""
+        ...
+
+    @property
+    def snapped_lon(self) -> float:
+        """Longitude of the point on the road the input snapped to."""
+        ...
+
+    @property
+    def node_id(self) -> int:
+        """OSM id of the nearer end of the snapped road segment."""
+        ...
 
     @property
     def node_lat(self) -> float: ...
@@ -30,7 +46,9 @@ class SnapResult:
     def node_lon(self) -> float: ...
 
     @property
-    def distance_m(self) -> float: ...
+    def distance_m(self) -> float:
+        """Distance in metres from the input coordinate to the road."""
+        ...
 
     def as_dict(self) -> dict[str, float | int]: ...
 
@@ -63,10 +81,22 @@ class RouteResult:
         """Return this route as a GeoJSON ``Feature`` string."""
         ...
 
+    @property
+    def __geo_interface__(self) -> dict[str, Any]:
+        """The route as a GeoJSON ``LineString`` mapping."""
+        ...
+
+    def to_shapely(self) -> Any:
+        """The route as a ``shapely.LineString`` (requires shapely)."""
+        ...
+
     def __repr__(self) -> str: ...
 
 class IsochroneResult:
-    """One isochrone polygon for one travel-time threshold."""
+    """
+    The area reachable within one travel-time threshold: a MultiPolygon that
+    may have several parts and holes for unreachable pockets.
+    """
 
     @property
     def minutes(self) -> float: ...
@@ -74,7 +104,16 @@ class IsochroneResult:
     def as_dict(self) -> dict[str, object]: ...
 
     def to_geojson(self) -> str:
-        """Return this isochrone polygon as a GeoJSON geometry string."""
+        """Return this isochrone as a GeoJSON ``MultiPolygon`` geometry string."""
+        ...
+
+    @property
+    def __geo_interface__(self) -> dict[str, Any]:
+        """The isochrone as a GeoJSON ``MultiPolygon`` mapping."""
+        ...
+
+    def to_shapely(self) -> Any:
+        """The isochrone as a ``shapely.MultiPolygon`` (requires shapely)."""
         ...
 
     def __repr__(self) -> str: ...
@@ -113,7 +152,40 @@ class PoiCollection:
         """Return POIs as a GeoJSON ``FeatureCollection`` string."""
         ...
 
+    @property
+    def __geo_interface__(self) -> dict[str, Any]:
+        """The POIs as a GeoJSON ``FeatureCollection`` mapping."""
+        ...
+
     def __len__(self) -> int: ...
+
+    def __repr__(self) -> str: ...
+
+class TravelTimeMatrix:
+    """Travel times between every origin and every destination."""
+
+    @property
+    def durations_s(self) -> list[list[float | None]]:
+        """
+        ``durations_s[i][j]``: seconds from origin ``i`` to destination ``j``;
+        ``None`` when there is no route or either point could not be snapped.
+        """
+        ...
+
+    @property
+    def origin_snaps(self) -> list[SnapResult | None]:
+        """Where each origin joined the network (``None`` if too far away)."""
+        ...
+
+    @property
+    def destination_snaps(self) -> list[SnapResult | None]:
+        """Where each destination joined the network (``None`` if too far away)."""
+        ...
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        """``(len(origins), len(destinations))``."""
+        ...
 
     def __repr__(self) -> str: ...
 
@@ -301,15 +373,19 @@ class SpatialGraph:
 
     @staticmethod
     def from_pbf(
-        path: str,
+        path: str | PathLike[str],
         network: str,
         retain_all: bool = False,
+        **profile: Any,
     ) -> SpatialGraph:
         """
         Load a local OSM PBF file into a reusable ``SpatialGraph``.
 
         ``network`` accepts ``"drive"``, ``"drive_service"``, ``"walk"``,
-        ``"bike"``, ``"all"``, or ``"all_private"``.
+        ``"bike"``, ``"all"``, or ``"all_private"``. Speed-profile keywords:
+        ``walk_speed_kph``, ``bike_speed_kph``, ``drive_speeds_kph`` (a
+        ``{highway_class: kph}`` dict), ``default_drive_speed_kph``,
+        ``use_maxspeed`` and ``merge_distance_m``.
         """
         ...
 
@@ -318,12 +394,13 @@ class SpatialGraph:
         xml: str,
         network: str,
         retain_all: bool = False,
+        **profile: Any,
     ) -> SpatialGraph:
         """
         Parse an OSM XML string into a reusable ``SpatialGraph``.
 
-        ``network`` accepts ``"drive"``, ``"drive_service"``, ``"walk"``,
-        ``"bike"``, ``"all"``, or ``"all_private"``.
+        Accepts the same ``network`` values and speed-profile keywords as
+        :meth:`from_pbf`.
         """
         ...
 
@@ -333,12 +410,34 @@ class SpatialGraph:
         network: str,
         max_dist: float | None = None,
         retain_all: bool = False,
+        **profile: Any,
     ) -> SpatialGraph:
         """
-        Geocode a place name and build a reusable ``SpatialGraph`` around it.
+        Geocode a place name and download the road network within
+        ``max_dist`` metres of it (default 5 km) from Overpass.
 
-        ``network`` accepts ``"drive"``, ``"drive_service"``, ``"walk"``,
-        ``"bike"``, ``"all"``, or ``"all_private"``.
+        Accepts the same ``network`` values and speed-profile keywords as
+        :meth:`from_pbf`.
+        """
+        ...
+
+    @staticmethod
+    def load(path: str | PathLike[str]) -> SpatialGraph:
+        """
+        Load a graph written by :meth:`save`. Much faster than rebuilding it;
+        the routing index comes back ready if it was built before saving.
+
+        Raises ``ValueError`` for a file that is not a graphways graph or was
+        written by an incompatible version, ``OSError`` if it cannot be read.
+        """
+        ...
+
+    def save(self, path: str | PathLike[str], prepare_routing: bool = True) -> None:
+        """
+        Write the graph to ``path`` for a fast :meth:`load` later.
+
+        By default the routing index is built first (if it isn't already) so
+        the loaded graph routes at full speed straight away.
         """
         ...
 
@@ -379,7 +478,7 @@ class SpatialGraph:
         Returns
         -------
         list[IsochroneResult]
-            One polygon result per time limit, in the same order as
+            One MultiPolygon result per time limit, in the same order as
             ``minutes``. Call ``to_geojson()`` when you need serialized
             GeoJSON.
         """
@@ -419,6 +518,22 @@ class SpatialGraph:
         """Whether the routing index has been built."""
         ...
 
+    def travel_time_matrix(
+        self,
+        origins: Sequence[tuple[float, float]],
+        destinations: Sequence[tuple[float, float]],
+        max_snap_m: float | None = 100.0,
+    ) -> TravelTimeMatrix:
+        """
+        Fastest travel times from every ``(lat, lon)`` origin to every
+        destination, exactly as :meth:`route` would find them.
+
+        Points farther than ``max_snap_m`` from any road get ``None`` times
+        instead of failing the whole matrix. Large matrices build the routing
+        index first (see :meth:`prepare_routing`), which makes them fast.
+        """
+        ...
+
     def fetch_pois(self, isochrone: IsochroneResult | str) -> PoiCollection:
         """
         Fetch OSM points of interest within a given isochrone polygon.
@@ -431,7 +546,7 @@ class SpatialGraph:
 
         Returns
         -------
-        str
+        PoiCollection
             Structured POI collection. Call ``to_geojson()`` for a GeoJSON
             ``FeatureCollection``.
         """
@@ -439,7 +554,8 @@ class SpatialGraph:
 
     def snap_point(self, lat: float, lon: float) -> SnapResult | None:
         """
-        Return snap diagnostics for the nearest graph node to ``(lat, lon)``.
+        Where ``(lat, lon)`` joins the road network: the closest point on any
+        road, as every query snaps its points. ``None`` for an empty graph.
 
         Use ``as_dict()`` if you need a plain dictionary.
         """

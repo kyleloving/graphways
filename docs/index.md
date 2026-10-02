@@ -12,8 +12,9 @@
 
 graphways queries OpenStreetMap, builds a road-network graph, and gives you:
 
-- **Isochrones** -- polygons bounding everything reachable within a time limit
-- **Point-to-point routing** -- A* routes with per-waypoint cumulative travel times
+- **Isochrones** -- multipolygons covering everything reachable within a time limit, with holes for unreachable pockets
+- **Point-to-point routing** -- exact routes with per-waypoint cumulative travel times, sub-millisecond once prepared
+- **Travel-time matrices** -- many origins to many destinations in one call
 - **POI fetching** -- amenities, shops, and other features within any isochrone
 - **Graph introspection** -- inspect nodes, edges, and the network structure directly
 
@@ -51,12 +52,16 @@ print(pois.count)
 |---------|--------|
 | Graph construction | Parses OSM XML or local OSM PBF into a reusable `SpatialGraph` |
 | Simplification | Collapses linear chains, deduplicates parallel edges, and preserves edge geometry |
-| Spatial index | R-tree for O(log n) nearest-node lookups |
-| Isochrones | Bounded graph search plus triangulated travel-time contours |
-| Routing | A* with an admissible straight-line heuristic |
+| Snapping | Points join the network at the closest point on any road (R-tree over road segments) |
+| Speed profiles | Configurable walking, cycling and per-road-class driving speeds |
+| Turn restrictions | OSM `type=restriction` relations are obeyed when driving |
+| Isochrones | Bounded graph search plus triangulated travel-time contours, as multipolygons with holes |
+| Routing | Contraction hierarchies once prepared, A* before; both exact |
+| Matrices | Many-to-many travel times via hierarchy buckets |
+| Persistence | Save a prepared graph and load it back in a fraction of the build time |
 | Network types | Drive, DriveService, Walk, Bike, All, AllPrivate |
 | Caching | Overpass XML cache: disk XML -> in-memory XML |
-| Python bindings | Structured result objects with explicit GeoJSON export |
+| Python bindings | Structured result objects with `__geo_interface__` and explicit GeoJSON export; the GIL is released during queries |
 
 ---
 
@@ -69,6 +74,7 @@ route, reachability, and isochrone queries:
 ```bash
 python benchmarks/comparison.py
 python benchmarks/engines/engines.py --pbf C:\path\to\extract.osm.pbf
+cargo bench --bench pipeline              # Rust pipeline on the bundled Munich extract
 ```
 
 Treat benchmark numbers as workload-specific. They depend on graph size,

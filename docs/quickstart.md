@@ -28,19 +28,36 @@ print(pois.count)
 
 Use `SpatialGraph.from_pbf(path, network="walk")` for local offline OSM PBF workflows, or `SpatialGraph.from_osm(xml, network="walk")` when you already have OSM XML.
 
+Points snap to the closest point on any road, so routes and isochrones start
+part-way along a street rather than at the nearest intersection.
+
+For repeated work over the same area, save the graph once and load it next
+time, and use a matrix when you need many trips at once:
+
+```python
+graph.save("munich-drive.graph")             # includes the routing index
+graph = gw.SpatialGraph.load("munich-drive.graph")
+
+stops = [(48.140, 11.560), (48.130, 11.590), (48.150, 11.580)]
+matrix = graph.travel_time_matrix([origin], stops)
+print(matrix.durations_s[0])                 # seconds to each stop
+```
+
 ---
 ## Working with structured results
 
-Routes, snap diagnostics, and isochrones are structured Python objects. Export
-GeoJSON explicitly when you need to pass geometry to mapping tools:
+Routes, snap diagnostics, and isochrones are structured Python objects. Routes
+and isochrones implement `__geo_interface__`, so `shapely.geometry.shape(iso)`
+and GeoPandas accept them directly. Export GeoJSON explicitly when you need to
+pass geometry to other mapping tools:
 
 ```python
 import json
 
 # Isochrone geometry
 iso = json.loads(isos[0].to_geojson())
-print(iso["type"])        # "Polygon"
-print(iso["coordinates"]) # [[lon, lat], ...]
+print(iso["type"])        # "MultiPolygon": parts, each with holes
+print(iso["coordinates"]) # [[[[lon, lat], ...], ...], ...]
 
 # Route metrics and feature export
 print(f"Distance: {route.distance_m:.0f} m")

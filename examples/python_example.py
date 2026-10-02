@@ -39,9 +39,9 @@ def isochrone_example():
     folium.Marker(location=[lat, lon], tooltip=place).add_to(m)
 
     # Add largest isochrone first so smaller ones render on top
-    for geojson_str, color, label in reversed(list(zip(isochrones, colors, labels))):
+    for iso, color, label in reversed(list(zip(isochrones, colors, labels))):
         folium.GeoJson(
-            json.loads(geojson_str),
+            iso.__geo_interface__,
             name=label,
             style_function=lambda _, c=color: {
                 "fillColor": c,
@@ -70,7 +70,7 @@ def routing_example():
 
     t0 = time.time()
     graph = gw.SpatialGraph.from_place(origin_place, network="drive", max_dist=10_000)
-    route_geojson = graph.route(origin, dest)
+    route_geojson = graph.route(origin, dest).to_geojson()
     elapsed = time.time() - t0
 
     route = json.loads(route_geojson)
@@ -146,7 +146,7 @@ def isochrone_and_route_example():
     walk_graph = gw.SpatialGraph.from_place(origin_place, network="walk", max_dist=5_000)
     isochrones = walk_graph.isochrone(origin, minutes=[5, 10, 15])
     drive_graph = gw.SpatialGraph.from_place(origin_place, network="drive", max_dist=10_000)
-    route_geojson = drive_graph.route(origin, dest)
+    route_geojson = drive_graph.route(origin, dest).to_geojson()
     route = json.loads(route_geojson)
     props = route["properties"]
     coords = route["geometry"]["coordinates"]
@@ -160,11 +160,11 @@ def isochrone_and_route_example():
     # Isochrones
     iso_colors = ["#2ecc71", "#f1c40f", "#e74c3c"]
     iso_labels = ["5 min walk", "10 min walk", "15 min walk"]
-    for geojson_str, color, label in reversed(
+    for iso, color, label in reversed(
         list(zip(isochrones, iso_colors, iso_labels))
     ):
         folium.GeoJson(
-            json.loads(geojson_str),
+            iso.__geo_interface__,
             name=label,
             style_function=lambda _, c=color: {
                 "fillColor": c,

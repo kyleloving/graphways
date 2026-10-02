@@ -12,6 +12,70 @@ graph = gw.SpatialGraph.from_place("Marienplatz, Munich, Germany", network="driv
 print(graph)  # SpatialGraph(nodes=6251, edges=15356, network_type=Drive)
 ```
 
+Every method that does real work releases the GIL, so a `SpatialGraph` can
+serve queries from several Python threads at once.
+
+---
+
+## Construction
+
+```python
+gw.SpatialGraph.from_place(place, network, max_dist=None, retain_all=False, **profile)
+gw.SpatialGraph.from_pbf(path, network, retain_all=False, **profile)
+gw.SpatialGraph.from_osm(xml, network, retain_all=False, **profile)
+gw.SpatialGraph.load(path)
+```
+
+`network` is one of `"drive"`, `"drive_service"`, `"walk"`, `"bike"`, `"all"`
+or `"all_private"`. `from_place` geocodes the place and downloads the roads
+within `max_dist` metres (default 5 km) from Overpass; `from_pbf` reads a
+local extract and needs no network access. Driving graphs obey the turn
+restrictions mapped in OpenStreetMap (no left turn, only straight on, ...).
+
+### Speed profiles
+
+Every builder accepts keyword arguments that tune the travel-time model:
+
+| Keyword | Default | Description |
+|---------|---------|-------------|
+| `walk_speed_kph` | `5.0` | Walking speed on every walkable way |
+| `bike_speed_kph` | `15.0` | Cycling speed on every ridable way |
+| `drive_speeds_kph` | built in | `{highway_class: kph}` overrides, e.g. `{"residential": 20}` |
+| `default_drive_speed_kph` | `50.0` | Driving speed for classes without a configured speed |
+| `use_maxspeed` | `True` | Let a way's `maxspeed` tag override its class speed |
+| `merge_distance_m` | `5.0` | Merge intersections closer than this when simplifying |
+
+```python
+slow_walk = gw.SpatialGraph.from_pbf("munich.osm.pbf", "walk", walk_speed_kph=3.5)
+zone_30 = gw.SpatialGraph.from_pbf(
+    "munich.osm.pbf", "drive",
+    drive_speeds_kph={"residential": 20, "tertiary": 30},
+)
+```
+
+### `save` / `load`
+
+```python
+graph.save(path, prepare_routing=True) -> None
+gw.SpatialGraph.load(path) -> SpatialGraph
+```
+
+Write the graph to a file and load it back later, much faster than
+rebuilding it (Munich walking graph: about 8 s to build and prepare, under
+1 s to load). By default `save` builds the routing index first (see
+[`route`](#route)) so the loaded graph routes at full speed immediately; pass
+`prepare_routing=False` for a smaller file. Loading a file that is not a
+graphways graph, or one written by an incompatible version, raises
+`ValueError`.
+
+```python
+graph = gw.SpatialGraph.from_pbf("munich.osm.pbf", "walk")
+graph.save("munich-walk.graph")
+
+# Later, or in another process:
+graph = gw.SpatialGraph.load("munich-walk.graph")
+```
+
 ---
 
 ## Inspection
@@ -57,6 +121,26 @@ print(f"Snapped to OSM node {osm_id} at ({node_lat:.6f}, {node_lon:.6f})")
 
 ---
 
+### `snap_point`
+
+```python
+graph.snap_point(lat: float, lon: float) -> SnapResult | None
+```
+
+Where a coordinate joins the road network: the closest point on any road,
+not just the closest intersection. Every query (routes, isochrones,
+reachability, prisms, matrices) snaps its points this way, so a trip from the
+middle of a long block starts in the middle of that block.
+
+| Property | Description |
+|----------|-------------|
+| `input_lat`, `input_lon` | The coordinate you passed |
+| `snapped_lat`, `snapped_lon` | The point on the road it snapped to |
+| `distance_m` | Distance from the input to the road |
+| `node_id`, `node_lat`, `node_lon` | The nearer end of the road segment |
+
+---
+
 ## Isochrones
 
 ### `isochrone`
@@ -71,8 +155,10 @@ graph.isochrone(
 
 Compute isochrones from an origin using the travel times of this graph's network type.
 
-One Dijkstra pass is run from the nearest graph node; one triangulated contour
-polygon is computed per time limit.
+One search runs from the origin's snapped road point, and each limit's area
+is traced from a triangulated travel-time surface. Isochrones are
+`MultiPolygon`s: several parts where the reachable area is split (by a river
+or a motorway, say) and holes for unreachable pockets inside it.
 
 **Parameters**
 
@@ -82,14 +168,22 @@ polygon is computed per time limit.
 | `minutes` | `list[float]` | - | Travel-time thresholds in minutes |
 | `max_snap_m` | `float` or `None` | `100.0` | Reject the query if the origin snaps farther than this many meters from the graph; pass `None` to allow unlimited snapping |
 
-**Returns** `list[IsochroneResult]` - one structured polygon result per time
-limit, in the same order as `minutes`. Use `.to_geojson()` for mapping tools.
+**Returns** `list[IsochroneResult]` - one structured result per time
+limit, in the same order as `minutes`. Each implements `__geo_interface__`,
+so GeoPandas and Shapely accept it directly; `.to_shapely()` converts it
+(requires `shapely`) and `.to_geojson()` serializes it.
 
 **Example**
 
 ```python
+import geopandas as gpd
+
 isos = graph.isochrone((48.137144, 11.575399), minutes=[5, 10, 15, 20])
-first_geojson = isos[0].to_geojson()
+frame = gpd.GeoDataFrame(
+    {"minutes": [iso.minutes for iso in isos]},
+    geometry=[iso.to_shapely() for iso in isos],
+    crs="EPSG:4326",
+)
 ```
 
 ---
@@ -115,8 +209,9 @@ index is ready, routes take well under a millisecond. Call
 `graph.is_routing_prepared()` to check.
 
 The network type (drive/walk/bike) is inherited from the `SpatialGraph`.
-Coordinates snap to the nearest graph node. Pass `max_snap_m` to reject routes
-whose origin or destination is too far from the road network.
+Coordinates snap to the nearest point on a road, so routes start and end
+part-way along streets. Pass `max_snap_m` to reject routes whose origin or
+destination is too far from the road network.
 
 **Parameters**
 
@@ -145,6 +240,49 @@ print(f"Distance: {route.distance_m:.0f} m")
 print(f"Duration: {route.duration_s / 60:.1f} min")
 print(f"Waypoints: {len(route.coordinates)}")
 route_geojson = route.to_geojson()
+```
+
+`RouteResult` also implements `__geo_interface__` (a `LineString`) and
+`.to_shapely()`.
+
+---
+
+### `travel_time_matrix`
+
+```python
+graph.travel_time_matrix(
+    origins: list[tuple[float, float]],
+    destinations: list[tuple[float, float]],
+    max_snap_m: float | None = 100.0,
+) -> TravelTimeMatrix
+```
+
+Fastest travel times from every origin to every destination, exactly as
+`route` would find them. Large matrices build the routing index first, after
+which a 1000 x 1000 matrix of Munich takes about 50 ms driving and 150 ms
+walking. Points farther than `max_snap_m` from any road get `None` times
+rather than failing the whole matrix.
+
+**Returns** `TravelTimeMatrix` with properties:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `durations_s` | list of lists of `float` or `None` | `durations_s[i][j]`: seconds from origin `i` to destination `j`; `None` when unreachable or unsnapped |
+| `origin_snaps` | list of `SnapResult` or `None` | Where each origin joined the network |
+| `destination_snaps` | list of `SnapResult` or `None` | Where each destination joined the network |
+| `shape` | `tuple[int, int]` | `(len(origins), len(destinations))` |
+
+**Example**
+
+```python
+import numpy as np
+
+homes = [(48.137, 11.575), (48.150, 11.560), (48.120, 11.600)]
+clinics = [(48.140, 11.560), (48.130, 11.590)]
+matrix = graph.travel_time_matrix(homes, clinics)
+
+times = np.array(matrix.durations_s, dtype=float)  # None becomes nan
+nearest_clinic_minutes = np.nanmin(times, axis=1) / 60
 ```
 
 ---

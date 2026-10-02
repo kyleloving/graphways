@@ -34,6 +34,14 @@ graphways = "0.5.0"
 
 > **Note:** The crate is published as `graphways`; the library module is `graphways` (matching the Python package name).
 
+The default `network` feature downloads data from Overpass and Nominatim. If
+you only load local PBF or XML files, leave it out to skip the HTTP stack:
+
+```toml
+[dependencies]
+graphways = { version = "0.5.0", default-features = false }
+```
+
 ## Dependencies
 
 graphways has no required Python dependencies -- all heavy lifting is in Rust.
