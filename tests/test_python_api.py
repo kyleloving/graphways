@@ -36,7 +36,8 @@ class PythonApiTests(unittest.TestCase):
         self.assertEqual([iso.minutes for iso in isochrones], [1.0, 3.0])
         self.assertTrue(all(type(iso).__name__ == "IsochroneResult" for iso in isochrones))
         geojson = json.loads(isochrones[0].to_geojson())
-        self.assertEqual(geojson["type"], "Polygon")
+        self.assertEqual(geojson["type"], "MultiPolygon")
+        self.assertEqual(isochrones[0].__geo_interface__, geojson)
 
     def test_snap_point_returns_structured_result(self):
         snap = self.graph.snap_point(48.0, 11.0)
@@ -68,6 +69,27 @@ class PythonApiTests(unittest.TestCase):
         route = self.graph.route((47.999, 11.0), (48.001, 11.0), max_snap_m=None)
         self.assertEqual(type(route).__name__, "RouteResult")
         self.assertGreater(route.origin_snap.distance_m, 100.0)
+
+    def test_snap_lands_on_the_road_between_nodes(self):
+        snap = self.graph.snap_point(48.0005, 11.0001)
+
+        self.assertLess(snap.distance_m, 10.0)
+        self.assertAlmostEqual(snap.snapped_lat, 48.0005, places=5)
+        self.assertIn("snapped_lon", snap.as_dict())
+
+    def test_results_expose_geo_interface(self):
+        route = self.graph.route((48.0, 11.0), (48.001, 11.0))
+        self.assertEqual(route.__geo_interface__["geometry"]["type"], "LineString")
+
+    def test_prepare_routing_gives_identical_routes(self):
+        xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
+        graph = gw.SpatialGraph.from_osm(xml, "walk")
+        before = graph.route((48.0, 11.0), (48.001, 11.0))
+        graph.prepare_routing()
+        self.assertTrue(graph.is_routing_prepared())
+        after = graph.route((48.0, 11.0), (48.001, 11.0))
+        self.assertAlmostEqual(before.duration_s, after.duration_s)
+        self.assertEqual(before.coordinates, after.coordinates)
 
     def test_invalid_osm_raises_value_error(self):
         with self.assertRaises(ValueError):

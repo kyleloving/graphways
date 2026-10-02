@@ -316,29 +316,25 @@ pub(crate) fn workspace(node_count: usize) -> PooledWorkspace {
 
 /// One-to-many Dijkstra over `adjacency`, bounded by `max_cost` (inclusive).
 ///
-/// `cost(slot)` prices the arc in adjacency slot `slot`. Pass the forward
-/// adjacency for `cost(start → v)` and the backward one for `cost(v → start)`.
-/// The result lists every reached node in settle order, i.e. sorted by cost.
+/// The search starts from every `(node, cost)` in `sources` at once, which is
+/// how a point part-way along a road enters the network. `cost(slot)` prices
+/// the arc in adjacency slot `slot`. Pass the forward adjacency for
+/// `cost(source → v)` and the backward one for `cost(v → source)`. The
+/// result lists every reached node in settle order, i.e. sorted by cost.
 pub(crate) fn dijkstra(
     adjacency: &Adjacency,
-    start: NodeIndex,
+    sources: &[(u32, f64)],
     max_cost: f64,
     mut cost: impl FnMut(usize) -> f64,
 ) -> NodeMap<f64> {
     let node_count = adjacency.node_count();
     let mut result = NodeMap::with_node_count(node_count);
-    if start.index() >= node_count || max_cost.is_nan() || max_cost < 0.0 {
+    if max_cost.is_nan() || max_cost < 0.0 {
         return result;
     }
 
     let mut ws = workspace(node_count);
-    let start = start.index() as u32;
-    ws.relax(start, 0.0, NONE, NONE);
-    ws.heap.push(HeapEntry {
-        key: 0.0,
-        cost: 0.0,
-        node: start,
-    });
+    seed(&mut ws, sources, node_count, |_| 0.0, Some(max_cost));
 
     while let Some(HeapEntry {
         cost: node_cost,
@@ -371,51 +367,80 @@ pub(crate) fn dijkstra(
     result
 }
 
-/// Point-to-point A* over the forward adjacency `out`.
+/// Push each in-range source onto the workspace heap with its starting cost.
+pub(crate) fn seed(
+    ws: &mut Workspace,
+    sources: &[(u32, f64)],
+    node_count: usize,
+    mut heuristic: impl FnMut(u32) -> f64,
+    max_cost: Option<f64>,
+) {
+    for &(node, cost) in sources {
+        let in_range = (node as usize) < node_count && usable(cost);
+        if in_range && max_cost.is_none_or(|max| cost <= max) && ws.relax(node, cost, NONE, NONE) {
+            ws.heap.push(HeapEntry {
+                key: cost + heuristic(node),
+                cost,
+                node,
+            });
+        }
+    }
+}
+
+/// An optimal path found by a point-to-point search.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SearchPath {
+    /// Total cost including the source and target offsets.
+    pub(crate) cost: f64,
+    /// The source the path leaves from and the target it arrives at.
+    pub(crate) first: NodeIndex,
+    pub(crate) last: NodeIndex,
+    /// Petgraph edges in travel order.
+    pub(crate) edges: Vec<EdgeIndex>,
+}
+
+/// Point-to-point A* over the forward adjacency `out`, from any of `sources`
+/// to any of `targets`, each a `(node, offset)` pair.
 ///
-/// `heuristic` must never overestimate the remaining cost to `goal`
-/// (`|_| 0.0` gives plain Dijkstra). Returns the total cost and the petgraph
-/// edges of an optimal path in travel order.
+/// `heuristic` must never overestimate the remaining cost to the goal
+/// including the target offset (`|_| 0.0` gives plain Dijkstra).
 pub(crate) fn astar(
     out: &Adjacency,
-    start: NodeIndex,
-    goal: NodeIndex,
+    sources: &[(u32, f64)],
+    targets: &[(u32, f64)],
     mut cost: impl FnMut(usize) -> f64,
     mut heuristic: impl FnMut(u32) -> f64,
-) -> Option<(f64, Vec<EdgeIndex>)> {
+) -> Option<SearchPath> {
     let node_count = out.node_count();
-    if start.index() >= node_count || goal.index() >= node_count {
-        return None;
-    }
-
     let mut ws = workspace(node_count);
-    let (start, goal) = (start.index() as u32, goal.index() as u32);
-    ws.relax(start, 0.0, NONE, NONE);
-    ws.heap.push(HeapEntry {
-        key: heuristic(start),
-        cost: 0.0,
-        node: start,
-    });
+    seed(&mut ws, sources, node_count, &mut heuristic, None);
+    let target_offset = |node: u32| {
+        targets
+            .iter()
+            .filter(|&&(t, offset)| t == node && usable(offset))
+            .map(|&(_, offset)| offset)
+            .min_by(f64::total_cmp)
+    };
 
+    let mut best = f64::INFINITY;
+    let mut best_target = NONE;
     while let Some(HeapEntry {
+        key,
         cost: node_cost,
         node,
-        ..
     }) = ws.heap.pop()
     {
+        if key >= best {
+            break;
+        }
         if node_cost > ws.dist(node) || !ws.settle(node) {
             continue; // stale heap entry
         }
-        if node == goal {
-            let mut edges = Vec::new();
-            let mut current = goal;
-            while current != start {
-                let (pred, slot) = ws.pred(current);
-                edges.push(EdgeIndex::new(out.edges[slot as usize] as usize));
-                current = pred;
+        if let Some(offset) = target_offset(node) {
+            if node_cost + offset < best {
+                best = node_cost + offset;
+                best_target = node;
             }
-            edges.reverse();
-            return Some((node_cost, edges));
         }
 
         for slot in out.range(node) {
@@ -425,7 +450,7 @@ pub(crate) fn astar(
             }
             let next = out.neighbors[slot];
             let next_cost = node_cost + edge_cost;
-            if ws.relax(next, next_cost, node, slot as u32) {
+            if next_cost < best && ws.relax(next, next_cost, node, slot as u32) {
                 ws.heap.push(HeapEntry {
                     key: next_cost + heuristic(next),
                     cost: next_cost,
@@ -435,7 +460,26 @@ pub(crate) fn astar(
         }
     }
 
-    None
+    if best_target == NONE {
+        return None;
+    }
+    let mut edges = Vec::new();
+    let mut current = best_target;
+    loop {
+        let (pred, slot) = ws.pred(current);
+        if pred == NONE {
+            break;
+        }
+        edges.push(EdgeIndex::new(out.edges[slot as usize] as usize));
+        current = pred;
+    }
+    edges.reverse();
+    Some(SearchPath {
+        cost: best,
+        first: NodeIndex::new(current as usize),
+        last: NodeIndex::new(best_target as usize),
+        edges,
+    })
 }
 
 #[cfg(test)]
@@ -467,8 +511,12 @@ mod tests {
         let (g, [a, b, c, d]) = diamond();
         let index = SearchIndex::new(&g);
         let (out_w, inc_w) = (weights(&g, &index.out), weights(&g, &index.inc));
-        let forward = dijkstra(&index.out, a, f64::INFINITY, |s| out_w[s]);
-        let backward = dijkstra(&index.inc, d, f64::INFINITY, |s| inc_w[s]);
+        let forward = dijkstra(&index.out, &[(a.index() as u32, 0.0)], f64::INFINITY, |s| {
+            out_w[s]
+        });
+        let backward = dijkstra(&index.inc, &[(d.index() as u32, 0.0)], f64::INFINITY, |s| {
+            inc_w[s]
+        });
 
         assert_eq!(forward.get(d), Some(&2.0));
         assert_eq!(backward.get(a), Some(&2.0));
@@ -484,33 +532,51 @@ mod tests {
         let (g, [a, b, c, d]) = diamond();
         let index = SearchIndex::new(&g);
         let w = weights(&g, &index.out);
-        let bounded = dijkstra(&index.out, a, 1.0, |s| w[s]);
+        let bounded = dijkstra(&index.out, &[(a.index() as u32, 0.0)], 1.0, |s| w[s]);
         assert_eq!(bounded.get(b), Some(&1.0));
         assert_eq!(bounded.get(c), None);
         assert_eq!(bounded.get(d), None);
 
-        let nan = dijkstra(&index.out, a, f64::INFINITY, |_| f64::NAN);
+        let nan = dijkstra(
+            &index.out,
+            &[(a.index() as u32, 0.0)],
+            f64::INFINITY,
+            |_| f64::NAN,
+        );
         assert_eq!(nan.len(), 1);
     }
 
     #[test]
     fn astar_returns_cheapest_edge_sequence_and_pool_resets() {
-        let (g, [a, b, _, d]) = diamond();
+        let (g, [a, b, c, d]) = diamond();
         let index = SearchIndex::new(&g);
         let w = weights(&g, &index.out);
+        let at = |n: NodeIndex| [(n.index() as u32, 0.0)];
         for _ in 0..3 {
-            let (cost, edges) = astar(&index.out, a, d, |s| w[s], |_| 0.0).unwrap();
-            assert_eq!(cost, 2.0);
-            let nodes: Vec<_> = edges
+            let path = astar(&index.out, &at(a), &at(d), |s| w[s], |_| 0.0).unwrap();
+            assert_eq!(path.cost, 2.0);
+            assert_eq!((path.first, path.last), (a, d));
+            let nodes: Vec<_> = path
+                .edges
                 .iter()
                 .map(|&e| g.edge_endpoints(e).unwrap().1)
                 .collect();
             assert_eq!(nodes, vec![b, d]);
-            assert_eq!(astar(&index.out, d, a, |s| w[s], |_| 0.0), None);
-            assert_eq!(
-                astar(&index.out, a, a, |s| w[s], |_| 0.0),
-                Some((0.0, vec![]))
-            );
+            assert_eq!(astar(&index.out, &at(d), &at(a), |s| w[s], |_| 0.0), None);
+            let same = astar(&index.out, &at(a), &at(a), |s| w[s], |_| 0.0).unwrap();
+            assert_eq!((same.cost, same.edges.len()), (0.0, 0));
         }
+        // Offsets: starting at c with 0.1 and arriving at b with 5 makes
+        // c → d (0.5) the best way into the target set {d + 0, b + 5}.
+        let path = astar(
+            &index.out,
+            &[(a.index() as u32, 3.0), (c.index() as u32, 0.1)],
+            &[(d.index() as u32, 0.0), (b.index() as u32, 5.0)],
+            |s| w[s],
+            |_| 0.0,
+        )
+        .unwrap();
+        assert!((path.cost - 0.6).abs() < 1e-12);
+        assert_eq!((path.first, path.last), (c, d));
     }
 }

@@ -7,8 +7,8 @@
 
 use petgraph::graph::{EdgeIndex, NodeIndex};
 
-use crate::graph::{CostField, Edge, NodeMap, RoadGraph, SpatialGraph};
-use crate::overpass::NetworkType;
+use crate::error::OsmGraphError;
+use crate::graph::{Anchor, Edge, LatLon, NodeMap, RoadGraph, Role, SnapResult, SpatialGraph};
 use crate::search::dijkstra;
 
 /// Result of a one-to-many shortest-path search from a single origin.
@@ -17,9 +17,23 @@ use crate::search::dijkstra;
 /// travel time in seconds, in increasing order of time.
 #[derive(Debug, Clone)]
 pub struct ReachabilityResult {
-    pub start: NodeIndex,
+    /// The snapped origin point on the road network.
+    pub origin: LatLon,
     pub max_cost: f64,
     pub times: NodeMap<f64>,
+}
+
+impl ReachabilityResult {
+    /// Travel time to `snap`, a point snapped onto the same graph: the best
+    /// way of finishing along its road from a reached node, if within budget.
+    pub fn time_to(&self, sg: &SpatialGraph, snap: &SnapResult) -> Option<f64> {
+        let nt = sg.network_type();
+        sg.arrivals(snap, &mut |e| sg.graph[e].travel_time(nt))
+            .iter()
+            .filter_map(|a| Some(self.times.get(a.node)? + a.cost))
+            .filter(|&t| t <= self.max_cost)
+            .min_by(f64::total_cmp)
+    }
 }
 
 /// A travel-time-labeled view of the graph reachable from an origin within a budget.
@@ -32,7 +46,6 @@ pub struct ReachableGraph {
     /// Parent graph. The reachable set is stored in `result`.
     pub graph: SpatialGraph,
     pub result: ReachabilityResult,
-    pub network_type: NetworkType,
 }
 
 /// Edge context passed to a custom cost closure.
@@ -63,7 +76,11 @@ impl<'a> EdgeInfo<'a> {
     }
 }
 
-/// Compute reachability with a caller-supplied edge cost.
+pub(crate) fn roots(anchors: &[Anchor]) -> Vec<(u32, f64)> {
+    anchors.iter().map(Anchor::root).collect()
+}
+
+/// Compute reachability from `origin` with a caller-supplied edge cost.
 ///
 /// The closure is called once per edge relaxation. Use it to inject
 /// density-based traffic penalties, externally-supplied multipliers from a
@@ -71,40 +88,43 @@ impl<'a> EdgeInfo<'a> {
 /// are negative, NaN or infinite make an edge impassable.
 pub fn compute_reachability_with<F>(
     sg: &SpatialGraph,
-    start: NodeIndex,
+    origin: &SnapResult,
     max_cost: f64,
     mut cost: F,
 ) -> ReachabilityResult
 where
     F: FnMut(EdgeInfo<'_>) -> f64,
 {
+    let sources = roots(&sg.departures(origin, &mut |e| {
+        cost(EdgeInfo::of(&sg.graph, e.index() as u32))
+    }));
     let out = &sg.search_index().out;
-    let times = dijkstra(out, start, max_cost, |slot| {
+    let times = dijkstra(out, &sources, max_cost, |slot| {
         cost(EdgeInfo::of(&sg.graph, out.edges[slot]))
     });
     ReachabilityResult {
-        start,
+        origin: origin.snapped(),
         max_cost,
         times,
     }
 }
 
-/// Compute reachability from `start` up to `max_cost` seconds for the given
-/// network type. Nodes with travel time greater than `max_cost` are excluded.
-///
-/// Uses the precomputed `walk_travel_time` / `bike_travel_time` /
-/// `drive_travel_time` of each edge. For custom cost models (traffic, density
-/// penalties), use [`compute_reachability_with`].
+/// Compute reachability from `origin` up to `max_cost` seconds using the
+/// graph's travel times. Nodes with travel time greater than `max_cost` are
+/// excluded. For custom cost models, use [`compute_reachability_with`].
 pub fn compute_reachability(
     sg: &SpatialGraph,
-    start: NodeIndex,
+    origin: &SnapResult,
     max_cost: f64,
-    network_type: NetworkType,
 ) -> ReachabilityResult {
-    let costs = &sg.slot_costs(CostField::of(network_type)).out;
-    let times = dijkstra(&sg.search_index().out, start, max_cost, |slot| costs[slot]);
+    let nt = sg.network_type();
+    let sources = roots(&sg.departures(origin, &mut |e| sg.graph[e].travel_time(nt)));
+    let costs = &sg.slot_costs().out;
+    let times = dijkstra(&sg.search_index().out, &sources, max_cost, |slot| {
+        costs[slot]
+    });
     ReachabilityResult {
-        start,
+        origin: origin.snapped(),
         max_cost,
         times,
     }
@@ -147,90 +167,73 @@ impl ReachableGraph {
             .induced_subgraph(|node| self.result.times.contains_key(node))
     }
 
+    /// A route that stays within the reachable subgraph.
     pub fn route(
         &self,
-        origin_lat: f64,
-        origin_lon: f64,
-        dest_lat: f64,
-        dest_lon: f64,
+        origin: impl Into<LatLon>,
+        destination: impl Into<LatLon>,
         max_snap_m: Option<f64>,
-    ) -> Result<crate::routing::Route, crate::error::OsmGraphError> {
-        self.materialize().route(
-            origin_lat,
-            origin_lon,
-            dest_lat,
-            dest_lon,
-            self.network_type,
-            max_snap_m,
-        )
+    ) -> Result<crate::routing::Route, OsmGraphError> {
+        self.materialize().route(origin, destination, max_snap_m)
     }
 
+    /// Isochrones computed within the reachable subgraph.
     pub fn isochrones(
         &self,
-        lat: f64,
-        lon: f64,
-        time_limits: Vec<f64>,
+        origin: impl Into<LatLon>,
+        time_limits: &[f64],
         max_snap_m: Option<f64>,
-    ) -> Option<Vec<geo::Polygon>> {
+    ) -> Result<Vec<geo::MultiPolygon>, OsmGraphError> {
         self.materialize()
-            .isochrones(lat, lon, time_limits, self.network_type, max_snap_m)
+            .isochrones(origin, time_limits, max_snap_m)
     }
 }
 
 impl SpatialGraph {
     /// Return the graph-shaped reachability result: a lightweight view over
-    /// nodes reachable from `(lat, lon)` within `max_time`, plus travel-time
+    /// nodes reachable from `origin` within `max_time`, plus travel-time
     /// labels from the origin.
     pub fn reachable_graph(
         &self,
-        lat: f64,
-        lon: f64,
+        origin: impl Into<LatLon>,
         max_time: f64,
-        network_type: NetworkType,
         max_snap_m: Option<f64>,
-    ) -> Option<ReachableGraph> {
-        let result = self.reachability(lat, lon, max_time, network_type, max_snap_m)?;
-        Some(ReachableGraph {
+    ) -> Result<ReachableGraph, OsmGraphError> {
+        Ok(ReachableGraph {
             graph: self.clone(),
-            result,
-            network_type,
+            result: self.reachability(origin, max_time, max_snap_m)?,
         })
     }
 
-    /// Return every node reachable from the nearest graph node to `(lat, lon)`
-    /// within `max_time` seconds, along with the travel time to each.
+    /// Return every node reachable from `origin` (snapped to the nearest
+    /// road) within `max_time` seconds, along with the travel time to each.
     ///
     /// This is the primary entry point for reachability queries. The returned
     /// [`ReachabilityResult`] can be passed directly to
     /// [`crate::isochrone::build_isochrone_polygons`] or inspected directly.
     pub fn reachability(
         &self,
-        lat: f64,
-        lon: f64,
+        origin: impl Into<LatLon>,
         max_time: f64,
-        network_type: NetworkType,
         max_snap_m: Option<f64>,
-    ) -> Option<ReachabilityResult> {
-        let start = self.nearest_node_within(lat, lon, max_snap_m)?;
-        Some(compute_reachability(self, start, max_time, network_type))
+    ) -> Result<ReachabilityResult, OsmGraphError> {
+        let snap = self.snap_endpoint(origin.into(), Role::Origin, max_snap_m)?;
+        Ok(compute_reachability(self, &snap, max_time))
     }
 
-    /// Fetch POIs reachable from `(lat, lon)` within `max_time` seconds,
+    /// Fetch POIs reachable from `origin` within `max_time` seconds,
     /// filtered by actual network travel time.
     ///
-    /// Runs a reachability search, then calls
-    /// `poi::fetch_pois_within_reachability` so that POI filtering
-    /// uses graph distances rather than polygon containment. Returns `None` if
-    /// no graph node is found near the origin.
+    /// Runs a reachability search, then filters POIs from Overpass by the
+    /// travel time to the road point each one snaps to, rather than by
+    /// polygon containment.
     pub async fn reachable_pois(
         &self,
-        lat: f64,
-        lon: f64,
+        origin: impl Into<LatLon>,
         max_time: f64,
-        network_type: NetworkType,
-    ) -> Option<Result<Vec<crate::poi::ReachablePoi>, crate::error::OsmGraphError>> {
-        let result = self.reachability(lat, lon, max_time, network_type, None)?;
-        Some(crate::poi::fetch_pois_within_reachability(self, &result).await)
+    ) -> Result<Vec<crate::poi::ReachablePoi>, OsmGraphError> {
+        let result = self.reachability(origin, max_time, None)?;
+        crate::poi::fetch_pois_within_reachability(self, &result).await
     }
 }
 
@@ -238,14 +241,15 @@ impl SpatialGraph {
 mod tests {
     use super::*;
     use crate::graph::create_graph;
-    use crate::graph::{XmlNode, XmlNodeRef, XmlTag, XmlWay};
+    use crate::graph::{OsmNode, OsmNodeRef, OsmTag, OsmWay};
+    use crate::overpass::NetworkType;
 
     fn spatial(g: RoadGraph) -> SpatialGraph {
-        SpatialGraph::new(g)
+        SpatialGraph::new(g, NetworkType::Drive)
     }
 
-    fn node(id: i64, lat: f64, lon: f64) -> XmlNode {
-        XmlNode {
+    fn node(id: i64, lat: f64, lon: f64) -> OsmNode {
+        OsmNode {
             id,
             lat,
             lon,
@@ -253,16 +257,16 @@ mod tests {
         }
     }
 
-    fn way(node_ids: Vec<i64>, tags: Vec<(&str, &str)>) -> XmlWay {
-        XmlWay {
+    fn way(node_ids: Vec<i64>, tags: Vec<(&str, &str)>) -> OsmWay {
+        OsmWay {
             id: 1,
             nodes: node_ids
                 .into_iter()
-                .map(|id| XmlNodeRef { node_id: id })
+                .map(|id| OsmNodeRef { node_id: id })
                 .collect(),
             tags: tags
                 .into_iter()
-                .map(|(k, v)| XmlTag {
+                .map(|(k, v)| OsmTag {
                     key: k.into(),
                     value: v.into(),
                 })
@@ -277,8 +281,8 @@ mod tests {
         let w = way(vec![1, 2, 3], vec![("highway", "residential")]);
         let g = spatial(create_graph(nodes, vec![w], true, false));
 
-        let start = g.node_index(1).unwrap();
-        let full = compute_reachability(&g, start, f64::INFINITY, NetworkType::Drive);
+        let start = g.snap_to_node(g.node_index(1).unwrap());
+        let full = compute_reachability(&g, &start, f64::INFINITY);
         assert_eq!(
             full.times.len(),
             3,
@@ -286,7 +290,7 @@ mod tests {
         );
 
         // ~111m at 30 kph => ~13s. 5s budget should drop the far node.
-        let tight = compute_reachability(&g, start, 5.0, NetworkType::Drive);
+        let tight = compute_reachability(&g, &start, 5.0);
         assert!(
             tight.times.len() < 3,
             "tight budget should exclude at least one node"
@@ -307,8 +311,8 @@ mod tests {
         let w = way(vec![1, 2, 3, 4], vec![("highway", "residential")]);
         let g = spatial(create_graph(nodes, vec![w], true, false));
 
-        let start = g.node_index(1).unwrap();
-        let result = compute_reachability_with(&g, start, 100.0, |_| 10.0);
+        let start = g.snap_to_node(g.node_index(1).unwrap());
+        let result = compute_reachability_with(&g, &start, 100.0, |_| 10.0);
 
         let mut times: Vec<f64> = result.times.values().copied().collect();
         times.sort_by(f64::total_cmp);
@@ -326,8 +330,8 @@ mod tests {
         let w = way(vec![1, 2, 3, 4], vec![("highway", "residential")]);
         let g = spatial(create_graph(nodes, vec![w], true, false));
 
-        let start = g.node_index(1).unwrap();
-        let result = compute_reachability_with(&g, start, 15.0, |_| 10.0);
+        let start = g.snap_to_node(g.node_index(1).unwrap());
+        let result = compute_reachability_with(&g, &start, 15.0, |_| 10.0);
 
         let mut node_ids: Vec<i64> = result.times.keys().map(|idx| g.graph[idx].id).collect();
         node_ids.sort_unstable();
@@ -341,8 +345,8 @@ mod tests {
         let w = way(vec![1, 2], vec![("highway", "residential")]);
         let g = spatial(create_graph(nodes, vec![w], true, false));
 
-        let start = g.node_index(1).unwrap();
-        let result = compute_reachability(&g, start, f64::NAN, NetworkType::Drive);
+        let start = g.snap_to_node(g.node_index(1).unwrap());
+        let result = compute_reachability(&g, &start, f64::NAN);
 
         assert!(result.times.is_empty());
     }
@@ -354,9 +358,9 @@ mod tests {
         let w = way(vec![1, 2, 3], vec![("highway", "residential")]);
         let g = spatial(create_graph(nodes, vec![w], true, false));
 
-        let start = g.node_index(1).unwrap();
-        let baseline = compute_reachability(&g, start, f64::INFINITY, NetworkType::Drive);
-        let doubled = compute_reachability_with(&g, start, f64::INFINITY, |e| {
+        let start = g.snap_to_node(g.node_index(1).unwrap());
+        let baseline = compute_reachability(&g, &start, f64::INFINITY);
+        let doubled = compute_reachability_with(&g, &start, f64::INFINITY, |e| {
             e.weight.travel_time(NetworkType::Drive) * 2.0
         });
 
@@ -380,7 +384,7 @@ mod tests {
         ];
         let w = way(vec![1, 2, 3, 4], vec![("highway", "residential")]);
         let g = spatial(create_graph(nodes, vec![w], true, false));
-        let result = compute_reachability(&g, g.node_index(3).unwrap(), 1e9, NetworkType::Drive);
+        let result = compute_reachability(&g, &g.snap_to_node(g.node_index(3).unwrap()), 1e9);
 
         let times: Vec<f64> = result.times.values().copied().collect();
         assert_eq!(times.len(), 4);
@@ -391,11 +395,12 @@ mod tests {
     fn reachable_graph_view_exposes_induced_counts_and_travel_times() {
         let nodes = vec![node(1, 0.0, 0.0), node(2, 0.0, 0.001), node(3, 0.0, 0.002)];
         let w = way(vec![1, 2, 3], vec![("highway", "residential")]);
-        let graph = SpatialGraph::new(create_graph(nodes, vec![w], true, false));
+        let graph = SpatialGraph::new(
+            create_graph(nodes, vec![w], true, false),
+            NetworkType::Drive,
+        );
 
-        let reachable = graph
-            .reachable_graph(0.0, 0.0, 20.0, NetworkType::Drive, None)
-            .unwrap();
+        let reachable = graph.reachable_graph((0.0, 0.0), 20.0, None).unwrap();
 
         assert_eq!(reachable.node_count(), 2);
         assert_eq!(reachable.edge_count(), 2);
@@ -406,5 +411,30 @@ mod tests {
         assert!(reachable.travel_time_to_node_id(2).unwrap() > 0.0);
         assert_eq!(reachable.graph.graph.node_count(), 3);
         assert_eq!(reachable.materialize().graph.node_count(), 2);
+    }
+
+    #[test]
+    fn origin_mid_road_starts_part_way_along_it() {
+        // Two-way residential street 1 → 2 → 3, ~111 m per edge at 30 km/h.
+        let nodes = vec![node(1, 0.0, 0.0), node(2, 0.0, 0.001), node(3, 0.0, 0.002)];
+        let w = way(vec![1, 2, 3], vec![("highway", "residential")]);
+        let g = SpatialGraph::new(
+            create_graph(nodes, vec![w], true, false),
+            NetworkType::Drive,
+        );
+        let edge_time = g.graph.edge_weights().next().unwrap().drive_travel_time;
+
+        // A quarter of the way from node 1 to node 2.
+        let result = g.reachability((0.0, 0.00025), f64::INFINITY, None).unwrap();
+
+        let at = |id| result.times[g.node_index(id).unwrap()];
+        assert!((at(1) - 0.25 * edge_time).abs() < 1e-9);
+        assert!((at(2) - 0.75 * edge_time).abs() < 1e-9);
+        assert!((at(3) - 1.75 * edge_time).abs() < 1e-9);
+
+        // And the time back to a point on the road counts the partial edge.
+        let destination = g.snap_point((0.0, 0.0015)).unwrap();
+        let time = result.time_to(&g, &destination).unwrap();
+        assert!((time - 1.25 * edge_time).abs() < 1e-9, "{time}");
     }
 }

@@ -1,4 +1,4 @@
-use geo::Polygon;
+use geo::{MultiPolygon, Polygon};
 use geojson::{GeoJson, Geometry, Value};
 
 pub fn calculate_distance(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
@@ -24,29 +24,36 @@ pub fn calculate_travel_time(length: f64, speed_kph: f64) -> f64 {
     length / speed_m_per_s
 }
 
-fn ring_to_geojson_coords(ring: &geo::LineString<f64>) -> Vec<Vec<f64>> {
-    ring.0
-        .iter()
-        .map(|coord| vec![coord.y, coord.x])
-        .collect::<Vec<_>>()
+fn ring_coords(ring: &geo::LineString<f64>) -> Vec<Vec<f64>> {
+    // geo coordinates are x = lon, y = lat, which is GeoJSON's order too.
+    ring.0.iter().map(|coord| vec![coord.x, coord.y]).collect()
 }
 
+fn polygon_rings(polygon: &Polygon<f64>) -> Vec<Vec<Vec<f64>>> {
+    std::iter::once(polygon.exterior())
+        .chain(polygon.interiors())
+        .map(ring_coords)
+        .collect()
+}
+
+/// A polygon (x = lon, y = lat) as a GeoJSON Polygon geometry.
 pub fn polygon_to_geojson(polygon: &Polygon<f64>) -> GeoJson {
-    // node_to_latlon returns (lat, lon) tuples which geo stores as (x=lat, y=lon).
-    // GeoJSON spec requires [longitude, latitude], so coord.y = lon, coord.x = lat.
-    let mut rings = Vec::with_capacity(1 + polygon.interiors().len());
-    rings.push(ring_to_geojson_coords(polygon.exterior()));
-    rings.extend(polygon.interiors().iter().map(ring_to_geojson_coords));
-
-    let geojson_polygon = Geometry::new(Value::Polygon(rings));
-
-    GeoJson::Geometry(geojson_polygon)
+    GeoJson::Geometry(Geometry::new(Value::Polygon(polygon_rings(polygon))))
 }
 
-// Convert polygon to GeoJSON string
 pub fn polygon_to_geojson_string(polygon: &Polygon<f64>) -> String {
-    let geojson = polygon_to_geojson(polygon);
-    geojson.to_string()
+    polygon_to_geojson(polygon).to_string()
+}
+
+/// A multipolygon (x = lon, y = lat) as a GeoJSON MultiPolygon geometry.
+pub fn multipolygon_to_geojson(area: &MultiPolygon<f64>) -> GeoJson {
+    GeoJson::Geometry(Geometry::new(Value::MultiPolygon(
+        area.0.iter().map(polygon_rings).collect(),
+    )))
+}
+
+pub fn multipolygon_to_geojson_string(area: &MultiPolygon<f64>) -> String {
+    multipolygon_to_geojson(area).to_string()
 }
 
 #[cfg(test)]

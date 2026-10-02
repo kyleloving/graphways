@@ -1,264 +1,226 @@
 //! Point-to-point routing.
 //!
-//! [`SpatialGraph::prepare_routing`] builds a contraction hierarchy for a
-//! mode; after that, routes for that mode are answered by a bidirectional
+//! Both endpoints snap to the closest point on a road, so routes start and
+//! end part-way along edges. [`SpatialGraph::prepare_routing`] builds a
+//! contraction hierarchy; after that, routes are answered by a bidirectional
 //! search over the hierarchy in well under a millisecond on a city graph.
 //! Without it, routing falls back to A* with an admissible straight-line
 //! heuristic. Both return exactly optimal routes.
 
-use petgraph::graph::{EdgeIndex, NodeIndex};
+use petgraph::graph::EdgeIndex;
 
 use crate::ch::ContractionHierarchy;
 use crate::error::OsmGraphError;
-use crate::graph::{edge_geometry, CostField, SnapResult, SpatialGraph};
-use crate::overpass::NetworkType;
+use crate::graph::{anchor_at, Anchor, LatLon, Piece, Role, SnapResult, SpatialGraph};
 use crate::reachability::EdgeInfo;
-use crate::search::astar;
-use crate::utils::calculate_distance;
+use crate::search::{astar, SearchPath};
 
 #[derive(Debug, Clone)]
 pub struct Route {
-    /// Ordered list of (lat, lon) coordinates along the route
+    /// Ordered list of (lat, lon) coordinates along the route, from the
+    /// snapped origin to the snapped destination.
     pub coordinates: Vec<(f64, f64)>,
     /// Cumulative travel time in seconds at each coordinate (parallel to `coordinates`)
     pub cumulative_times_s: Vec<f64>,
     /// Total route distance in meters
     pub distance_m: f64,
-    /// Total travel time in seconds for the given network type
+    /// Total travel time in seconds for the graph's network type
     pub duration_s: f64,
+    /// The stretches of road travelled, in order.
+    pub pieces: Vec<Piece>,
     /// Snap diagnostics for the requested origin coordinate.
     pub origin_snap: SnapResult,
     /// Snap diagnostics for the requested destination coordinate.
     pub destination_snap: SnapResult,
 }
 
-/// Optimal path edges for a built-in mode: through the contraction hierarchy
-/// when one has been prepared, otherwise A* guided by the straight-line
-/// distance at the fastest speed any edge allows (admissible, so still exact).
-fn shortest_path_edges(
+/// The cheapest sequence of pieces from `origin` to `destination` under
+/// `cost`, using `search` to cross the network between anchors.
+pub(crate) fn best_pieces(
     sg: &SpatialGraph,
-    origin: NodeIndex,
-    dest: NodeIndex,
-    network_type: NetworkType,
-) -> Option<Vec<EdgeIndex>> {
-    let field = CostField::of(network_type);
-    if let Some(hierarchy) = sg.hierarchy_slot(field).get() {
-        return hierarchy
-            .shortest_path(origin, dest)
-            .map(|(_, edges)| edges);
-    }
+    origin: &SnapResult,
+    destination: &SnapResult,
+    cost: &mut dyn FnMut(EdgeIndex) -> f64,
+    search: impl FnOnce(&[Anchor], &[Anchor], &mut dyn FnMut(EdgeIndex) -> f64) -> Option<SearchPath>,
+) -> Option<(f64, Vec<Piece>)> {
+    let departures = sg.departures(origin, cost);
+    let arrivals = sg.arrivals(destination, cost);
+    let direct = sg.direct_piece(origin, destination, cost);
 
-    let speed = sg.max_straight_line_speed(field);
-    let goal = &sg.graph[dest];
-    let remaining_lower_bound = |node: u32| {
-        if !(speed.is_finite() && speed > 0.0) {
-            return 0.0;
-        }
-        let n = &sg.graph[NodeIndex::new(node as usize)];
-        calculate_distance(n.lat, n.lon, goal.lat, goal.lon) / speed
-    };
-    let costs = &sg.slot_costs(field).out;
-    astar(
-        &sg.search_index().out,
+    let via_network = search(&departures, &arrivals, cost).map(|path| {
+        let mut pieces = Vec::with_capacity(path.edges.len() + 2);
+        pieces.extend(anchor_at(&departures, path.first).and_then(|a| a.piece));
+        pieces.extend(path.edges.iter().map(|&e| Piece::whole(e)));
+        pieces.extend(anchor_at(&arrivals, path.last).and_then(|a| a.piece));
+        (path.cost, pieces)
+    });
+    match (direct, via_network) {
+        (Some((d, piece)), Some((n, _))) if d <= n => Some((d, vec![piece])),
+        (Some((d, piece)), None) => Some((d, vec![piece])),
+        (_, network) => network,
+    }
+}
+
+/// Optimal pieces under the graph's own travel times: through the
+/// contraction hierarchy when one has been prepared, otherwise A* guided by
+/// the straight-line distance at the fastest speed any edge allows.
+fn shortest_pieces(
+    sg: &SpatialGraph,
+    origin: &SnapResult,
+    destination: &SnapResult,
+) -> Option<(f64, Vec<Piece>)> {
+    let nt = sg.network_type();
+    let mut cost = |e: EdgeIndex| sg.graph[e].travel_time(nt);
+    best_pieces(
+        sg,
         origin,
-        dest,
-        |slot| costs[slot],
-        remaining_lower_bound,
-    )
-    .map(|(_, edges)| edges)
-}
-
-/// Route coordinates with travel time interpolated along each edge's shape
-/// in proportion to segment length.
-struct RouteGeometry {
-    coordinates: Vec<(f64, f64)>,
-    cumulative_times_s: Vec<f64>,
-    distance_m: f64,
-    duration_s: f64,
-}
-
-fn route_geometry_and_times(
-    sg: &SpatialGraph,
-    origin: NodeIndex,
-    edges: &[EdgeIndex],
-    mut edge_time_of: impl FnMut(EdgeIndex) -> f64,
-) -> RouteGeometry {
-    let mut out = RouteGeometry {
-        coordinates: Vec::new(),
-        cumulative_times_s: Vec::new(),
-        distance_m: 0.0,
-        duration_s: 0.0,
-    };
-    if edges.is_empty() {
-        let node = &sg.graph[origin];
-        out.coordinates.push((node.lat, node.lon));
-        out.cumulative_times_s.push(0.0);
-        return out;
-    }
-
-    let mut segment_lengths = Vec::new();
-    for &edge in edges {
-        let way = &sg.graph[edge];
-        let geometry = edge_geometry(&sg.graph, edge);
-        let edge_time = edge_time_of(edge);
-        let edge_start_time = out.duration_s;
-
-        segment_lengths.clear();
-        segment_lengths.extend(
-            geometry
-                .points()
-                .zip(geometry.points().skip(1))
-                .map(|(a, b)| calculate_distance(a.0, a.1, b.0, b.1)),
-        );
-        let geometry_length: f64 = segment_lengths.iter().sum();
-        let evenly_split = edge_time / (segment_lengths.len().max(1) as f64);
-
-        let mut points = geometry.points();
-        let first = points
-            .next()
-            .expect("edge geometry has at least two points");
-        if out.coordinates.is_empty() {
-            out.coordinates.push(first);
-            out.cumulative_times_s.push(edge_start_time);
-        }
-
-        let mut elapsed_on_edge = 0.0;
-        for (point, &segment_len) in points.zip(&segment_lengths) {
-            elapsed_on_edge += if geometry_length > 0.0 {
-                edge_time * (segment_len / geometry_length)
-            } else {
-                evenly_split
-            };
-            out.coordinates.push(point);
-            out.cumulative_times_s
-                .push(edge_start_time + elapsed_on_edge);
-        }
-
-        out.distance_m += way.length;
-        out.duration_s += edge_time;
-        // Pin each edge's last timestamp to the exact running total.
-        if let Some(last) = out.cumulative_times_s.last_mut() {
-            *last = out.duration_s;
-        }
-    }
-
-    out
-}
-
-/// Snap both endpoints, enforcing `max_snap_m` when given.
-fn snap_endpoints(
-    sg: &SpatialGraph,
-    origin: (f64, f64),
-    destination: (f64, f64),
-    max_snap_m: Option<f64>,
-) -> Result<(SnapResult, SnapResult), OsmGraphError> {
-    let origin_snap = sg
-        .snap_point(origin.0, origin.1)
-        .ok_or(OsmGraphError::OriginNodeNotFound)?;
-    let destination_snap = sg
-        .snap_point(destination.0, destination.1)
-        .ok_or(OsmGraphError::DestinationNodeNotFound)?;
-    if let Some(max_distance_m) = max_snap_m {
-        for (role, snap) in [("origin", origin_snap), ("destination", destination_snap)] {
-            if snap.distance_m > max_distance_m {
-                return Err(OsmGraphError::SnapDistanceExceeded {
-                    role,
-                    distance_m: snap.distance_m,
-                    max_distance_m,
-                });
+        destination,
+        &mut cost,
+        |departures, arrivals, _| {
+            let sources: Vec<(u32, f64)> = departures.iter().map(Anchor::root).collect();
+            let targets: Vec<(u32, f64)> = arrivals.iter().map(Anchor::root).collect();
+            if let Some(hierarchy) = sg.hierarchy_slot().get() {
+                return hierarchy.shortest_path(&sources, &targets);
             }
-        }
-    }
-    Ok((origin_snap, destination_snap))
+            let speed = sg.max_straight_line_speed();
+            let goal = destination.snapped();
+            let remaining_lower_bound = |node: u32| {
+                if !(speed.is_finite() && speed > 0.0) {
+                    return 0.0;
+                }
+                let n = &sg.graph[petgraph::graph::NodeIndex::new(node as usize)];
+                LatLon::from(n).distance_m(goal) / speed
+            };
+            let costs = &sg.slot_costs().out;
+            astar(
+                &sg.search_index().out,
+                &sources,
+                &targets,
+                |slot| costs[slot],
+                remaining_lower_bound,
+            )
+        },
+    )
 }
 
+/// Route coordinates with travel time interpolated along each piece's shape
+/// in proportion to segment length.
 fn assemble(
     sg: &SpatialGraph,
     (origin_snap, destination_snap): (SnapResult, SnapResult),
-    edges: Option<Vec<EdgeIndex>>,
-    edge_time_of: impl FnMut(EdgeIndex) -> f64,
-) -> Result<Route, OsmGraphError> {
-    let edges = edges.ok_or(OsmGraphError::PathNotFound)?;
-    let geometry = route_geometry_and_times(sg, origin_snap.node_index, &edges, edge_time_of);
-    Ok(Route {
-        coordinates: geometry.coordinates,
-        cumulative_times_s: geometry.cumulative_times_s,
-        distance_m: geometry.distance_m,
-        duration_s: geometry.duration_s,
+    pieces: Vec<Piece>,
+    cost: &mut dyn FnMut(EdgeIndex) -> f64,
+) -> Route {
+    let mut coordinates = Vec::new();
+    let mut cumulative_times_s = Vec::new();
+    let mut distance_m = 0.0;
+    let mut duration_s = 0.0;
+    let mut segment_lengths = Vec::new();
+
+    for piece in pieces.iter().filter(|p| p.share() > 0.0) {
+        let points = piece.points(&sg.graph);
+        let piece_time = cost(piece.edge) * piece.share();
+        let piece_start_time = duration_s;
+
+        segment_lengths.clear();
+        segment_lengths.extend(
+            points
+                .windows(2)
+                .map(|w| LatLon::from(w[0]).distance_m(LatLon::from(w[1]))),
+        );
+        let geometry_length: f64 = segment_lengths.iter().sum();
+        let evenly_split = piece_time / (segment_lengths.len().max(1) as f64);
+
+        if coordinates.is_empty() {
+            coordinates.push(points[0]);
+            cumulative_times_s.push(piece_start_time);
+        }
+        let mut elapsed = 0.0;
+        for (&point, &segment_len) in points[1..].iter().zip(&segment_lengths) {
+            elapsed += if geometry_length > 0.0 {
+                piece_time * (segment_len / geometry_length)
+            } else {
+                evenly_split
+            };
+            coordinates.push(point);
+            cumulative_times_s.push(piece_start_time + elapsed);
+        }
+
+        distance_m += sg.graph[piece.edge].length * piece.share();
+        duration_s += piece_time;
+        // Pin each piece's last timestamp to the exact running total.
+        if let Some(last) = cumulative_times_s.last_mut() {
+            *last = duration_s;
+        }
+    }
+
+    if coordinates.is_empty() {
+        // Origin and destination snapped to the same point.
+        coordinates.push((origin_snap.snapped_lat, origin_snap.snapped_lon));
+        cumulative_times_s.push(0.0);
+    }
+    Route {
+        coordinates,
+        cumulative_times_s,
+        distance_m,
+        duration_s,
+        pieces,
         origin_snap,
         destination_snap,
-    })
+    }
 }
 
-pub fn route(
+fn snap_both(
     sg: &SpatialGraph,
-    origin_lat: f64,
-    origin_lon: f64,
-    dest_lat: f64,
-    dest_lon: f64,
-    network_type: NetworkType,
+    origin: LatLon,
+    destination: LatLon,
     max_snap_m: Option<f64>,
-) -> Result<Route, OsmGraphError> {
-    let snaps = snap_endpoints(
-        sg,
-        (origin_lat, origin_lon),
-        (dest_lat, dest_lon),
-        max_snap_m,
-    )?;
-    let edges = shortest_path_edges(sg, snaps.0.node_index, snaps.1.node_index, network_type);
-    assemble(sg, snaps, edges, |edge| {
-        sg.graph[edge].travel_time(network_type)
-    })
+) -> Result<(SnapResult, SnapResult), OsmGraphError> {
+    Ok((
+        sg.snap_endpoint(origin, Role::Origin, max_snap_m)?,
+        sg.snap_endpoint(destination, Role::Destination, max_snap_m)?,
+    ))
 }
 
 impl SpatialGraph {
-    /// Preprocess this graph for fast routing in `network_type`.
+    /// Preprocess this graph for fast routing.
     ///
-    /// Builds a contraction hierarchy for the mode's travel times (a few
-    /// seconds on a city graph; once per mode, shared by every clone of this
-    /// graph). Afterwards [`SpatialGraph::route`] for that mode answers in
+    /// Builds a contraction hierarchy for the graph's travel times (a few
+    /// seconds on a city walking graph, using all cores; shared by every
+    /// clone of this graph). Afterwards [`SpatialGraph::route`] answers in
     /// well under a millisecond. Routing works without it, just more slowly.
-    pub fn prepare_routing(&self, network_type: NetworkType) {
-        let field = CostField::of(network_type);
-        self.hierarchy_slot(field).get_or_init(|| {
-            ContractionHierarchy::build(self.search_index(), &self.slot_costs(field).out)
+    pub fn prepare_routing(&self) {
+        self.hierarchy_slot().get_or_init(|| {
+            ContractionHierarchy::build(self.search_index(), &self.slot_costs().out)
         });
     }
 
-    /// Whether [`SpatialGraph::prepare_routing`] has run for `network_type`'s
-    /// travel times.
-    pub fn is_routing_prepared(&self, network_type: NetworkType) -> bool {
-        self.hierarchy_slot(CostField::of(network_type))
-            .get()
-            .is_some()
+    /// Whether [`SpatialGraph::prepare_routing`] has run.
+    pub fn is_routing_prepared(&self) -> bool {
+        self.hierarchy_slot().get().is_some()
     }
 
-    /// Find the fastest route between two lat/lon points.
+    /// Find the fastest route between two points.
     ///
-    /// Snaps both points to the nearest graph nodes and finds an optimal
-    /// path, through the contraction hierarchy if
-    /// [`SpatialGraph::prepare_routing`] has run for this mode and with A*
-    /// otherwise. Returns [`OsmGraphError::OriginNodeNotFound`] or
-    /// [`OsmGraphError::DestinationNodeNotFound`] if snapping fails, and
-    /// [`OsmGraphError::PathNotFound`] if the snapped nodes are disconnected.
+    /// Both points snap to the nearest road; `max_snap_m` rejects points
+    /// farther than that from any road. Routes are exactly optimal, through
+    /// the contraction hierarchy if [`SpatialGraph::prepare_routing`] has run
+    /// and with A* otherwise. Errors with
+    /// [`OsmGraphError::SnapDistanceExceeded`] for a rejected snap and
+    /// [`OsmGraphError::PathNotFound`] when no route exists.
     pub fn route(
         &self,
-        origin_lat: f64,
-        origin_lon: f64,
-        dest_lat: f64,
-        dest_lon: f64,
-        network_type: NetworkType,
+        origin: impl Into<LatLon>,
+        destination: impl Into<LatLon>,
         max_snap_m: Option<f64>,
     ) -> Result<Route, OsmGraphError> {
-        route(
-            self,
-            origin_lat,
-            origin_lon,
-            dest_lat,
-            dest_lon,
-            network_type,
-            max_snap_m,
-        )
+        let snaps = snap_both(self, origin.into(), destination.into(), max_snap_m)?;
+        let (_, pieces) =
+            shortest_pieces(self, &snaps.0, &snaps.1).ok_or(OsmGraphError::PathNotFound)?;
+        let nt = self.network_type();
+        Ok(assemble(self, snaps, pieces, &mut |e| {
+            self.graph[e].travel_time(nt)
+        }))
     }
 
     /// Find the cheapest route under a caller-supplied edge cost, e.g. live
@@ -270,39 +232,48 @@ impl SpatialGraph {
     /// search; prefer [`SpatialGraph::route`] for the built-in travel times.
     pub fn route_with<F>(
         &self,
-        origin: (f64, f64),
-        destination: (f64, f64),
+        origin: impl Into<LatLon>,
+        destination: impl Into<LatLon>,
         max_snap_m: Option<f64>,
         mut cost: F,
     ) -> Result<Route, OsmGraphError>
     where
         F: FnMut(EdgeInfo<'_>) -> f64,
     {
-        let snaps = snap_endpoints(self, origin, destination, max_snap_m)?;
+        let snaps = snap_both(self, origin.into(), destination.into(), max_snap_m)?;
+        let mut edge_cost = |e: EdgeIndex| cost(EdgeInfo::of(&self.graph, e.index() as u32));
         let out = &self.search_index().out;
-        let edges = astar(
-            out,
-            snaps.0.node_index,
-            snaps.1.node_index,
-            |slot| cost(EdgeInfo::of(&self.graph, out.edges[slot])),
-            |_| 0.0,
+        let (_, pieces) = best_pieces(
+            self,
+            &snaps.0,
+            &snaps.1,
+            &mut edge_cost,
+            |dep, arr, edge_cost| {
+                let sources: Vec<(u32, f64)> = dep.iter().map(Anchor::root).collect();
+                let targets: Vec<(u32, f64)> = arr.iter().map(Anchor::root).collect();
+                astar(
+                    out,
+                    &sources,
+                    &targets,
+                    |slot| edge_cost(EdgeIndex::new(out.edges[slot] as usize)),
+                    |_| 0.0,
+                )
+            },
         )
-        .map(|(_, edges)| edges);
-        assemble(self, snaps, edges, |edge| {
-            cost(EdgeInfo::of(&self.graph, edge.index() as u32))
-        })
+        .ok_or(OsmGraphError::PathNotFound)?;
+        Ok(assemble(self, snaps, pieces, &mut edge_cost))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{Edge, SpatialGraph, XmlNode, XmlTag};
+    use crate::graph::{Edge, OsmNode, OsmTag, SpatialGraph};
     use crate::overpass::NetworkType;
     use petgraph::graph::DiGraph;
 
-    fn make_node(id: i64, lat: f64, lon: f64) -> XmlNode {
-        XmlNode {
+    fn make_node(id: i64, lat: f64, lon: f64) -> OsmNode {
+        OsmNode {
             id,
             lat,
             lon,
@@ -313,7 +284,7 @@ mod tests {
     fn make_way(drive_travel_time: f64, length: f64) -> Edge {
         Edge {
             way_id: 1,
-            tags: vec![XmlTag {
+            tags: vec![OsmTag {
                 key: "highway".into(),
                 value: "residential".into(),
             }]
@@ -330,7 +301,7 @@ mod tests {
     fn make_profile_way(drive_travel_time: f64, walk_travel_time: f64, length: f64) -> Edge {
         Edge {
             way_id: 1,
-            tags: vec![XmlTag {
+            tags: vec![OsmTag {
                 key: "highway".into(),
                 value: "residential".into(),
             }]
@@ -363,27 +334,27 @@ mod tests {
         let c = g.add_node(make_node(3, 0.002, 0.0));
         g.add_edge(a, b, make_way(10.0, 111.0));
         g.add_edge(b, c, make_way(10.0, 111.0));
-        SpatialGraph::new(g)
+        SpatialGraph::new(g, NetworkType::Drive)
     }
 
     #[test]
     fn test_cumulative_times_starts_at_zero() {
         let sg = linear_graph();
-        let r = route(&sg, 0.0, 0.0, 0.002, 0.0, NetworkType::Drive, None).unwrap();
+        let r = sg.route((0.0, 0.0), (0.002, 0.0), None).unwrap();
         assert_eq!(r.cumulative_times_s[0], 0.0);
     }
 
     #[test]
     fn test_cumulative_times_parallel_to_coordinates() {
         let sg = linear_graph();
-        let r = route(&sg, 0.0, 0.0, 0.002, 0.0, NetworkType::Drive, None).unwrap();
+        let r = sg.route((0.0, 0.0), (0.002, 0.0), None).unwrap();
         assert_eq!(r.cumulative_times_s.len(), r.coordinates.len());
     }
 
     #[test]
     fn test_cumulative_times_monotonic() {
         let sg = linear_graph();
-        let r = route(&sg, 0.0, 0.0, 0.002, 0.0, NetworkType::Drive, None).unwrap();
+        let r = sg.route((0.0, 0.0), (0.002, 0.0), None).unwrap();
         for w in r.cumulative_times_s.windows(2) {
             assert!(w[1] >= w[0], "times decreased: {:?}", r.cumulative_times_s);
         }
@@ -392,7 +363,7 @@ mod tests {
     #[test]
     fn test_cumulative_times_last_equals_duration() {
         let sg = linear_graph();
-        let r = route(&sg, 0.0, 0.0, 0.002, 0.0, NetworkType::Drive, None).unwrap();
+        let r = sg.route((0.0, 0.0), (0.002, 0.0), None).unwrap();
         let last = *r.cumulative_times_s.last().unwrap();
         assert!(
             (last - r.duration_s).abs() < 1e-6,
@@ -410,9 +381,9 @@ mod tests {
         g.add_edge(a, c, make_way(100.0, 100.0));
         g.add_edge(a, b, make_way(10.0, 50.0));
         g.add_edge(b, c, make_way(10.0, 50.0));
-        let sg = SpatialGraph::new(g);
+        let sg = SpatialGraph::new(g, NetworkType::Drive);
 
-        let route = route(&sg, 0.0, 0.0, 0.002, 0.0, NetworkType::Drive, None).unwrap();
+        let route = sg.route((0.0, 0.0), (0.002, 0.0), None).unwrap();
 
         assert_eq!(route.coordinates.len(), 3);
         assert_eq!(route.duration_s, 20.0);
@@ -428,9 +399,9 @@ mod tests {
         g.add_edge(a, b, make_way(100.0, 1_000.0));
         g.add_edge(a, b, make_way(10.0, 50.0));
         g.add_edge(b, c, make_way(10.0, 50.0));
-        let sg = SpatialGraph::new(g);
+        let sg = SpatialGraph::new(g, NetworkType::Drive);
 
-        let route = route(&sg, 0.0, 0.0, 0.002, 0.0, NetworkType::Drive, None).unwrap();
+        let route = sg.route((0.0, 0.0), (0.002, 0.0), None).unwrap();
 
         assert_eq!(route.duration_s, 20.0);
         assert_eq!(route.distance_m, 100.0);
@@ -450,9 +421,9 @@ mod tests {
                 vec![(0.0, 0.0), (0.0005, 0.0002), (0.001, 0.0)],
             ),
         );
-        let sg = SpatialGraph::new(g);
+        let sg = SpatialGraph::new(g, NetworkType::Drive);
 
-        let route = route(&sg, 0.0, 0.0, 0.001, 0.0, NetworkType::Drive, None).unwrap();
+        let route = sg.route((0.0, 0.0), (0.001, 0.0), None).unwrap();
 
         assert_eq!(
             route.coordinates,
@@ -466,8 +437,8 @@ mod tests {
     fn test_route_oneway_succeeds_forward_and_fails_reverse() {
         let sg = linear_graph();
 
-        let forward = route(&sg, 0.0, 0.0, 0.002, 0.0, NetworkType::Drive, None);
-        let reverse = route(&sg, 0.002, 0.0, 0.0, 0.0, NetworkType::Drive, None);
+        let forward = sg.route((0.0, 0.0), (0.002, 0.0), None);
+        let reverse = sg.route((0.002, 0.0), (0.0, 0.0), None);
 
         assert!(forward.is_ok());
         assert!(matches!(reverse, Err(OsmGraphError::PathNotFound)));
@@ -477,7 +448,7 @@ mod tests {
     fn test_route_origin_equals_destination_is_zero_cost() {
         let sg = linear_graph();
 
-        let route = route(&sg, 0.0, 0.0, 0.0, 0.0, NetworkType::Drive, None).unwrap();
+        let route = sg.route((0.0, 0.0), (0.0, 0.0), None).unwrap();
 
         assert_eq!(route.coordinates.len(), 1);
         assert_eq!(route.duration_s, 0.0);
@@ -494,10 +465,11 @@ mod tests {
         g.add_edge(a, c, make_profile_way(10.0, 100.0, 100.0));
         g.add_edge(a, b, make_profile_way(30.0, 5.0, 50.0));
         g.add_edge(b, c, make_profile_way(30.0, 5.0, 50.0));
-        let sg = SpatialGraph::new(g);
+        let drive_graph = SpatialGraph::new(g.clone(), NetworkType::Drive);
+        let walk_graph = SpatialGraph::new(g, NetworkType::Walk);
 
-        let drive = route(&sg, 0.0, 0.0, 0.002, 0.0, NetworkType::Drive, None).unwrap();
-        let walk = route(&sg, 0.0, 0.0, 0.002, 0.0, NetworkType::Walk, None).unwrap();
+        let drive = drive_graph.route((0.0, 0.0), (0.002, 0.0), None).unwrap();
+        let walk = walk_graph.route((0.0, 0.0), (0.002, 0.0), None).unwrap();
 
         assert_eq!(drive.coordinates.len(), 2);
         assert_eq!(drive.duration_s, 10.0);
@@ -514,9 +486,9 @@ mod tests {
         let d = g.add_node(make_node(4, 1.001, 1.0));
         g.add_edge(a, b, make_way(10.0, 100.0));
         g.add_edge(c, d, make_way(10.0, 100.0));
-        let sg = SpatialGraph::new(g);
+        let sg = SpatialGraph::new(g, NetworkType::Drive);
 
-        let result = route(&sg, 0.0, 0.0, 1.001, 1.0, NetworkType::Drive, None);
+        let result = sg.route((0.0, 0.0), (1.001, 1.0), None);
 
         assert!(matches!(result, Err(OsmGraphError::PathNotFound)));
     }
@@ -526,30 +498,22 @@ mod tests {
         use crate::reachability::compute_reachability;
 
         for network_type in [NetworkType::Walk, NetworkType::Drive] {
-            let sg = SpatialGraph::from_pbf("tests/fixtures/tiny_map.osm.pbf", network_type, None)
+            let sg = SpatialGraph::from_pbf("tests/fixtures/tiny_map.osm.pbf", network_type, false)
                 .unwrap();
             let prepared = sg.clone();
-            prepared.prepare_routing(network_type);
-            assert!(prepared.is_routing_prepared(network_type));
-            assert!(
-                sg.is_routing_prepared(network_type),
-                "clones share the hierarchy"
-            );
-            let unprepared = SpatialGraph::new((*sg.graph).clone());
+            prepared.prepare_routing();
+            assert!(prepared.is_routing_prepared());
+            assert!(sg.is_routing_prepared(), "clones share the hierarchy");
+            let unprepared = SpatialGraph::new((*sg.graph).clone(), network_type);
 
-            let path_cost = |edges: Vec<EdgeIndex>| {
-                edges
-                    .iter()
-                    .map(|&e| sg.graph[e].travel_time(network_type))
-                    .sum::<f64>()
-            };
             for origin in sg.graph.node_indices() {
-                let exact = compute_reachability(&sg, origin, f64::INFINITY, network_type).times;
+                let from = sg.snap_to_node(origin);
+                let exact = compute_reachability(&sg, &from, f64::INFINITY).times;
                 for dest in sg.graph.node_indices() {
                     let want = exact.get(dest).copied();
                     for graph in [&prepared, &unprepared] {
-                        let got =
-                            shortest_path_edges(graph, origin, dest, network_type).map(path_cost);
+                        let got = shortest_pieces(graph, &from, &graph.snap_to_node(dest))
+                            .map(|(cost, _)| cost);
                         match (got, want) {
                             (Some(a), Some(d)) => assert!((a - d).abs() < 1e-9, "{a} vs {d}"),
                             (None, None) => {}
@@ -562,6 +526,53 @@ mod tests {
     }
 
     #[test]
+    fn routes_start_and_end_mid_road() {
+        let sg = linear_graph();
+        // 1/4 of the way along A→B to 1/2 of the way along B→C.
+        let r = sg
+            .route((0.00025, 0.00001), (0.0015, -0.00001), None)
+            .unwrap();
+
+        assert!(
+            (r.duration_s - (7.5 + 5.0)).abs() < 1e-9,
+            "{}",
+            r.duration_s
+        );
+        assert!((r.distance_m - (0.75 * 111.0 + 0.5 * 111.0)).abs() < 1e-9);
+        let first = r.coordinates[0];
+        assert!((first.0 - 0.00025).abs() < 1e-12 && first.1.abs() < 1e-12);
+        let last = *r.coordinates.last().unwrap();
+        assert!((last.0 - 0.0015).abs() < 1e-12 && last.1.abs() < 1e-12);
+        assert!(r.origin_snap.distance_m > 1.0 && r.origin_snap.distance_m < 1.2);
+        assert_eq!(r.pieces.len(), 2);
+    }
+
+    #[test]
+    fn same_road_trips_go_directly_and_can_turn_back_on_two_way_roads() {
+        let mut g = DiGraph::new();
+        let a = g.add_node(make_node(1, 0.0, 0.0));
+        let b = g.add_node(make_node(2, 0.001, 0.0));
+        g.add_edge(a, b, make_way(10.0, 111.0));
+        g.add_edge(b, a, make_way(10.0, 111.0));
+        let sg = SpatialGraph::new(g, NetworkType::Drive);
+
+        let ahead = sg.route((0.0002, 0.0), (0.0008, 0.0), None).unwrap();
+        let behind = sg.route((0.0008, 0.0), (0.0002, 0.0), None).unwrap();
+
+        for r in [&ahead, &behind] {
+            assert!((r.duration_s - 6.0).abs() < 1e-9, "{}", r.duration_s);
+            assert_eq!(r.pieces.len(), 1, "no detour through a node");
+        }
+    }
+
+    #[test]
+    fn one_way_mid_road_trip_backwards_has_no_route() {
+        let sg = linear_graph();
+        let r = sg.route((0.0008, 0.0), (0.0002, 0.0), None);
+        assert!(matches!(r, Err(OsmGraphError::PathNotFound)));
+    }
+
+    #[test]
     fn route_with_uses_custom_costs() {
         let mut g = DiGraph::new();
         let a = g.add_node(make_node(1, 0.0, 0.0));
@@ -570,7 +581,7 @@ mod tests {
         g.add_edge(a, c, make_way(10.0, 100.0));
         g.add_edge(a, b, make_way(30.0, 50.0));
         g.add_edge(b, c, make_way(30.0, 50.0));
-        let sg = SpatialGraph::new(g);
+        let sg = SpatialGraph::new(g, NetworkType::Drive);
 
         // Penalise the direct edge tenfold: the two-hop path wins.
         let route = sg
@@ -592,10 +603,10 @@ mod tests {
     fn test_route_respects_max_snap_distance() {
         let sg = linear_graph();
 
-        let close = route(&sg, 0.0, 0.0, 0.002, 0.0, NetworkType::Drive, Some(1.0));
+        let close = sg.route((0.0, 0.0), (0.002, 0.0), Some(1.0));
         assert!(close.is_ok());
 
-        let far = route(&sg, 0.0, 0.0005, 0.002, 0.0, NetworkType::Drive, Some(1.0));
+        let far = sg.route((0.0, 0.0005), (0.002, 0.0), Some(1.0));
         assert!(matches!(
             far,
             Err(OsmGraphError::SnapDistanceExceeded { role: "origin", .. })

@@ -3,14 +3,16 @@
 //! a road graph with the indexes every query needs.
 
 use crate::ch::ContractionHierarchy;
+use crate::error::OsmGraphError;
 use crate::overpass::NetworkType;
 use crate::search::{SearchIndex, SlotCosts};
 use crate::simplify::simplify_graph;
 use crate::utils::{calculate_distance, calculate_travel_time};
 use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
 use petgraph::visit::EdgeRef;
+use rstar::primitives::{GeomWithData, Line};
 use rstar::{PointDistance, RTree, RTreeObject, AABB};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ops::Index;
 use std::sync::{Arc, OnceLock};
@@ -20,15 +22,15 @@ use std::sync::{Arc, OnceLock};
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
-pub struct XmlData {
+pub struct OsmData {
     #[serde(rename = "node", default)]
-    pub nodes: Vec<XmlNode>,
+    pub nodes: Vec<OsmNode>,
     #[serde(rename = "way", default)]
-    pub ways: Vec<XmlWay>,
+    pub ways: Vec<OsmWay>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
-pub struct XmlNode {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct OsmNode {
     #[serde(rename = "@id")]
     pub id: i64,
     #[serde(rename = "@lat")]
@@ -36,35 +38,47 @@ pub struct XmlNode {
     #[serde(rename = "@lon")]
     pub lon: f64,
     #[serde(rename = "tag", default)]
-    pub tags: Vec<XmlTag>,
+    pub tags: Vec<OsmTag>,
 }
 
 /// An OSM way as parsed from XML or PBF: the input to [`create_graph`].
 #[derive(Debug, Deserialize, Clone)]
-pub struct XmlWay {
+pub struct OsmWay {
     #[serde(rename = "@id")]
     pub id: i64,
     #[serde(rename = "nd", default)]
-    pub nodes: Vec<XmlNodeRef>,
+    pub nodes: Vec<OsmNodeRef>,
     #[serde(rename = "tag", default)]
-    pub tags: Vec<XmlTag>,
+    pub tags: Vec<OsmTag>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
-pub struct XmlNodeRef {
+pub struct OsmNodeRef {
     #[serde(rename = "@ref")]
     pub node_id: i64,
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
-pub struct XmlTag {
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct OsmTag {
     #[serde(rename = "@k")]
     pub key: String,
     #[serde(rename = "@v")]
     pub value: String,
 }
 
-pub fn parse_xml(xml_data: &str) -> Result<XmlData, quick_xml::DeError> {
+/// Former names of the OSM input types.
+#[deprecated(since = "0.5.0", note = "renamed to OsmData")]
+pub type XmlData = OsmData;
+#[deprecated(since = "0.5.0", note = "renamed to OsmNode")]
+pub type XmlNode = OsmNode;
+#[deprecated(since = "0.5.0", note = "renamed to OsmWay")]
+pub type XmlWay = OsmWay;
+#[deprecated(since = "0.5.0", note = "renamed to OsmTag")]
+pub type XmlTag = OsmTag;
+#[deprecated(since = "0.5.0", note = "renamed to OsmNodeRef")]
+pub type XmlNodeRef = OsmNodeRef;
+
+pub fn parse_xml(xml_data: &str) -> Result<OsmData, quick_xml::DeError> {
     quick_xml::de::from_str(xml_data)
 }
 
@@ -73,7 +87,7 @@ pub fn parse_xml(xml_data: &str) -> Result<XmlData, quick_xml::DeError> {
 // ---------------------------------------------------------------------------
 
 /// The road network: OSM nodes connected by directed [`Edge`]s.
-pub type RoadGraph = DiGraph<XmlNode, Edge>;
+pub type RoadGraph = DiGraph<OsmNode, Edge>;
 
 /// One directed road segment, or a collapsed chain of segments, in a
 /// [`RoadGraph`].
@@ -82,7 +96,7 @@ pub struct Edge {
     /// OSM id of the way this edge was cut from (the first way of a chain).
     pub way_id: i64,
     /// Routing-relevant tags of that way, shared by every edge cut from it.
-    pub tags: Arc<[XmlTag]>,
+    pub tags: Arc<[OsmTag]>,
     /// Length in metres.
     pub length: f64,
     pub speed_kph: f64,
@@ -100,7 +114,7 @@ pub struct Edge {
 impl Edge {
     /// A straight edge whose travel times follow from `length` at walking
     /// pace (5 km/h), cycling pace (15 km/h) and `speed_kph` for driving.
-    pub fn from_length(way_id: i64, tags: Arc<[XmlTag]>, length: f64, speed_kph: f64) -> Self {
+    pub fn from_length(way_id: i64, tags: Arc<[OsmTag]>, length: f64, speed_kph: f64) -> Self {
         Edge {
             way_id,
             tags,
@@ -138,7 +152,7 @@ impl Edge {
     /// Falls back to the straight segment between the two nodes when the edge
     /// carries no shape points, and flips stored geometry that runs backwards.
     /// Borrows the stored points; nothing is allocated.
-    pub fn oriented_geometry(&self, source: &XmlNode, target: &XmlNode) -> EdgeGeometry<'_> {
+    pub fn oriented_geometry(&self, source: &OsmNode, target: &OsmNode) -> EdgeGeometry<'_> {
         let (start, end) = ((source.lat, source.lon), (target.lat, target.lon));
         let [first, .., last] = self.geometry.as_slice() else {
             return EdgeGeometry {
@@ -165,8 +179,6 @@ pub(crate) enum CostField {
 }
 
 impl CostField {
-    pub(crate) const ALL: [CostField; 3] = [CostField::Walk, CostField::Bike, CostField::Drive];
-
     #[inline]
     pub(crate) fn of(network_type: NetworkType) -> Self {
         match network_type {
@@ -219,6 +231,72 @@ pub fn edge_geometry(graph: &RoadGraph, edge: EdgeIndex) -> EdgeGeometry<'_> {
     graph[edge].oriented_geometry(&graph[source], &graph[target])
 }
 
+/// A stretch of one edge between two fractions of its length, `0 <= from <=
+/// to <= 1`, in the edge's direction. Routes are sequences of pieces: whole
+/// edges in the middle, partial ones where a route starts or ends mid-road.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Piece {
+    pub edge: EdgeIndex,
+    pub from: f64,
+    pub to: f64,
+}
+
+impl Piece {
+    pub fn whole(edge: EdgeIndex) -> Self {
+        Piece {
+            edge,
+            from: 0.0,
+            to: 1.0,
+        }
+    }
+
+    /// Share of the edge this piece covers.
+    pub fn share(&self) -> f64 {
+        (self.to - self.from).max(0.0)
+    }
+
+    /// `(lat, lon)` points of this stretch: the interpolated start, every
+    /// shape point strictly inside, and the interpolated end.
+    pub fn points(&self, graph: &RoadGraph) -> Vec<(f64, f64)> {
+        let geometry = edge_geometry(graph, self.edge);
+        if self.from <= 0.0 && self.to >= 1.0 {
+            return geometry.points().collect();
+        }
+        let points: Vec<(f64, f64)> = geometry.points().collect();
+        let mut cumulative = Vec::with_capacity(points.len());
+        let mut total = 0.0;
+        cumulative.push(0.0);
+        for pair in points.windows(2) {
+            total += calculate_distance(pair[0].0, pair[0].1, pair[1].0, pair[1].1);
+            cumulative.push(total);
+        }
+        let at = |distance: f64| -> (f64, f64) {
+            let i = cumulative
+                .partition_point(|&c| c <= distance)
+                .clamp(1, points.len() - 1);
+            let span = cumulative[i] - cumulative[i - 1];
+            let s = if span > 0.0 {
+                ((distance - cumulative[i - 1]) / span).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let (a, b) = (points[i - 1], points[i]);
+            (a.0 + (b.0 - a.0) * s, a.1 + (b.1 - a.1) * s)
+        };
+        let (start, end) = (self.from * total, self.to * total);
+        let mut out = vec![at(start)];
+        out.extend(
+            points
+                .iter()
+                .zip(&cumulative)
+                .filter(|&(_, &c)| c > start && c < end)
+                .map(|(&p, _)| p),
+        );
+        out.push(at(end));
+        out
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Bidirectional,
@@ -242,11 +320,11 @@ impl Direction {
     }
 }
 
-fn find_tag<'a>(tags: &'a [XmlTag], key: &str) -> Option<&'a XmlTag> {
+fn find_tag<'a>(tags: &'a [OsmTag], key: &str) -> Option<&'a OsmTag> {
     tags.iter().find(|tag| tag.key == key)
 }
 
-fn assess_path_directionality(tags: &[XmlTag]) -> Direction {
+fn assess_path_directionality(tags: &[OsmTag]) -> Direction {
     let oneway = find_tag(tags, "oneway").map(|tag| tag.value.as_str());
     match oneway {
         Some("-1" | "reverse") => Direction::OneWayReverse,
@@ -281,7 +359,7 @@ fn highway_speed_kph(highway: &str) -> Option<f64> {
     }
 }
 
-fn way_speed_kph(tags: &[XmlTag]) -> f64 {
+fn way_speed_kph(tags: &[OsmTag]) -> f64 {
     const FALLBACK_SPEED_KPH: f64 = 50.0;
     find_tag(tags, "maxspeed")
         .and_then(|tag| clean_maxspeed(&tag.value))
@@ -290,7 +368,7 @@ fn way_speed_kph(tags: &[XmlTag]) -> f64 {
 }
 
 /// The tags edges keep; everything else is dropped at build time.
-fn useful_tags(mut tags: Vec<XmlTag>) -> Arc<[XmlTag]> {
+fn useful_tags(mut tags: Vec<OsmTag>) -> Arc<[OsmTag]> {
     const USEFUL_TAGS: &[&str] = &["highway", "name", "ref", "bridge", "tunnel", "service"];
     tags.retain(|tag| USEFUL_TAGS.contains(&tag.key.as_str()));
     tags.into()
@@ -305,8 +383,8 @@ fn useful_tags(mut tags: Vec<XmlTag>) -> Arc<[XmlTag]> {
 /// simplified: nearby intersection nodes are merged and degree-two chains are
 /// collapsed into single edges.
 pub fn create_graph(
-    nodes: Vec<XmlNode>,
-    ways: Vec<XmlWay>,
+    nodes: Vec<OsmNode>,
+    ways: Vec<OsmWay>,
     retain_all: bool,
     bidirectional: bool,
 ) -> RoadGraph {
@@ -384,7 +462,7 @@ pub(crate) struct NodeEntry {
 }
 
 impl NodeEntry {
-    pub(crate) fn new(node: &XmlNode, index: NodeIndex) -> Self {
+    pub(crate) fn new(node: &OsmNode, index: NodeIndex) -> Self {
         Self {
             point: spatial_index_point(node.lat, node.lon),
             index,
@@ -523,16 +601,98 @@ impl<'a, T> IntoIterator for &'a NodeMap<T> {
 // SpatialGraph
 // ---------------------------------------------------------------------------
 
+/// A WGS84 coordinate. Every method that takes a location accepts
+/// `impl Into<LatLon>`, so `(lat, lon)` tuples work too, in that order.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct LatLon {
+    pub lat: f64,
+    pub lon: f64,
+}
+
+impl LatLon {
+    pub const fn new(lat: f64, lon: f64) -> Self {
+        Self { lat, lon }
+    }
+
+    /// Great-circle distance in metres.
+    pub fn distance_m(self, other: LatLon) -> f64 {
+        calculate_distance(self.lat, self.lon, other.lat, other.lon)
+    }
+}
+
+impl From<(f64, f64)> for LatLon {
+    fn from((lat, lon): (f64, f64)) -> Self {
+        Self { lat, lon }
+    }
+}
+
+impl From<&OsmNode> for LatLon {
+    fn from(node: &OsmNode) -> Self {
+        Self::new(node.lat, node.lon)
+    }
+}
+
+/// Where a coordinate lands on the road network.
+///
+/// Points snap to the closest point on any road, not to the closest
+/// intersection, so a query from the middle of a long block starts in the
+/// middle of that block. The nearest end of the snapped edge is reported too.
 #[derive(Debug, Clone, Copy)]
 pub struct SnapResult {
     pub input_lat: f64,
     pub input_lon: f64,
+    /// The point on the road the input was snapped to.
+    pub snapped_lat: f64,
+    pub snapped_lon: f64,
+    /// Straight-line distance in metres from the input to the road.
+    pub distance_m: f64,
+    /// The edge snapped onto, or `None` when the graph has no edges near
+    /// enough to matter and the point snapped to a node instead.
+    pub edge: Option<EdgeIndex>,
+    /// Position along `edge` as a share of its length, from its source (0)
+    /// to its target (1).
+    pub fraction: f64,
+    /// The endpoint of `edge` nearest the snapped point.
     pub node_index: NodeIndex,
     pub node_id: i64,
     pub node_lat: f64,
     pub node_lon: f64,
-    pub distance_m: f64,
 }
+
+impl SnapResult {
+    /// The snapped point on the road.
+    pub fn snapped(&self) -> LatLon {
+        LatLon::new(self.snapped_lat, self.snapped_lon)
+    }
+}
+
+/// A way onto (or off) the network from a snapped point: reach `node` at
+/// `cost`, travelling `piece` of the snapped edge (`None` when the point is
+/// the node itself).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Anchor {
+    pub(crate) node: NodeIndex,
+    pub(crate) cost: f64,
+    pub(crate) piece: Option<Piece>,
+}
+
+impl Anchor {
+    pub(crate) fn root(&self) -> (u32, f64) {
+        (self.node.index() as u32, self.cost)
+    }
+}
+
+/// The cheapest anchor at `node`, if any.
+pub(crate) fn anchor_at(anchors: &[Anchor], node: NodeIndex) -> Option<&Anchor> {
+    anchors
+        .iter()
+        .filter(|a| a.node == node)
+        .min_by(|a, b| a.cost.total_cmp(&b.cost))
+}
+
+/// R-tree entry for one straight segment of an edge's geometry, in the
+/// local metric projection: `(edge index, segment index)`.
+type SegmentEntry = GeomWithData<Line<[f64; 2]>, (u32, u32)>;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SnappedPoi {
@@ -540,12 +700,21 @@ pub struct SnappedPoi {
     pub snap: SnapResult,
 }
 
-/// A road graph bundled with the indexes queries need: an R-tree for
-/// nearest-node lookups, a compact adjacency for searches, and (after
-/// [`SpatialGraph::prepare_routing`]) a contraction hierarchy per mode.
+/// Which end of a query a snapped point is, for error messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    Origin,
+    Destination,
+}
+
+/// A road graph for one [`NetworkType`], bundled with the indexes queries
+/// need: an R-tree for nearest-node lookups, a compact adjacency for
+/// searches, and (after [`SpatialGraph::prepare_routing`]) a contraction
+/// hierarchy.
 ///
-/// Build once via [`SpatialGraph::new`], reuse for all queries. Cloning is
-/// O(1): clones share the graph and every index, including ones built later.
+/// Every query uses the travel times of the graph's network type. Build once,
+/// reuse for all queries. Cloning is O(1): clones share the graph and every
+/// index, including ones built later.
 #[derive(Clone)]
 pub struct SpatialGraph {
     pub graph: Arc<RoadGraph>,
@@ -553,6 +722,7 @@ pub struct SpatialGraph {
     /// `snap_pois`. `None` until called; `Some` map used by POI filtering
     /// for O(1) lookup instead of an R-tree query on every request.
     pub poi_snaps: Option<Arc<HashMap<i64, SnappedPoi>>>,
+    network_type: NetworkType,
     index: Arc<GraphIndex>,
 }
 
@@ -560,14 +730,16 @@ pub struct SpatialGraph {
 /// on first use and then shared by every clone.
 struct GraphIndex {
     tree: RTree<NodeEntry>,
+    segments: RTree<SegmentEntry>,
     search: SearchIndex,
     node_ids: OnceLock<Vec<(i64, NodeIndex)>>,
-    max_speed_mps: OnceLock<[f64; 3]>,
-    hierarchies: [OnceLock<ContractionHierarchy>; 3],
+    max_speed_mps: OnceLock<f64>,
+    hierarchy: OnceLock<ContractionHierarchy>,
 }
 
 impl SpatialGraph {
-    pub fn new(graph: RoadGraph) -> Self {
+    /// Wrap a road graph whose edges are costed for `network_type`.
+    pub fn new(graph: RoadGraph, network_type: NetworkType) -> Self {
         let tree = RTree::bulk_load(
             graph
                 .node_indices()
@@ -575,41 +747,49 @@ impl SpatialGraph {
                 .collect(),
         );
         let search = SearchIndex::new(&graph);
+        let segments = RTree::bulk_load(segment_entries(&graph));
         Self {
             graph: Arc::new(graph),
             poi_snaps: None,
+            network_type,
             index: Arc::new(GraphIndex {
                 tree,
+                segments,
                 search,
                 node_ids: OnceLock::new(),
                 max_speed_mps: OnceLock::new(),
-                hierarchies: Default::default(),
+                hierarchy: OnceLock::new(),
             }),
         }
     }
 
-    pub(crate) fn from_parsed_osm(
-        data: XmlData,
-        network_type: NetworkType,
-        retain_all: bool,
-    ) -> Self {
+    /// Build a graph from parsed OSM data with [`create_graph`].
+    pub fn from_osm_data(data: OsmData, network_type: NetworkType, retain_all: bool) -> Self {
         let bidirectional = matches!(network_type, NetworkType::Walk);
         let graph = create_graph(data.nodes, data.ways, retain_all, bidirectional);
-        Self::new(graph)
+        Self::new(graph, network_type)
     }
 
-    /// Parse an OSM XML response and build a [`SpatialGraph`].
+    /// Parse an OSM XML document (e.g. an Overpass response) and build a graph.
     pub fn from_osm(
         xml: &str,
         network_type: NetworkType,
-        retain_all: Option<bool>,
-    ) -> Result<Self, quick_xml::DeError> {
-        let data = parse_xml(xml)?;
-        Ok(Self::from_parsed_osm(
-            data,
+        retain_all: bool,
+    ) -> Result<Self, OsmGraphError> {
+        Ok(Self::from_osm_data(
+            parse_xml(xml)?,
             network_type,
-            retain_all.unwrap_or(false),
+            retain_all,
         ))
+    }
+
+    /// The network type whose travel times every query uses.
+    pub fn network_type(&self) -> NetworkType {
+        self.network_type
+    }
+
+    pub(crate) fn cost_field(&self) -> CostField {
+        CostField::of(self.network_type)
     }
 
     /// Compact adjacency used by every search.
@@ -617,25 +797,27 @@ impl SpatialGraph {
         &self.index.search
     }
 
-    /// Per-slot edge costs for `field`, built on first use.
-    pub(crate) fn slot_costs(&self, field: CostField) -> &SlotCosts {
+    /// Per-slot edge costs for this graph's network type, built on first use.
+    pub(crate) fn slot_costs(&self) -> &SlotCosts {
+        let field = self.cost_field();
         self.index
             .search
             .costs(field as usize, |edge| self.graph[edge].cost(field))
     }
 
-    pub(crate) fn hierarchy_slot(&self, field: CostField) -> &OnceLock<ContractionHierarchy> {
-        &self.index.hierarchies[field as usize]
+    pub(crate) fn hierarchy_slot(&self) -> &OnceLock<ContractionHierarchy> {
+        &self.index.hierarchy
     }
 
-    /// The fastest straight-line speed (m/s) any edge allows for `field`:
+    /// The fastest straight-line speed (m/s) any edge allows:
     /// `straight_line_distance / speed` never exceeds the true travel time
     /// between two nodes, which makes it an admissible and consistent A*
     /// heuristic. Computed once, on first use.
-    pub(crate) fn max_straight_line_speed(&self, field: CostField) -> f64 {
-        self.index
+    pub(crate) fn max_straight_line_speed(&self) -> f64 {
+        *self
+            .index
             .max_speed_mps
-            .get_or_init(|| max_straight_line_speeds(&self.graph))[field as usize]
+            .get_or_init(|| max_straight_line_speed(&self.graph, self.cost_field()))
     }
 
     /// The graph node with OSM id `node_id`, if any. O(log n) after a
@@ -674,7 +856,7 @@ impl SpatialGraph {
                 subgraph.add_edge(source, target, edge.weight().clone());
             }
         }
-        SpatialGraph::new(subgraph)
+        SpatialGraph::new(subgraph, self.network_type)
     }
 
     /// Pre-snap a set of POI nodes to their nearest graph nodes, storing the
@@ -686,7 +868,7 @@ impl SpatialGraph {
         let snaps: HashMap<i64, SnappedPoi> = pois
             .iter()
             .filter_map(|poi| {
-                let snap = self.snap_point(poi.lat, poi.lon)?;
+                let snap = self.snap_point((poi.lat, poi.lon))?;
                 Some((
                     poi.id,
                     SnappedPoi {
@@ -699,79 +881,328 @@ impl SpatialGraph {
         self.poi_snaps = Some(Arc::new(snaps));
     }
 
-    pub fn nearest_node(&self, lat: f64, lon: f64) -> Option<NodeIndex> {
+    pub fn nearest_node(&self, point: impl Into<LatLon>) -> Option<NodeIndex> {
+        let point = point.into();
         self.index
             .tree
-            .nearest_neighbor(&spatial_index_point(lat, lon))
+            .nearest_neighbor(&spatial_index_point(point.lat, point.lon))
             .map(|e| e.index)
     }
 
-    pub fn snap_point(&self, lat: f64, lon: f64) -> Option<SnapResult> {
-        self.nearest_node(lat, lon).map(|node_index| {
-            let node = &self.graph[node_index];
-            SnapResult {
-                input_lat: lat,
-                input_lon: lon,
-                node_index,
-                node_id: node.id,
-                node_lat: node.lat,
-                node_lon: node.lon,
-                distance_m: calculate_distance(lat, lon, node.lat, node.lon),
-            }
+    /// Snap a coordinate to the closest point on any road. Falls back to the
+    /// nearest node in a graph without edges; `None` only for an empty graph.
+    pub fn snap_point(&self, point: impl Into<LatLon>) -> Option<SnapResult> {
+        let point = point.into();
+        let query = spatial_index_point(point.lat, point.lon);
+        // The index projection is only locally uniform, so refine the few
+        // closest candidates in a projection centred on the query point.
+        let local = |p: (f64, f64)| -> [f64; 2] {
+            const METERS_PER_DEGREE: f64 = 111_320.0;
+            [
+                (p.1 - point.lon) * METERS_PER_DEGREE * point.lat.to_radians().cos(),
+                (p.0 - point.lat) * METERS_PER_DEGREE,
+            ]
+        };
+        let best = self
+            .index
+            .segments
+            .nearest_neighbor_iter(&query)
+            .take(4)
+            .map(|entry| {
+                let (edge, segment) =
+                    (EdgeIndex::new(entry.data.0 as usize), entry.data.1 as usize);
+                let points: Vec<(f64, f64)> = edge_geometry(&self.graph, edge).points().collect();
+                let (a, b) = (local(points[segment]), local(points[segment + 1]));
+                let d = [b[0] - a[0], b[1] - a[1]];
+                let length_2 = d[0] * d[0] + d[1] * d[1];
+                let s = if length_2 > 0.0 {
+                    (-(a[0] * d[0] + a[1] * d[1]) / length_2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let foot = [a[0] + s * d[0], a[1] + s * d[1]];
+                (
+                    foot[0] * foot[0] + foot[1] * foot[1],
+                    edge,
+                    segment,
+                    s,
+                    points,
+                )
+            })
+            .min_by(|x, y| x.0.total_cmp(&y.0));
+        let Some((_, edge, segment, s, points)) = best else {
+            return self
+                .nearest_node(point)
+                .map(|node| self.snap_to_node_from(point, node));
+        };
+
+        let (a, b) = (points[segment], points[segment + 1]);
+        let snapped = LatLon::new(a.0 + (b.0 - a.0) * s, a.1 + (b.1 - a.1) * s);
+        let span = |p: (f64, f64), q: (f64, f64)| calculate_distance(p.0, p.1, q.0, q.1);
+        let total: f64 = points.windows(2).map(|w| span(w[0], w[1])).sum();
+        let before: f64 = points[..=segment]
+            .windows(2)
+            .map(|w| span(w[0], w[1]))
+            .sum();
+        let fraction = if total > 0.0 {
+            ((before + s * span(a, b)) / total).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let (source, target) = self.graph.edge_endpoints(edge).expect("indexed edge");
+        let node_index = if fraction <= 0.5 { source } else { target };
+        let node = &self.graph[node_index];
+        Some(SnapResult {
+            input_lat: point.lat,
+            input_lon: point.lon,
+            snapped_lat: snapped.lat,
+            snapped_lon: snapped.lon,
+            distance_m: point.distance_m(snapped),
+            edge: Some(edge),
+            fraction,
+            node_index,
+            node_id: node.id,
+            node_lat: node.lat,
+            node_lon: node.lon,
         })
     }
 
-    /// Snap a coordinate to the nearest graph node, optionally rejecting snaps
-    /// farther than `max_distance_m`.
-    pub fn snap_point_within(
-        &self,
-        lat: f64,
-        lon: f64,
-        max_distance_m: Option<f64>,
-    ) -> Option<SnapResult> {
-        let snap = self.snap_point(lat, lon)?;
-        match max_distance_m {
-            Some(max_distance_m) if snap.distance_m > max_distance_m => None,
-            _ => Some(snap),
+    /// A snap exactly at graph node `node`, for node-based queries.
+    pub fn snap_to_node(&self, node: NodeIndex) -> SnapResult {
+        self.snap_to_node_from((&self.graph[node]).into(), node)
+    }
+
+    fn snap_to_node_from(&self, point: LatLon, node_index: NodeIndex) -> SnapResult {
+        let node = &self.graph[node_index];
+        SnapResult {
+            input_lat: point.lat,
+            input_lon: point.lon,
+            snapped_lat: node.lat,
+            snapped_lon: node.lon,
+            distance_m: point.distance_m(node.into()),
+            edge: None,
+            fraction: 0.0,
+            node_index,
+            node_id: node.id,
+            node_lat: node.lat,
+            node_lon: node.lon,
         }
     }
 
-    pub fn nearest_node_within(
+    /// The edge running the opposite way along the same road as `edge`, if
+    /// one exists.
+    pub(crate) fn twin(&self, edge: EdgeIndex) -> Option<EdgeIndex> {
+        let (u, v) = self.graph.edge_endpoints(edge)?;
+        let length = self.graph[edge].length;
+        self.graph
+            .edges_connecting(v, u)
+            .filter(|r| (r.weight().length - length).abs() <= 1.0 + 0.01 * length)
+            .min_by(|a, b| {
+                (a.weight().length - length)
+                    .abs()
+                    .total_cmp(&(b.weight().length - length).abs())
+            })
+            .map(|r| r.id())
+    }
+
+    /// Ways onto the network from `snap`, priced by `cost`.
+    pub(crate) fn departures(
         &self,
-        lat: f64,
-        lon: f64,
+        snap: &SnapResult,
+        cost: &mut dyn FnMut(EdgeIndex) -> f64,
+    ) -> Vec<Anchor> {
+        self.anchors(snap, cost, true)
+    }
+
+    /// Ways from the network to `snap`, priced by `cost`.
+    pub(crate) fn arrivals(
+        &self,
+        snap: &SnapResult,
+        cost: &mut dyn FnMut(EdgeIndex) -> f64,
+    ) -> Vec<Anchor> {
+        self.anchors(snap, cost, false)
+    }
+
+    fn anchors(
+        &self,
+        snap: &SnapResult,
+        cost: &mut dyn FnMut(EdgeIndex) -> f64,
+        depart: bool,
+    ) -> Vec<Anchor> {
+        let Some(edge) = snap.edge else {
+            return vec![Anchor {
+                node: snap.node_index,
+                cost: 0.0,
+                piece: None,
+            }];
+        };
+        let (u, v) = self.graph.edge_endpoints(edge).expect("snapped edge");
+        let t = snap.fraction;
+        let mut anchors = Vec::with_capacity(3);
+        let mut push = |node, edge, from: f64, to: f64, cost: f64| {
+            if cost.is_finite() && cost >= 0.0 {
+                let piece = Piece { edge, from, to };
+                anchors.push(Anchor {
+                    node,
+                    cost: cost * piece.share(),
+                    piece: Some(piece),
+                });
+            }
+        };
+        let forward = cost(edge);
+        if depart {
+            push(v, edge, t, 1.0, forward);
+        } else {
+            push(u, edge, 0.0, t, forward);
+        }
+        if let Some(twin) = self.twin(edge) {
+            let backward = cost(twin);
+            if depart {
+                push(u, twin, 1.0 - t, 1.0, backward);
+            } else {
+                push(v, twin, 0.0, 1.0 - t, backward);
+            }
+        }
+        for (node, at_node) in [(u, t <= 0.0), (v, t >= 1.0)] {
+            if at_node {
+                anchors.push(Anchor {
+                    node,
+                    cost: 0.0,
+                    piece: None,
+                });
+            }
+        }
+        anchors
+    }
+
+    /// The cheapest way from `origin` to `destination` along the single road
+    /// both lie on, without passing through a node, if there is one.
+    pub(crate) fn direct_piece(
+        &self,
+        origin: &SnapResult,
+        destination: &SnapResult,
+        cost: &mut dyn FnMut(EdgeIndex) -> f64,
+    ) -> Option<(f64, Piece)> {
+        let (eo, ed) = (origin.edge?, destination.edge?);
+        let twin = self.twin(eo);
+        let mut best: Option<(f64, Piece)> = None;
+        for (edge, flipped) in [(Some(eo), false), (twin, true)] {
+            let Some(edge) = edge else { continue };
+            let from = if flipped {
+                1.0 - origin.fraction
+            } else {
+                origin.fraction
+            };
+            let to = if ed == edge {
+                destination.fraction
+            } else if self.twin(ed) == Some(edge) {
+                1.0 - destination.fraction
+            } else {
+                continue;
+            };
+            let edge_cost = cost(edge);
+            if to >= from && edge_cost.is_finite() && edge_cost >= 0.0 {
+                let piece = Piece { edge, from, to };
+                let total = edge_cost * piece.share();
+                if best.is_none_or(|(b, _)| total < b) {
+                    best = Some((total, piece));
+                }
+            }
+        }
+        best
+    }
+
+    /// Snap a coordinate onto the graph, rejecting snaps farther than
+    /// `max_distance_m` when given.
+    pub fn snap_point_within(
+        &self,
+        point: impl Into<LatLon>,
         max_distance_m: Option<f64>,
-    ) -> Option<NodeIndex> {
-        self.snap_point_within(lat, lon, max_distance_m)
-            .map(|snap| snap.node_index)
+    ) -> Option<SnapResult> {
+        self.snap_point(point)
+            .filter(|snap| max_distance_m.is_none_or(|max| snap.distance_m <= max))
+    }
+
+    /// Snap a query endpoint, turning failures into the matching error.
+    pub(crate) fn snap_endpoint(
+        &self,
+        point: LatLon,
+        role: Role,
+        max_snap_m: Option<f64>,
+    ) -> Result<SnapResult, OsmGraphError> {
+        let snap = self.snap_point(point).ok_or(match role {
+            Role::Origin => OsmGraphError::OriginNodeNotFound,
+            Role::Destination => OsmGraphError::DestinationNodeNotFound,
+        })?;
+        match max_snap_m {
+            Some(max_distance_m) if snap.distance_m > max_distance_m => {
+                Err(OsmGraphError::SnapDistanceExceeded {
+                    role: match role {
+                        Role::Origin => "origin",
+                        Role::Destination => "destination",
+                    },
+                    distance_m: snap.distance_m,
+                    max_distance_m,
+                })
+            }
+            _ => Ok(snap),
+        }
     }
 }
 
-/// Per cost field, the largest `straight-line distance / travel time` over all
-/// edges. Because great-circle distance obeys the triangle inequality,
-/// `distance(n, goal) / max_speed` never exceeds the true remaining cost.
-fn max_straight_line_speeds(graph: &RoadGraph) -> [f64; 3] {
-    let mut max_speed = [0.0_f64; 3];
+/// Segments of every edge for the snapping index. Of two edges running
+/// opposite ways along one road only one is indexed; snapping finds the
+/// other through [`SpatialGraph::twin`].
+fn segment_entries(graph: &RoadGraph) -> Vec<SegmentEntry> {
+    let mut entries = Vec::new();
     for edge in graph.edge_references() {
-        let (a, b) = (&graph[edge.source()], &graph[edge.target()]);
-        let distance = calculate_distance(a.lat, a.lon, b.lat, b.lon);
-        if distance == 0.0 {
+        let (u, v) = (edge.source(), edge.target());
+        let has_indexed_twin = u > v
+            && graph.edges_connecting(v, u).any(|r| {
+                (r.weight().length - edge.weight().length).abs()
+                    <= 1.0 + 0.01 * edge.weight().length
+            });
+        if has_indexed_twin || u == v {
             continue;
         }
-        for field in CostField::ALL {
-            let time = edge.weight().cost(field);
-            if time.is_finite() && time >= 0.0 {
-                let speed = if time > 0.0 {
-                    distance / time
-                } else {
-                    f64::INFINITY
-                };
-                max_speed[field as usize] = max_speed[field as usize].max(speed);
-            }
+        let geometry = edge.weight().oriented_geometry(&graph[u], &graph[v]);
+        let projected: Vec<[f64; 2]> = geometry
+            .points()
+            .map(|(lat, lon)| spatial_index_point(lat, lon))
+            .collect();
+        for (i, pair) in projected.windows(2).enumerate() {
+            entries.push(GeomWithData::new(
+                Line::new(pair[0], pair[1]),
+                (edge.id().index() as u32, i as u32),
+            ));
+        }
+    }
+    entries
+}
+
+/// The largest `straight-line distance / travel time` over all edges for
+/// `field`. Because great-circle distance obeys the triangle inequality,
+/// `distance(n, goal) / max_speed` never exceeds the true remaining cost.
+fn max_straight_line_speed(graph: &RoadGraph, field: CostField) -> f64 {
+    let mut max_speed = 0.0_f64;
+    for edge in graph.edge_references() {
+        let (a, b) = (&graph[edge.source()], &graph[edge.target()]);
+        // Along-road length too: routes may start or end part-way along an
+        // edge, and the bound must hold for those partial stretches.
+        let distance = calculate_distance(a.lat, a.lon, b.lat, b.lon).max(edge.weight().length);
+        let time = edge.weight().cost(field);
+        if distance > 0.0 && time.is_finite() && time >= 0.0 {
+            let speed = if time > 0.0 {
+                distance / time
+            } else {
+                f64::INFINITY
+            };
+            max_speed = max_speed.max(speed);
         }
     }
     // Pad by a hair so floating-point rounding can't make the bound inadmissible.
-    max_speed.map(|speed| speed * (1.0 + 1e-9))
+    max_speed * (1.0 + 1e-9)
 }
 
 #[cfg(test)]
@@ -779,8 +1210,8 @@ mod tests {
     use super::*;
     use petgraph::visit::EdgeRef;
 
-    fn make_node(id: i64, lat: f64, lon: f64) -> XmlNode {
-        XmlNode {
+    fn make_node(id: i64, lat: f64, lon: f64) -> OsmNode {
+        OsmNode {
             id,
             lat,
             lon,
@@ -788,16 +1219,16 @@ mod tests {
         }
     }
 
-    fn make_way_raw(node_ids: Vec<i64>, tags: Vec<(&str, &str)>) -> XmlWay {
-        XmlWay {
+    fn make_way_raw(node_ids: Vec<i64>, tags: Vec<(&str, &str)>) -> OsmWay {
+        OsmWay {
             id: 1,
             nodes: node_ids
                 .into_iter()
-                .map(|id| XmlNodeRef { node_id: id })
+                .map(|id| OsmNodeRef { node_id: id })
                 .collect(),
             tags: tags
                 .into_iter()
-                .map(|(k, v)| XmlTag {
+                .map(|(k, v)| OsmTag {
                     key: k.into(),
                     value: v.into(),
                 })
@@ -996,7 +1427,10 @@ mod tests {
             make_node(3, 0.002, 0.0),
         ];
         let way = make_way_raw(vec![1, 2, 3], vec![("highway", "residential")]);
-        let sg = SpatialGraph::new(create_graph(nodes, vec![way], true, false));
+        let sg = SpatialGraph::new(
+            create_graph(nodes, vec![way], true, false),
+            NetworkType::Drive,
+        );
 
         let sub = sg.induced_subgraph(|idx| sg.graph[idx].id != 3);
 
@@ -1062,7 +1496,10 @@ mod tests {
     fn node_index_finds_nodes_by_osm_id() {
         let nodes = vec![make_node(42, 0.0, 0.0), make_node(7, 0.001, 0.0)];
         let way = make_way_raw(vec![42, 7], vec![("highway", "residential")]);
-        let sg = SpatialGraph::new(create_graph(nodes, vec![way], true, false));
+        let sg = SpatialGraph::new(
+            create_graph(nodes, vec![way], true, false),
+            NetworkType::Drive,
+        );
 
         let idx = sg.node_index(7).unwrap();
         assert_eq!(sg.graph[idx].id, 7);
@@ -1070,12 +1507,58 @@ mod tests {
     }
 
     #[test]
+    fn snapping_lands_on_the_nearest_road_not_the_nearest_node() {
+        // A 1 km straight road with nodes only at its ends.
+        let nodes = vec![make_node(1, 0.0, 0.0), make_node(2, 0.0, 0.009)];
+        let way = make_way_raw(vec![1, 2], vec![("highway", "residential")]);
+        let sg = SpatialGraph::new(
+            create_graph(nodes, vec![way], true, false),
+            NetworkType::Walk,
+        );
+
+        let snap = sg.snap_point((0.0001, 0.003)).unwrap();
+
+        assert!(snap.edge.is_some());
+        assert!((snap.distance_m - 11.1).abs() < 0.2, "{}", snap.distance_m);
+        assert!(
+            (snap.fraction - 1.0 / 3.0).abs() < 1e-6,
+            "{}",
+            snap.fraction
+        );
+        assert!((snap.snapped_lon - 0.003).abs() < 1e-9 && snap.snapped_lat.abs() < 1e-9);
+        assert_eq!(snap.node_id, 1, "nearest end of the snapped edge");
+    }
+
+    #[test]
+    fn piece_points_cut_the_geometry_at_fractions() {
+        let mut graph = RoadGraph::new();
+        let a = graph.add_node(make_node(1, 0.0, 0.0));
+        let b = graph.add_node(make_node(2, 0.002, 0.0));
+        let edge = graph.add_edge(a, b, Edge::default());
+
+        let points = Piece {
+            edge,
+            from: 0.25,
+            to: 0.75,
+        }
+        .points(&graph);
+
+        assert_eq!(points.len(), 2);
+        assert!((points[0].0 - 0.0005).abs() < 1e-12);
+        assert!((points[1].0 - 0.0015).abs() < 1e-12);
+        assert_eq!(
+            Piece::whole(edge).points(&graph),
+            vec![(0.0, 0.0), (0.002, 0.0)]
+        );
+    }
+
+    #[test]
     fn test_nearest_node_finds_closest() {
         let mut graph = DiGraph::new();
         graph.add_node(make_node(1, 48.0, 11.0));
         graph.add_node(make_node(2, 52.0, 13.0));
-        let sg = SpatialGraph::new(graph);
-        let idx = sg.nearest_node(48.001, 11.001).unwrap();
+        let sg = SpatialGraph::new(graph, NetworkType::Drive);
+        let idx = sg.nearest_node((48.001, 11.001)).unwrap();
         assert_eq!(sg.graph[idx].id, 1);
     }
 
@@ -1083,9 +1566,9 @@ mod tests {
     fn test_snap_point_returns_diagnostics() {
         let mut graph = DiGraph::new();
         graph.add_node(make_node(1, 48.0, 11.0));
-        let sg = SpatialGraph::new(graph);
+        let sg = SpatialGraph::new(graph, NetworkType::Drive);
 
-        let snap = sg.snap_point(48.001, 11.001).unwrap();
+        let snap = sg.snap_point((48.001, 11.001)).unwrap();
 
         assert_eq!(snap.node_id, 1);
         assert_eq!(snap.node_lat, 48.0);
@@ -1097,10 +1580,12 @@ mod tests {
     fn test_snap_point_within_rejects_far_snap() {
         let mut graph = DiGraph::new();
         graph.add_node(make_node(1, 48.0, 11.0));
-        let sg = SpatialGraph::new(graph);
+        let sg = SpatialGraph::new(graph, NetworkType::Drive);
 
-        assert!(sg.snap_point_within(48.001, 11.001, Some(500.0)).is_some());
-        assert!(sg.snap_point_within(48.001, 11.001, Some(1.0)).is_none());
+        assert!(sg
+            .snap_point_within((48.001, 11.001), Some(500.0))
+            .is_some());
+        assert!(sg.snap_point_within((48.001, 11.001), Some(1.0)).is_none());
     }
 
     #[test]

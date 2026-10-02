@@ -16,7 +16,7 @@ use petgraph::graph::{EdgeIndex, NodeIndex};
 
 use rayon::prelude::*;
 
-use crate::search::{usable, workspace, HeapEntry, SearchIndex, Workspace, NONE};
+use crate::search::{seed, usable, workspace, HeapEntry, SearchIndex, SearchPath, Workspace, NONE};
 
 /// Witness searches give up after settling this many nodes. Giving up only
 /// ever adds a redundant shortcut, never a wrong one. Priority estimates can
@@ -405,27 +405,17 @@ impl ContractionHierarchy {
             .count()
     }
 
-    /// Exact shortest path from `source` to `target`: its cost and original
-    /// edges in travel order.
+    /// Exact shortest path from any of `sources` to any of `targets`, each a
+    /// `(node, offset)` pair: its cost and original edges in travel order.
     pub(crate) fn shortest_path(
         &self,
-        source: NodeIndex,
-        target: NodeIndex,
-    ) -> Option<(f64, Vec<EdgeIndex>)> {
-        if source.index() >= self.node_count || target.index() >= self.node_count {
-            return None;
-        }
+        sources: &[(u32, f64)],
+        targets: &[(u32, f64)],
+    ) -> Option<SearchPath> {
         let mut fwd = workspace(self.node_count);
         let mut bwd = workspace(self.node_count);
-        let (s, t) = (source.index() as u32, target.index() as u32);
-        for (ws, root) in [(&mut fwd, s), (&mut bwd, t)] {
-            ws.relax(root, 0.0, NONE, NONE);
-            ws.heap.push(HeapEntry {
-                key: 0.0,
-                cost: 0.0,
-                node: root,
-            });
-        }
+        seed(&mut fwd, sources, self.node_count, |_| 0.0, None);
+        seed(&mut bwd, targets, self.node_count, |_| 0.0, None);
 
         let mut best = f64::INFINITY;
         let mut meet = NONE;
@@ -474,20 +464,31 @@ impl ContractionHierarchy {
             return None;
         }
         let mut path_arcs = Vec::new();
-        let mut node = meet;
-        while node != s {
-            let (pred, arc) = fwd.pred(node);
+        let mut first = meet;
+        loop {
+            let (pred, arc) = fwd.pred(first);
+            if pred == NONE {
+                break;
+            }
             path_arcs.push(arc);
-            node = pred;
+            first = pred;
         }
         path_arcs.reverse();
-        let mut node = meet;
-        while node != t {
-            let (next, arc) = bwd.pred(node);
+        let mut last = meet;
+        loop {
+            let (next, arc) = bwd.pred(last);
+            if next == NONE {
+                break;
+            }
             path_arcs.push(arc);
-            node = next;
+            last = next;
         }
-        Some((best, self.unpack(&path_arcs)))
+        Some(SearchPath {
+            cost: best,
+            first: NodeIndex::new(first as usize),
+            last: NodeIndex::new(last as usize),
+            edges: self.unpack(&path_arcs),
+        })
     }
 
     /// Expand shortcut arcs into original edges, preserving travel order.
@@ -561,10 +562,11 @@ mod tests {
             assert!(ch.shortcut_count() > 0);
 
             for s in g.node_indices() {
-                let exact = dijkstra(&index.out, s, f64::INFINITY, |slot| costs[slot]);
+                let root = |n: NodeIndex| [(n.index() as u32, 0.0)];
+                let exact = dijkstra(&index.out, &root(s), f64::INFINITY, |slot| costs[slot]);
                 for t in g.node_indices() {
-                    let got = ch.shortest_path(s, t);
-                    match (got, exact.get(t)) {
+                    let got = ch.shortest_path(&root(s), &root(t));
+                    match (got.map(|p| (p.cost, p.edges)), exact.get(t)) {
                         (None, None) => {}
                         (Some((cost, edges)), Some(&want)) => {
                             assert!((cost - want).abs() < 1e-9, "{s:?}->{t:?}: {cost} vs {want}");
@@ -586,10 +588,12 @@ mod tests {
                 }
             }
             // And agrees with A* on a sample.
-            let a = NodeIndex::new(0);
-            let b = NodeIndex::new(g.node_count() - 1);
-            let via_astar = astar(&index.out, a, b, |slot| costs[slot], |_| 0.0).map(|r| r.0);
-            let via_ch = ch.shortest_path(a, b).map(|r| r.0);
+            let a: NodeIndex = NodeIndex::new(0);
+            let b: NodeIndex = NodeIndex::new(g.node_count() - 1);
+            let (ra, rb) = ([(a.index() as u32, 0.0)], [(b.index() as u32, 0.0)]);
+            let via_astar =
+                astar(&index.out, &ra, &rb, |slot| costs[slot], |_| 0.0).map(|r| r.cost);
+            let via_ch = ch.shortest_path(&ra, &rb).map(|r| r.cost);
             match (via_astar, via_ch) {
                 (Some(x), Some(y)) => assert!((x - y).abs() < 1e-9),
                 (x, y) => assert_eq!(x.is_some(), y.is_some()),

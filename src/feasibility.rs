@@ -34,12 +34,14 @@
 //!   cannot be completed within the budget at all, giving callers a clear
 //!   signal to surface to users rather than an opaque empty result.
 
-use geo::{ConvexHull, MultiPoint, Polygon};
-use petgraph::graph::NodeIndex;
+use std::cell::RefCell;
 
-use crate::graph::{node_to_latlon, CostField, NodeMap, RoadGraph, SpatialGraph};
-use crate::overpass::NetworkType;
-use crate::reachability::{induced_edge_count, EdgeInfo};
+use geo::{ConvexHull, MultiPoint, Polygon};
+use petgraph::graph::EdgeIndex;
+
+use crate::error::OsmGraphError;
+use crate::graph::{LatLon, NodeMap, RoadGraph, Role, SnapResult, SpatialGraph};
+use crate::reachability::{induced_edge_count, roots, EdgeInfo};
 use crate::search::{astar, dijkstra};
 
 // ---------------------------------------------------------------------------
@@ -61,10 +63,10 @@ pub struct FeasibleNode {
 /// Full result of a successful [`compute_feasibility`] call.
 #[derive(Debug, Clone)]
 pub struct FeasibilityResult {
-    /// The origin node used for the forward search.
-    pub origin: NodeIndex,
-    /// The destination node used for the reverse search.
-    pub destination: NodeIndex,
+    /// Where the origin snapped onto the network.
+    pub origin: SnapResult,
+    /// Where the destination snapped onto the network.
+    pub destination: SnapResult,
     /// The time budget passed by the caller (seconds).
     pub available_time: f64,
     /// The minimum travel time from origin to destination (seconds).
@@ -125,7 +127,6 @@ pub struct PrismGraph {
     /// Parent graph. The prism node set is stored in `result`.
     pub graph: SpatialGraph,
     pub result: FeasibilityResult,
-    pub network_type: NetworkType,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,44 +140,64 @@ enum Side {
     In,
 }
 
-/// Two-sided feasibility with `price(side, slot)` giving each arc's cost.
+/// Two-sided feasibility. `edge_cost` prices whole edges (for the partial
+/// stretches at either end), `price(side, slot)` prices adjacency slots.
 fn feasibility(
     sg: &SpatialGraph,
-    origin: NodeIndex,
-    destination: NodeIndex,
+    origin: &SnapResult,
+    destination: &SnapResult,
     available_time: f64,
+    edge_cost: &mut dyn FnMut(EdgeIndex) -> f64,
     mut price: impl FnMut(Side, usize) -> f64,
 ) -> Result<FeasibilityResult, InfeasibleReason> {
     let index = sg.search_index();
+    let departures = roots(&sg.departures(origin, edge_cost));
+    let arrivals = roots(&sg.arrivals(destination, edge_cost));
+    let direct = sg
+        .direct_piece(origin, destination, edge_cost)
+        .map(|(cost, _)| cost);
 
     // Forward search: origin → every node within budget.
-    let forward = dijkstra(&index.out, origin, available_time, |slot| {
+    let forward = dijkstra(&index.out, &departures, available_time, |slot| {
         price(Side::Out, slot)
     });
+    let via_network = arrivals
+        .iter()
+        .filter_map(|&(node, cost)| Some(forward.get(node.into())? + cost))
+        .min_by(f64::total_cmp);
+    let direct_time = [via_network, direct]
+        .into_iter()
+        .flatten()
+        .filter(|&t| t <= available_time)
+        .min_by(f64::total_cmp);
 
-    let direct_time = match forward.get(destination) {
-        Some(&time) => time,
+    let Some(direct_time) = direct_time else {
         // Out of budget or disconnected: one targeted search tells which.
-        None => {
-            let direct = astar(
-                &index.out,
-                origin,
-                destination,
-                |slot| price(Side::Out, slot),
-                |_| 0.0,
-            );
-            return Err(match direct {
-                Some((direct_time, _)) => InfeasibleReason::BudgetTooTight {
+        let unbounded = astar(
+            &index.out,
+            &departures,
+            &arrivals,
+            |slot| price(Side::Out, slot),
+            |_| 0.0,
+        )
+        .map(|path| path.cost);
+        return Err(
+            match [unbounded, direct]
+                .into_iter()
+                .flatten()
+                .min_by(f64::total_cmp)
+            {
+                Some(direct_time) => InfeasibleReason::BudgetTooTight {
                     direct_time,
                     available_time,
                 },
                 None => InfeasibleReason::NoPathExists,
-            });
-        }
+            },
+        );
     };
 
     // Reverse search: every node → destination, following incoming edges.
-    let backward = dijkstra(&index.inc, destination, available_time, |slot| {
+    let backward = dijkstra(&index.inc, &arrivals, available_time, |slot| {
         price(Side::In, slot)
     });
 
@@ -200,8 +221,8 @@ fn feasibility(
     }
 
     Ok(FeasibilityResult {
-        origin,
-        destination,
+        origin: *origin,
+        destination: *destination,
         available_time,
         direct_time,
         feasible,
@@ -225,42 +246,51 @@ fn feasibility(
 /// negative, NaN or infinite make an edge impassable.
 pub fn compute_feasibility_with<F>(
     sg: &SpatialGraph,
-    origin: NodeIndex,
-    destination: NodeIndex,
+    origin: &SnapResult,
+    destination: &SnapResult,
     available_time: f64,
-    mut cost: F,
+    cost: F,
 ) -> Result<FeasibilityResult, InfeasibleReason>
 where
     F: FnMut(EdgeInfo<'_>) -> f64,
 {
     let index = sg.search_index();
-    feasibility(sg, origin, destination, available_time, |side, slot| {
-        let adjacency = match side {
-            Side::Out => &index.out,
-            Side::In => &index.inc,
-        };
-        cost(EdgeInfo::of(&sg.graph, adjacency.edges[slot]))
-    })
-}
-
-/// Compute two-sided feasibility using the precomputed walk/bike/drive travel
-/// time on each edge.
-///
-/// For custom cost models (traffic, density penalties), call
-/// [`compute_feasibility_with`].
-pub fn compute_feasibility(
-    sg: &SpatialGraph,
-    origin: NodeIndex,
-    destination: NodeIndex,
-    available_time: f64,
-    network_type: NetworkType,
-) -> Result<FeasibilityResult, InfeasibleReason> {
-    let costs = sg.slot_costs(CostField::of(network_type));
+    let cost = RefCell::new(cost);
+    let price_edge = |edge: u32| (cost.borrow_mut())(EdgeInfo::of(&sg.graph, edge));
     feasibility(
         sg,
         origin,
         destination,
         available_time,
+        &mut |e| price_edge(e.index() as u32),
+        |side, slot| {
+            let adjacency = match side {
+                Side::Out => &index.out,
+                Side::In => &index.inc,
+            };
+            price_edge(adjacency.edges[slot])
+        },
+    )
+}
+
+/// Compute two-sided feasibility using the graph's travel times.
+///
+/// For custom cost models (traffic, density penalties), call
+/// [`compute_feasibility_with`].
+pub fn compute_feasibility(
+    sg: &SpatialGraph,
+    origin: &SnapResult,
+    destination: &SnapResult,
+    available_time: f64,
+) -> Result<FeasibilityResult, InfeasibleReason> {
+    let costs = sg.slot_costs();
+    let nt = sg.network_type();
+    feasibility(
+        sg,
+        origin,
+        destination,
+        available_time,
+        &mut |e| sg.graph[e].travel_time(nt),
         |side, slot| match side {
             Side::Out => costs.out[slot],
             Side::In => costs.inc[slot],
@@ -292,7 +322,10 @@ pub fn build_feasibility_polygon(
         .feasible
         .iter()
         .filter(|(_, n)| n.slack >= min_slack)
-        .map(|(&idx, _)| node_to_latlon(graph, idx))
+        .map(|(&idx, _)| {
+            let node = &graph[idx];
+            geo::Point::new(node.lon, node.lat)
+        })
         .collect::<Vec<_>>()
         .into();
 
@@ -331,61 +364,49 @@ impl PrismGraph {
             .induced_subgraph(|node| self.result.feasible.contains_key(node))
     }
 
+    /// A route that stays within the prism.
     pub fn route(
         &self,
-        origin_lat: f64,
-        origin_lon: f64,
-        dest_lat: f64,
-        dest_lon: f64,
+        origin: impl Into<LatLon>,
+        destination: impl Into<LatLon>,
         max_snap_m: Option<f64>,
-    ) -> Result<crate::routing::Route, crate::error::OsmGraphError> {
-        self.materialize().route(
-            origin_lat,
-            origin_lon,
-            dest_lat,
-            dest_lon,
-            self.network_type,
-            max_snap_m,
-        )
+    ) -> Result<crate::routing::Route, OsmGraphError> {
+        self.materialize().route(origin, destination, max_snap_m)
     }
 
+    /// Isochrones computed within the prism.
     pub fn isochrones(
         &self,
-        lat: f64,
-        lon: f64,
-        time_limits: Vec<f64>,
+        origin: impl Into<LatLon>,
+        time_limits: &[f64],
         max_snap_m: Option<f64>,
-    ) -> Option<Vec<geo::Polygon>> {
+    ) -> Result<Vec<geo::MultiPolygon>, OsmGraphError> {
         self.materialize()
-            .isochrones(lat, lon, time_limits, self.network_type, max_snap_m)
+            .isochrones(origin, time_limits, max_snap_m)
     }
 }
 
 impl SpatialGraph {
-    /// Return the network-time prism between two coordinates.
+    /// Return the network-time prism between two points.
     ///
     /// The result is a lightweight graph view over every node `v` satisfying
     /// `origin -> v -> destination <= available_time`, with each node labeled
-    /// by inbound time, outbound time, and slack.
-    #[allow(clippy::too_many_arguments)]
+    /// by inbound time, outbound time, and slack. Errors with
+    /// [`OsmGraphError::Infeasible`] when the trip itself does not fit.
     pub fn prism(
         &self,
-        origin_lat: f64,
-        origin_lon: f64,
-        dest_lat: f64,
-        dest_lon: f64,
+        origin: impl Into<LatLon>,
+        destination: impl Into<LatLon>,
         available_time: f64,
-        network_type: NetworkType,
         max_snap_m: Option<f64>,
-    ) -> Option<Result<PrismGraph, InfeasibleReason>> {
-        let origin = self.nearest_node_within(origin_lat, origin_lon, max_snap_m)?;
-        let destination = self.nearest_node_within(dest_lat, dest_lon, max_snap_m)?;
-        let result = compute_feasibility(self, origin, destination, available_time, network_type);
-        Some(result.map(|result| PrismGraph {
+    ) -> Result<PrismGraph, OsmGraphError> {
+        let origin = self.snap_endpoint(origin.into(), Role::Origin, max_snap_m)?;
+        let destination = self.snap_endpoint(destination.into(), Role::Destination, max_snap_m)?;
+        let result = compute_feasibility(self, &origin, &destination, available_time)?;
+        Ok(PrismGraph {
             graph: self.clone(),
             result,
-            network_type,
-        }))
+        })
     }
 }
 
@@ -396,15 +417,16 @@ impl SpatialGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{create_graph, XmlNode, XmlNodeRef, XmlTag, XmlWay};
+    use crate::graph::{create_graph, OsmNode, OsmNodeRef, OsmTag, OsmWay};
     use crate::overpass::NetworkType;
+    use petgraph::graph::NodeIndex;
 
     // ------------------------------------------------------------------
     // Helpers
     // ------------------------------------------------------------------
 
-    fn node(id: i64, lat: f64, lon: f64) -> XmlNode {
-        XmlNode {
+    fn node(id: i64, lat: f64, lon: f64) -> OsmNode {
+        OsmNode {
             id,
             lat,
             lon,
@@ -412,14 +434,14 @@ mod tests {
         }
     }
 
-    fn way(node_ids: Vec<i64>) -> XmlWay {
-        XmlWay {
+    fn way(node_ids: Vec<i64>) -> OsmWay {
+        OsmWay {
             id: 1,
             nodes: node_ids
                 .into_iter()
-                .map(|id| XmlNodeRef { node_id: id })
+                .map(|id| OsmNodeRef { node_id: id })
                 .collect(),
-            tags: vec![XmlTag {
+            tags: vec![OsmTag {
                 key: "highway".into(),
                 value: "residential".into(),
             }],
@@ -434,12 +456,15 @@ mod tests {
             node(3, 0.002, 0.0),
             node(4, 0.003, 0.0),
         ];
-        SpatialGraph::new(create_graph(
-            nodes,
-            vec![way(vec![1, 2, 3, 4])],
-            /*retain_all=*/ true,
-            false,
-        ))
+        SpatialGraph::new(
+            create_graph(
+                nodes,
+                vec![way(vec![1, 2, 3, 4])],
+                /*retain_all=*/ true,
+                false,
+            ),
+            NetworkType::Drive,
+        )
     }
 
     fn find_node(g: &SpatialGraph, osm_id: i64) -> NodeIndex {
@@ -454,7 +479,7 @@ mod tests {
         dest: NodeIndex,
         budget: f64,
     ) -> FeasibilityResult {
-        compute_feasibility(g, origin, dest, budget, NetworkType::Drive)
+        compute_feasibility(g, &g.snap_to_node(origin), &g.snap_to_node(dest), budget)
             .expect("expected Ok but got Err")
     }
 
@@ -509,8 +534,7 @@ mod tests {
     fn prism_graph_view_exposes_induced_counts_and_slack_labels() {
         let sg = linear_graph();
         let prism = sg
-            .prism(0.0, 0.0, 0.003, 0.0, 10_000.0, NetworkType::Drive, None)
-            .expect("origin and destination should snap")
+            .prism((0.0, 0.0), (0.003, 0.0), 10_000.0, None)
             .expect("budget should be feasible");
 
         assert_eq!(prism.node_count(), 4);
@@ -574,8 +598,13 @@ mod tests {
         let direct_time = feasibility_ok(&g, origin, dest, 10_000.0).direct_time;
 
         // Budget just 1 second short of the direct trip.
-        let err = compute_feasibility(&g, origin, dest, direct_time - 1.0, NetworkType::Drive)
-            .expect_err("expected BudgetTooTight");
+        let err = compute_feasibility(
+            &g,
+            &g.snap_to_node(origin),
+            &g.snap_to_node(dest),
+            direct_time - 1.0,
+        )
+        .expect_err("expected BudgetTooTight");
 
         match err {
             InfeasibleReason::BudgetTooTight {
@@ -603,7 +632,7 @@ mod tests {
 
         let shortfall = 42.0;
         let budget = direct_time - shortfall;
-        let err = compute_feasibility(&g, origin, dest, budget, NetworkType::Drive)
+        let err = compute_feasibility(&g, &g.snap_to_node(origin), &g.snap_to_node(dest), budget)
             .expect_err("expected BudgetTooTight");
 
         if let InfeasibleReason::BudgetTooTight {
@@ -627,8 +656,13 @@ mod tests {
         let direct_time = feasibility_ok(&g, origin, dest, 10_000.0).direct_time;
 
         // Exactly at the boundary should succeed (≤, not <).
-        let result = compute_feasibility(&g, origin, dest, direct_time, NetworkType::Drive)
-            .expect("budget == direct_time should be Ok");
+        let result = compute_feasibility(
+            &g,
+            &g.snap_to_node(origin),
+            &g.snap_to_node(dest),
+            direct_time,
+        )
+        .expect("budget == direct_time should be Ok");
 
         assert!(result.feasible.contains_key(dest));
         assert!(result.feasible.contains_key(origin));
@@ -644,9 +678,9 @@ mod tests {
         let mut raw = RoadGraph::new();
         let a = raw.add_node(node(1, 0.0, 0.0));
         let b = raw.add_node(node(2, 1.0, 1.0));
-        let g = SpatialGraph::new(raw);
+        let g = SpatialGraph::new(raw, NetworkType::Drive);
 
-        let err = compute_feasibility(&g, a, b, 10_000.0, NetworkType::Drive)
+        let err = compute_feasibility(&g, &g.snap_to_node(a), &g.snap_to_node(b), 10_000.0)
             .expect_err("expected NoPathExists");
 
         assert_eq!(err, InfeasibleReason::NoPathExists);
@@ -690,11 +724,16 @@ mod tests {
         let origin = find_node(&g, 1);
         let dest = find_node(&g, 4);
 
-        let baseline = compute_feasibility(&g, origin, dest, 10_000.0, NetworkType::Drive)
-            .expect("baseline should be Ok");
-        let doubled = compute_feasibility_with(&g, origin, dest, 10_000.0, |e| {
-            e.weight.travel_time(NetworkType::Drive) * 2.0
-        })
+        let baseline =
+            compute_feasibility(&g, &g.snap_to_node(origin), &g.snap_to_node(dest), 10_000.0)
+                .expect("baseline should be Ok");
+        let doubled = compute_feasibility_with(
+            &g,
+            &g.snap_to_node(origin),
+            &g.snap_to_node(dest),
+            10_000.0,
+            |e| e.weight.travel_time(NetworkType::Drive) * 2.0,
+        )
         .expect("doubled should be Ok");
 
         for (node, base) in &baseline.feasible {
@@ -726,13 +765,19 @@ mod tests {
         // for "backward" edges. A symmetric cost would give the same in both
         // searches; an oriented cost would differ. Either way, the slack
         // identity must hold.
-        let result = compute_feasibility_with(&g, origin, dest, 10_000.0, |e| {
-            if e.source.index() < e.target.index() {
-                10.0
-            } else {
-                100.0
-            }
-        })
+        let result = compute_feasibility_with(
+            &g,
+            &g.snap_to_node(origin),
+            &g.snap_to_node(dest),
+            10_000.0,
+            |e| {
+                if e.source.index() < e.target.index() {
+                    10.0
+                } else {
+                    100.0
+                }
+            },
+        )
         .expect("should be Ok");
 
         for f in result.feasible.values() {
@@ -749,10 +794,15 @@ mod tests {
         let origin = find_node(&g, 1);
         let dest = find_node(&g, 4);
 
-        let a = compute_feasibility(&g, origin, dest, 10_000.0, NetworkType::Drive).unwrap();
-        let b = compute_feasibility_with(&g, origin, dest, 10_000.0, |e| {
-            e.weight.travel_time(NetworkType::Drive)
-        })
+        let a = compute_feasibility(&g, &g.snap_to_node(origin), &g.snap_to_node(dest), 10_000.0)
+            .unwrap();
+        let b = compute_feasibility_with(
+            &g,
+            &g.snap_to_node(origin),
+            &g.snap_to_node(dest),
+            10_000.0,
+            |e| e.weight.travel_time(NetworkType::Drive),
+        )
         .unwrap();
 
         assert_eq!(a.feasible.len(), b.feasible.len());

@@ -17,7 +17,7 @@ use rayon::prelude::*;
 
 use crate::error::OsmGraphError;
 use crate::filters::{is_poi_node, way_passes_road_filter};
-use crate::graph::{SpatialGraph, XmlData, XmlNode, XmlNodeRef, XmlTag, XmlWay};
+use crate::graph::{OsmData, OsmNode, OsmNodeRef, OsmTag, OsmWay, SpatialGraph};
 use crate::overpass::NetworkType;
 use crate::poi::Poi;
 
@@ -26,21 +26,20 @@ impl SpatialGraph {
     ///
     /// POIs are parsed separately from road-network nodes and pre-snapped onto
     /// the graph. Use [`read_pbf`] when you need access to the intermediate
-    /// [`XmlData`] or raw [`Poi`] list.
+    /// [`OsmData`] or raw [`Poi`] list.
     pub fn from_pbf(
         path: impl AsRef<Path>,
         network_type: NetworkType,
-        retain_all: Option<bool>,
+        retain_all: bool,
     ) -> Result<Self, OsmGraphError> {
         let (data, pois) = read_pbf(path, network_type)?;
-        let mut spatial_graph =
-            SpatialGraph::from_parsed_osm(data, network_type, retain_all.unwrap_or(false));
+        let mut spatial_graph = SpatialGraph::from_osm_data(data, network_type, retain_all);
         spatial_graph.snap_pois(&pois);
         Ok(spatial_graph)
     }
 }
 
-/// Read a PBF file once and produce one `XmlData` per requested network type,
+/// Read a PBF file once and produce one `OsmData` per requested network type,
 /// plus the POIs found in the extract (POIs are network-type-independent).
 ///
 /// This avoids re-reading the PBF for each network type -- useful at server
@@ -48,7 +47,7 @@ impl SpatialGraph {
 pub fn read_pbf_multi(
     path: impl AsRef<Path>,
     network_types: &[NetworkType],
-) -> Result<(HashMap<NetworkType, XmlData>, Vec<Poi>), OsmGraphError> {
+) -> Result<(HashMap<NetworkType, OsmData>, Vec<Poi>), OsmGraphError> {
     let scan = scan_pbf(path.as_ref(), network_types)?;
     let data = network_types
         .iter()
@@ -58,17 +57,17 @@ pub fn read_pbf_multi(
     Ok((data, scan.pois))
 }
 
-/// Read a PBF file and produce an `XmlData` (the canonical intermediate shape
+/// Read a PBF file and produce an `OsmData` (the canonical intermediate shape
 /// our graph builder consumes) plus the POIs found in the extract.
 ///
-/// `XmlData` holds only road-network nodes (nodes referenced by a way that
+/// `OsmData` holds only road-network nodes (nodes referenced by a way that
 /// passes the `network_type` road filter), sorted by id. POIs are returned
 /// separately as [`Poi`] values, also sorted by id, and can be snapped onto a
 /// [`crate::graph::SpatialGraph`] afterward.
 pub fn read_pbf(
     path: impl AsRef<Path>,
     network_type: NetworkType,
-) -> Result<(XmlData, Vec<Poi>), OsmGraphError> {
+) -> Result<(OsmData, Vec<Poi>), OsmGraphError> {
     let scan = scan_pbf(path.as_ref(), &[network_type])?;
     Ok((scan.xml_data(&scan.roads[0]), scan.pois))
 }
@@ -205,7 +204,7 @@ fn scan_block(block: &PrimitiveBlock, network_types: &[NetworkType]) -> PbfScan 
 
 impl PbfScan {
     /// Assemble the road nodes and ways for one network type's road list.
-    fn xml_data(&self, roads: &[RawWay]) -> XmlData {
+    fn xml_data(&self, roads: &[RawWay]) -> OsmData {
         let mut needed: Vec<i64> = roads.iter().flat_map(|w| w.refs.iter().copied()).collect();
         needed.sort_unstable();
         needed.dedup();
@@ -223,30 +222,30 @@ impl PbfScan {
                     .next_if(|(tag_id, _)| *tag_id == id)
                     .map(|(_, tags)| to_xml_tags(tags))
                     .unwrap_or_default();
-                Some(XmlNode { id, lat, lon, tags })
+                Some(OsmNode { id, lat, lon, tags })
             })
             .collect();
 
         let ways = roads
             .iter()
-            .map(|way| XmlWay {
+            .map(|way| OsmWay {
                 id: way.id,
                 nodes: way
                     .refs
                     .iter()
-                    .map(|&node_id| XmlNodeRef { node_id })
+                    .map(|&node_id| OsmNodeRef { node_id })
                     .collect(),
                 tags: to_xml_tags(&way.tags),
             })
             .collect();
 
-        XmlData { nodes, ways }
+        OsmData { nodes, ways }
     }
 }
 
-fn to_xml_tags(tags: &[(String, String)]) -> Vec<XmlTag> {
+fn to_xml_tags(tags: &[(String, String)]) -> Vec<OsmTag> {
     tags.iter()
-        .map(|(key, value)| XmlTag {
+        .map(|(key, value)| OsmTag {
             key: key.clone(),
             value: value.clone(),
         })
@@ -270,7 +269,7 @@ mod tests {
         ids
     }
 
-    fn way_tag_value(way: &XmlWay, key: &str) -> Option<String> {
+    fn way_tag_value(way: &OsmWay, key: &str) -> Option<String> {
         way.tags
             .iter()
             .find(|tag| tag.key == key)

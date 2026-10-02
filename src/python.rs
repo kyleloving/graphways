@@ -1,5 +1,8 @@
 //! Python bindings, compiled only with the `extension-module` feature
 //! (maturin enables it when building the wheel).
+//!
+//! Every call that does real work (loading, routing, searches, GeoJSON
+//! export) releases the GIL, so threaded Python servers stay responsive.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,11 +11,12 @@ use std::sync::OnceLock;
 use geojson::{Feature, JsonObject};
 use petgraph::graph::{EdgeReference, NodeIndex};
 use petgraph::visit::EdgeRef;
-use pyo3::exceptions::{PyLookupError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict, PyList};
+use pyo3::types::{PyDict, PyList};
 
-use crate::graph::{Edge, NodeMap, SnapResult, SpatialGraph, XmlNode};
+use crate::error::OsmGraphError;
+use crate::graph::{Edge, NodeMap, OsmNode, SnapResult, SpatialGraph};
 use crate::overpass::NetworkType;
 use crate::{cache, feasibility, geocoding, isochrone, poi, reachability, routing, utils};
 
@@ -40,22 +44,32 @@ fn parse_network_type(s: &str) -> PyResult<NetworkType> {
     }
 }
 
-fn no_origin_node() -> PyErr {
-    PyValueError::new_err("No graph node found within max_snap_m of the origin coordinates")
+/// Snapping failures for area queries (isochrones, reachability, prisms)
+/// surface as `ValueError`, as they always have; routes keep `LookupError`.
+fn snap_as_value_error(e: OsmGraphError) -> PyErr {
+    match e {
+        OsmGraphError::OriginNodeNotFound
+        | OsmGraphError::DestinationNodeNotFound
+        | OsmGraphError::SnapDistanceExceeded { .. } => PyValueError::new_err(e.to_string()),
+        other => other.into(),
+    }
 }
 
-/// Convert minute budgets to seconds, run `compute`, and pair each polygon
-/// with the limit it was requested for.
+/// Convert minute budgets to seconds, run `compute`, and pair each area with
+/// the limit it was requested for.
 fn isochrone_results(
+    py: Python<'_>,
     minutes: Vec<f64>,
-    compute: impl FnOnce(Vec<f64>) -> Option<Vec<geo::Polygon>>,
+    compute: impl FnOnce(&[f64]) -> Result<Vec<geo::MultiPolygon>, OsmGraphError> + Send,
 ) -> PyResult<Vec<PyIsochroneResult>> {
-    let time_limits = minutes.iter().map(|m| m * 60.0).collect();
-    let polygons = compute(time_limits).ok_or_else(no_origin_node)?;
+    let limits: Vec<f64> = minutes.iter().map(|m| m * 60.0).collect();
+    let areas = py
+        .detach(|| compute(&limits))
+        .map_err(snap_as_value_error)?;
     Ok(minutes
         .into_iter()
-        .zip(polygons)
-        .map(|(minutes, polygon)| PyIsochroneResult { minutes, polygon })
+        .zip(areas)
+        .map(|(minutes, area)| PyIsochroneResult { minutes, area })
         .collect())
 }
 
@@ -91,6 +105,19 @@ fn labeled_edges<'a, L>(
     })
 }
 
+/// Parse a GeoJSON string into a Python object (dict), for `__geo_interface__`.
+fn json_to_python<'py>(py: Python<'py>, json: &str) -> PyResult<Bound<'py, PyAny>> {
+    py.import("json")?.call_method1("loads", (json,))
+}
+
+/// `shapely.geometry.shape(obj)`, with a clear message if shapely is missing.
+fn to_shapely<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    let geometry = obj.py().import("shapely.geometry").map_err(|_| {
+        pyo3::exceptions::PyImportError::new_err("to_shapely() needs shapely: pip install shapely")
+    })?;
+    geometry.call_method1("shape", (obj.getattr("__geo_interface__")?,))
+}
+
 // ---------------------------------------------------------------------------
 // GeoJSON helpers
 // ---------------------------------------------------------------------------
@@ -119,7 +146,7 @@ fn feature_collection(features: impl IntoIterator<Item = Feature>) -> String {
     .to_string()
 }
 
-fn point(node: &XmlNode) -> geojson::Value {
+fn point(node: &OsmNode) -> geojson::Value {
     geojson::Value::Point(vec![node.lon, node.lat])
 }
 
@@ -154,6 +181,8 @@ fn snap_json(snap: SnapResult) -> geojson::JsonValue {
     geojson::JsonValue::Object(props([
         ("input_lat", snap.input_lat.into()),
         ("input_lon", snap.input_lon.into()),
+        ("snapped_lat", snap.snapped_lat.into()),
+        ("snapped_lon", snap.snapped_lon.into()),
         ("node_id", snap.node_id.into()),
         ("node_lat", snap.node_lat.into()),
         ("node_lon", snap.node_lon.into()),
@@ -180,10 +209,12 @@ fn route_to_geojson(r: &routing::Route) -> String {
     geojson::GeoJson::Feature(feature(geojson::Value::LineString(coords), properties)).to_string()
 }
 
-fn snap_to_dict(py: Python<'_>, snap: SnapResult) -> PyResult<&PyDict> {
+fn snap_to_dict(py: Python<'_>, snap: SnapResult) -> PyResult<Bound<'_, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("input_lat", snap.input_lat)?;
     dict.set_item("input_lon", snap.input_lon)?;
+    dict.set_item("snapped_lat", snap.snapped_lat)?;
+    dict.set_item("snapped_lon", snap.snapped_lon)?;
     dict.set_item("node_id", snap.node_id)?;
     dict.set_item("node_lat", snap.node_lat)?;
     dict.set_item("node_lon", snap.node_lon)?;
@@ -195,7 +226,8 @@ fn snap_to_dict(py: Python<'_>, snap: SnapResult) -> PyResult<&PyDict> {
 // Result classes
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "SnapResult")]
+/// Where a coordinate landed on the road network.
+#[pyclass(name = "SnapResult", frozen, skip_from_py_object)]
 #[derive(Clone, Copy)]
 struct PySnapResult {
     snap: SnapResult,
@@ -213,6 +245,19 @@ impl PySnapResult {
         self.snap.input_lon
     }
 
+    /// Latitude of the point on the road the input snapped to.
+    #[getter]
+    fn snapped_lat(&self) -> f64 {
+        self.snap.snapped_lat
+    }
+
+    /// Longitude of the point on the road the input snapped to.
+    #[getter]
+    fn snapped_lon(&self) -> f64 {
+        self.snap.snapped_lon
+    }
+
+    /// OSM id of the nearest end of the road segment snapped to.
     #[getter]
     fn node_id(&self) -> i64 {
         self.snap.node_id
@@ -228,12 +273,13 @@ impl PySnapResult {
         self.snap.node_lon
     }
 
+    /// Distance in metres from the input to the road.
     #[getter]
     fn distance_m(&self) -> f64 {
         self.snap.distance_m
     }
 
-    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<&'py PyDict> {
+    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         snap_to_dict(py, self.snap)
     }
 
@@ -245,7 +291,7 @@ impl PySnapResult {
     }
 }
 
-#[pyclass(name = "RouteResult")]
+#[pyclass(name = "RouteResult", frozen, skip_from_py_object)]
 #[derive(Clone)]
 struct PyRouteResult {
     route: routing::Route,
@@ -291,10 +337,22 @@ impl PyRouteResult {
         route_to_geojson(&self.route)
     }
 
-    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<&'py PyDict> {
+    /// GeoJSON Feature as a dict; lets shapely, geopandas and others
+    /// consume the route directly.
+    #[getter]
+    fn __geo_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        json_to_python(py, &self.to_geojson())
+    }
+
+    /// The route as a shapely LineString (requires shapely).
+    fn to_shapely<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        to_shapely(slf.as_any())
+    }
+
+    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
-        dict.set_item("coordinates", &self.route.coordinates)?;
-        dict.set_item("cumulative_times_s", &self.route.cumulative_times_s)?;
+        dict.set_item("coordinates", self.route.coordinates.clone())?;
+        dict.set_item("cumulative_times_s", self.route.cumulative_times_s.clone())?;
         dict.set_item("distance_m", self.route.distance_m)?;
         dict.set_item("duration_s", self.route.duration_s)?;
         dict.set_item("origin_snap", snap_to_dict(py, self.route.origin_snap)?)?;
@@ -315,11 +373,11 @@ impl PyRouteResult {
     }
 }
 
-#[pyclass(name = "IsochroneResult")]
+#[pyclass(name = "IsochroneResult", frozen, skip_from_py_object)]
 #[derive(Clone)]
 struct PyIsochroneResult {
     minutes: f64,
-    polygon: geo::Polygon<f64>,
+    area: geo::MultiPolygon<f64>,
 }
 
 #[pymethods]
@@ -329,32 +387,48 @@ impl PyIsochroneResult {
         self.minutes
     }
 
-    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<&'py PyDict> {
+    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         dict.set_item("minutes", self.minutes)?;
         dict.set_item("geojson", self.to_geojson())?;
         Ok(dict)
     }
 
+    /// GeoJSON MultiPolygon geometry: one or more parts, each possibly with
+    /// holes where nothing is reachable in time.
     fn to_geojson(&self) -> String {
-        utils::polygon_to_geojson_string(&self.polygon)
+        utils::multipolygon_to_geojson_string(&self.area)
+    }
+
+    #[getter]
+    fn __geo_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        json_to_python(py, &self.to_geojson())
+    }
+
+    /// The area as a shapely MultiPolygon (requires shapely).
+    fn to_shapely<'py>(slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
+        to_shapely(slf.as_any())
     }
 
     fn __repr__(&self) -> String {
-        format!("IsochroneResult(minutes={:.1})", self.minutes)
+        format!(
+            "IsochroneResult(minutes={:.1}, parts={})",
+            self.minutes,
+            self.area.0.len()
+        )
     }
 }
 
-fn poi_to_dict<'py>(py: Python<'py>, poi: &poi::Poi) -> PyResult<&'py PyDict> {
+fn poi_to_dict<'py>(py: Python<'py>, poi: &poi::Poi) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("id", poi.id)?;
     dict.set_item("lat", poi.lat)?;
     dict.set_item("lon", poi.lon)?;
-    dict.set_item("tags", &poi.tags)?;
+    dict.set_item("tags", poi.tags.clone())?;
     Ok(dict)
 }
 
-#[pyclass(name = "Poi")]
+#[pyclass(name = "Poi", frozen, skip_from_py_object)]
 #[derive(Clone)]
 struct PyPoi {
     poi: poi::Poi,
@@ -382,7 +456,7 @@ impl PyPoi {
         self.poi.tags.clone()
     }
 
-    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<&'py PyDict> {
+    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         poi_to_dict(py, &self.poi)
     }
 
@@ -392,7 +466,7 @@ impl PyPoi {
     }
 }
 
-#[pyclass(name = "PoiCollection")]
+#[pyclass(name = "PoiCollection", frozen, skip_from_py_object)]
 #[derive(Clone)]
 struct PyPoiCollection {
     pois: Vec<poi::Poi>,
@@ -414,7 +488,12 @@ impl PyPoiCollection {
         poi::pois_to_geojson(&self.pois)
     }
 
-    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<&'py PyDict> {
+    #[getter]
+    fn __geo_interface__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        json_to_python(py, &self.to_geojson())
+    }
+
+    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
         let items = PyList::empty(py);
         for poi in &self.pois {
@@ -442,19 +521,17 @@ impl PyPoiCollection {
 ///
 /// Construct one with `SpatialGraph.from_place(...)`, `SpatialGraph.from_pbf(...)`,
 /// or `SpatialGraph.from_osm(...)`, then reuse it for queries over the same area.
-#[pyclass(name = "SpatialGraph")]
+#[pyclass(name = "SpatialGraph", frozen, skip_from_py_object)]
 struct PyGraph {
     sg: SpatialGraph,
-    network_type: NetworkType,
     routing_requested: AtomicBool,
 }
 
 impl PyGraph {
-    fn new(sg: SpatialGraph, network_type: NetworkType) -> Self {
+    fn new(sg: SpatialGraph) -> Self {
         Self {
+            routing_requested: AtomicBool::new(sg.is_routing_prepared()),
             sg,
-            network_type,
-            routing_requested: AtomicBool::new(false),
         }
     }
 
@@ -462,8 +539,8 @@ impl PyGraph {
     /// Routes are answered with A* until it is ready, so no call waits on it.
     fn prepare_routing_in_background(&self) {
         if !self.routing_requested.swap(true, Ordering::Relaxed) {
-            let (sg, network_type) = (self.sg.clone(), self.network_type);
-            std::thread::spawn(move || sg.prepare_routing(network_type));
+            let sg = self.sg.clone();
+            std::thread::spawn(move || sg.prepare_routing());
         }
     }
 }
@@ -472,40 +549,45 @@ impl PyGraph {
 impl PyGraph {
     #[staticmethod]
     #[pyo3(signature = (path, network, retain_all = false))]
-    fn from_pbf(path: String, network: String, retain_all: bool) -> PyResult<Self> {
+    fn from_pbf(py: Python<'_>, path: String, network: String, retain_all: bool) -> PyResult<Self> {
         let network_type = parse_network_type(&network)?;
-        let sg = SpatialGraph::from_pbf(path, network_type, Some(retain_all))?;
-        Ok(Self::new(sg, network_type))
+        let sg = py.detach(|| SpatialGraph::from_pbf(path, network_type, retain_all))?;
+        Ok(Self::new(sg))
     }
 
     #[staticmethod]
     #[pyo3(signature = (xml, network, retain_all = false))]
-    fn from_osm(xml: String, network: String, retain_all: bool) -> PyResult<Self> {
+    fn from_osm(py: Python<'_>, xml: String, network: String, retain_all: bool) -> PyResult<Self> {
         let network_type = parse_network_type(&network)?;
-        let sg = SpatialGraph::from_osm(&xml, network_type, Some(retain_all))
+        let sg = py
+            .detach(|| SpatialGraph::from_osm(&xml, network_type, retain_all))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(Self::new(sg, network_type))
+        Ok(Self::new(sg))
     }
 
     #[staticmethod]
     #[pyo3(signature = (place, network, max_dist = None, retain_all = false))]
     fn from_place(
+        py: Python<'_>,
         place: String,
         network: String,
         max_dist: Option<f64>,
         retain_all: bool,
     ) -> PyResult<Self> {
         let network_type = parse_network_type(&network)?;
-        let (lat, lon) = tokio_rt().block_on(geocoding::geocode(&place))?;
-        let (_, sg) = tokio_rt().block_on(isochrone::calculate_isochrones_from_point(
-            lat,
-            lon,
-            Some(max_dist.unwrap_or(5_000.0)),
-            vec![],
-            network_type,
-            retain_all,
-        ))?;
-        Ok(Self::new(sg, network_type))
+        let sg = py.detach(|| -> Result<SpatialGraph, OsmGraphError> {
+            let (lat, lon) = tokio_rt().block_on(geocoding::geocode(&place))?;
+            let (_, sg) = tokio_rt().block_on(isochrone::calculate_isochrones_from_point(
+                lat,
+                lon,
+                Some(max_dist.unwrap_or(5_000.0)),
+                vec![],
+                network_type,
+                retain_all,
+            ))?;
+            Ok(sg)
+        })?;
+        Ok(Self::new(sg))
     }
 
     fn node_count(&self) -> usize {
@@ -517,44 +599,45 @@ impl PyGraph {
     }
 
     fn nearest_node(&self, lat: f64, lon: f64) -> Option<(i64, f64, f64)> {
-        self.sg.nearest_node(lat, lon).map(|idx| {
+        self.sg.nearest_node((lat, lon)).map(|idx| {
             let n = &self.sg.graph[idx];
             (n.id, n.lat, n.lon)
         })
     }
 
+    /// Snap a coordinate to the nearest point on any road.
     fn snap_point(&self, lat: f64, lon: f64) -> Option<PySnapResult> {
         self.sg
-            .snap_point(lat, lon)
+            .snap_point((lat, lon))
             .map(|snap| PySnapResult { snap })
     }
 
     #[pyo3(signature = (origin, minutes, max_snap_m = Some(100.0)))]
     fn isochrone(
         &self,
+        py: Python<'_>,
         origin: (f64, f64),
         minutes: Vec<f64>,
         max_snap_m: Option<f64>,
     ) -> PyResult<Vec<PyIsochroneResult>> {
-        isochrone_results(minutes, |limits| {
-            self.sg
-                .isochrones(origin.0, origin.1, limits, self.network_type, max_snap_m)
+        isochrone_results(py, minutes, |limits| {
+            self.sg.isochrones(origin, limits, max_snap_m)
         })
     }
 
-    /// Build the routing index for this graph's mode now and wait for it.
+    /// Build the routing index now and wait for it.
     ///
     /// Optional: the first `route()` call starts the same build in the
     /// background and routes with A* meanwhile. Call this when you want
     /// every route to get the fast path from the start.
     fn prepare_routing(&self, py: Python<'_>) {
         self.routing_requested.store(true, Ordering::Relaxed);
-        py.allow_threads(|| self.sg.prepare_routing(self.network_type));
+        py.detach(|| self.sg.prepare_routing());
     }
 
     /// Whether the routing index is built (see `prepare_routing`).
     fn is_routing_prepared(&self) -> bool {
-        self.sg.is_routing_prepared(self.network_type)
+        self.sg.is_routing_prepared()
     }
 
     #[pyo3(signature = (origin, destination, max_snap_m = Some(100.0)))]
@@ -566,51 +649,40 @@ impl PyGraph {
         max_snap_m: Option<f64>,
     ) -> PyResult<PyRouteResult> {
         self.prepare_routing_in_background();
-        let route = py.allow_threads(|| {
-            self.sg.route(
-                origin.0,
-                origin.1,
-                destination.0,
-                destination.1,
-                self.network_type,
-                max_snap_m,
-            )
-        })?;
+        let route = py.detach(|| self.sg.route(origin, destination, max_snap_m))?;
         Ok(PyRouteResult { route })
     }
 
-    fn fetch_pois(&self, isochrone: &PyAny) -> PyResult<PyPoiCollection> {
-        let isochrone_geojson = if let Ok(s) = isochrone.extract::<String>() {
+    fn fetch_pois(
+        &self,
+        py: Python<'_>,
+        isochrone: &Bound<'_, PyAny>,
+    ) -> PyResult<PyPoiCollection> {
+        let geojson = if let Ok(s) = isochrone.extract::<String>() {
             s
-        } else if let Ok(iso) = isochrone.extract::<PyRef<PyIsochroneResult>>() {
-            iso.to_geojson()
+        } else if let Ok(iso) = isochrone.cast::<PyIsochroneResult>() {
+            iso.get().to_geojson()
         } else {
             return Err(PyTypeError::new_err(
                 "fetch_pois expects an IsochroneResult or GeoJSON string",
             ));
         };
-        let polygon = poi::parse_isochrone(&isochrone_geojson)?;
-        let pois = tokio_rt().block_on(poi::fetch_pois_within(&polygon))?;
+        let area = poi::parse_area(&geojson)?;
+        let pois = py.detach(|| tokio_rt().block_on(poi::fetch_pois_within(&area)))?;
         Ok(PyPoiCollection { pois })
     }
 
     #[pyo3(signature = (origin, minutes, max_snap_m = Some(100.0)))]
     fn reachable(
         &self,
+        py: Python<'_>,
         origin: (f64, f64),
         minutes: f64,
         max_snap_m: Option<f64>,
     ) -> PyResult<PyReachableGraph> {
-        let inner = self
-            .sg
-            .reachable_graph(
-                origin.0,
-                origin.1,
-                minutes * 60.0,
-                self.network_type,
-                max_snap_m,
-            )
-            .ok_or_else(no_origin_node)?;
+        let inner = py
+            .detach(|| self.sg.reachable_graph(origin, minutes * 60.0, max_snap_m))
+            .map_err(snap_as_value_error)?;
         Ok(PyReachableGraph { inner })
     }
 
@@ -622,8 +694,10 @@ impl PyGraph {
         buffer_minutes = 0.0,
         max_snap_m = Some(100.0),
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn prism(
         &self,
+        py: Python<'_>,
         origin: (f64, f64),
         destination: (f64, f64),
         max_minutes: f64,
@@ -641,29 +715,12 @@ impl PyGraph {
             ));
         }
 
-        let inner = self
-            .sg
-            .prism(
-                origin.0,
-                origin.1,
-                destination.0,
-                destination.1,
-                traversal_budget,
-                self.network_type,
-                max_snap_m,
-            )
-            .ok_or_else(|| {
-                PyValueError::new_err("No node found near the origin or destination coordinates")
-            })?
-            .map_err(|e| match e {
-                feasibility::InfeasibleReason::BudgetTooTight { .. } => {
-                    PyValueError::new_err(e.to_string())
-                }
-                feasibility::InfeasibleReason::NoPathExists => {
-                    PyLookupError::new_err(e.to_string())
-                }
-            })?;
-
+        let inner = py
+            .detach(|| {
+                self.sg
+                    .prism(origin, destination, traversal_budget, max_snap_m)
+            })
+            .map_err(snap_as_value_error)?;
         Ok(PyPrismGraph {
             inner,
             max_time_s,
@@ -672,26 +729,30 @@ impl PyGraph {
         })
     }
 
-    fn nodes_geojson(&self) -> String {
-        feature_collection(self.sg.graph.node_weights().map(|n| {
-            feature(
-                point(n),
-                props([
-                    ("id", n.id.into()),
-                    ("lat", n.lat.into()),
-                    ("lon", n.lon.into()),
-                ]),
-            )
-        }))
+    fn nodes_geojson(&self, py: Python<'_>) -> String {
+        py.detach(|| {
+            feature_collection(self.sg.graph.node_weights().map(|n| {
+                feature(
+                    point(n),
+                    props([
+                        ("id", n.id.into()),
+                        ("lat", n.lat.into()),
+                        ("lon", n.lon.into()),
+                    ]),
+                )
+            }))
+        })
     }
 
-    fn edges_geojson(&self) -> String {
-        feature_collection(
-            self.sg
-                .graph
-                .edge_references()
-                .map(|edge| feature(edge_line(&self.sg, edge), edge_properties(edge.weight()))),
-        )
+    fn edges_geojson(&self, py: Python<'_>) -> String {
+        py.detach(|| {
+            feature_collection(
+                self.sg
+                    .graph
+                    .edge_references()
+                    .map(|edge| feature(edge_line(&self.sg, edge), edge_properties(edge.weight()))),
+            )
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -699,7 +760,7 @@ impl PyGraph {
             "SpatialGraph(nodes={}, edges={}, network_type={:?})",
             self.sg.graph.node_count(),
             self.sg.graph.edge_count(),
-            self.network_type,
+            self.sg.network_type(),
         )
     }
 }
@@ -708,7 +769,7 @@ impl PyGraph {
 // ReachableGraph
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "ReachableGraph")]
+#[pyclass(name = "ReachableGraph", frozen, skip_from_py_object)]
 struct PyReachableGraph {
     inner: reachability::ReachableGraph,
 }
@@ -752,7 +813,7 @@ impl PyReachableGraph {
         self.inner.travel_time_to_node_id(node_id)
     }
 
-    fn nodes<'py>(&self, py: Python<'py>) -> PyResult<&'py PyList> {
+    fn nodes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let items = PyList::empty(py);
         for (&idx, &travel_time_s) in self.times() {
             let node = &self.sg().graph[idx];
@@ -766,86 +827,91 @@ impl PyReachableGraph {
         Ok(items)
     }
 
-    fn nodes_geojson(&self) -> String {
-        feature_collection(self.times().iter().map(|(&idx, &travel_time_s)| {
-            let node = &self.sg().graph[idx];
-            feature(
-                point(node),
-                props([
-                    ("node_id", node.id.into()),
-                    ("lat", node.lat.into()),
-                    ("lon", node.lon.into()),
-                    ("travel_time_s", travel_time_s.into()),
-                ]),
-            )
-        }))
-    }
-
-    fn edges_geojson(&self) -> String {
-        feature_collection(labeled_edges(self.sg(), self.times()).map(
-            |(edge, &source_time, &target_time)| {
-                let mut properties = edge_properties(edge.weight());
-                properties.extend(endpoint_ids(self.sg(), edge));
-                properties.insert("source_time_s".into(), source_time.into());
-                properties.insert("target_time_s".into(), target_time.into());
-                feature(edge_line(self.sg(), edge), properties)
-            },
-        ))
-    }
-
-    fn to_geojson(&self) -> String {
-        let nodes = self.times().iter().map(|(&idx, &travel_time_s)| {
-            let node = &self.sg().graph[idx];
-            feature(
-                point(node),
-                props([
-                    ("kind", "node".into()),
-                    ("node_id", node.id.into()),
-                    ("travel_time_s", travel_time_s.into()),
-                ]),
-            )
-        });
-        let edges =
-            labeled_edges(self.sg(), self.times()).map(|(edge, &source_time, &target_time)| {
+    fn nodes_geojson(&self, py: Python<'_>) -> String {
+        py.detach(|| {
+            feature_collection(self.times().iter().map(|(&idx, &travel_time_s)| {
+                let node = &self.sg().graph[idx];
                 feature(
-                    edge_line(self.sg(), edge),
+                    point(node),
                     props([
-                        ("kind", "edge".into()),
-                        ("source_time_s", source_time.into()),
-                        ("target_time_s", target_time.into()),
-                        ("length_m", edge.weight().length.into()),
-                    ])
-                    .into_iter()
-                    .chain(endpoint_ids(self.sg(), edge))
-                    .collect(),
+                        ("node_id", node.id.into()),
+                        ("lat", node.lat.into()),
+                        ("lon", node.lon.into()),
+                        ("travel_time_s", travel_time_s.into()),
+                    ]),
+                )
+            }))
+        })
+    }
+
+    fn edges_geojson(&self, py: Python<'_>) -> String {
+        py.detach(|| {
+            feature_collection(labeled_edges(self.sg(), self.times()).map(
+                |(edge, &source_time, &target_time)| {
+                    let mut properties = edge_properties(edge.weight());
+                    properties.extend(endpoint_ids(self.sg(), edge));
+                    properties.insert("source_time_s".into(), source_time.into());
+                    properties.insert("target_time_s".into(), target_time.into());
+                    feature(edge_line(self.sg(), edge), properties)
+                },
+            ))
+        })
+    }
+
+    fn to_geojson(&self, py: Python<'_>) -> String {
+        py.detach(|| {
+            let nodes = self.times().iter().map(|(&idx, &travel_time_s)| {
+                let node = &self.sg().graph[idx];
+                feature(
+                    point(node),
+                    props([
+                        ("kind", "node".into()),
+                        ("node_id", node.id.into()),
+                        ("travel_time_s", travel_time_s.into()),
+                    ]),
                 )
             });
-        feature_collection(nodes.chain(edges))
+            let edges =
+                labeled_edges(self.sg(), self.times()).map(|(edge, &source_time, &target_time)| {
+                    feature(
+                        edge_line(self.sg(), edge),
+                        props([
+                            ("kind", "edge".into()),
+                            ("source_time_s", source_time.into()),
+                            ("target_time_s", target_time.into()),
+                            ("length_m", edge.weight().length.into()),
+                        ])
+                        .into_iter()
+                        .chain(endpoint_ids(self.sg(), edge))
+                        .collect(),
+                    )
+                });
+            feature_collection(nodes.chain(edges))
+        })
     }
 
     #[pyo3(signature = (origin, minutes, max_snap_m = Some(100.0)))]
     fn isochrone(
         &self,
+        py: Python<'_>,
         origin: (f64, f64),
         minutes: Vec<f64>,
         max_snap_m: Option<f64>,
     ) -> PyResult<Vec<PyIsochroneResult>> {
-        isochrone_results(minutes, |limits| {
-            self.inner
-                .isochrones(origin.0, origin.1, limits, max_snap_m)
+        isochrone_results(py, minutes, |limits| {
+            self.inner.isochrones(origin, limits, max_snap_m)
         })
     }
 
     #[pyo3(signature = (origin, destination, max_snap_m = Some(100.0)))]
     fn route(
         &self,
+        py: Python<'_>,
         origin: (f64, f64),
         destination: (f64, f64),
         max_snap_m: Option<f64>,
     ) -> PyResult<PyRouteResult> {
-        let route =
-            self.inner
-                .route(origin.0, origin.1, destination.0, destination.1, max_snap_m)?;
+        let route = py.detach(|| self.inner.route(origin, destination, max_snap_m))?;
         Ok(PyRouteResult { route })
     }
 
@@ -863,7 +929,7 @@ impl PyReachableGraph {
 // PrismGraph
 // ---------------------------------------------------------------------------
 
-#[pyclass(name = "PrismGraph")]
+#[pyclass(name = "PrismGraph", frozen, skip_from_py_object)]
 struct PyPrismGraph {
     inner: feasibility::PrismGraph,
     max_time_s: f64,
@@ -928,7 +994,7 @@ impl PyPrismGraph {
         self.inner.slack_at_node_id(node_id)
     }
 
-    fn nodes<'py>(&self, py: Python<'py>) -> PyResult<&'py PyList> {
+    fn nodes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let items = PyList::empty(py);
         for (&idx, reach) in self.feasible() {
             let node = &self.sg().graph[idx];
@@ -944,64 +1010,70 @@ impl PyPrismGraph {
         Ok(items)
     }
 
-    fn nodes_geojson(&self) -> String {
-        feature_collection(self.feasible().iter().map(|(&idx, reach)| {
-            let node = &self.sg().graph[idx];
-            feature(
-                point(node),
-                props([
-                    ("node_id", node.id.into()),
-                    ("lat", node.lat.into()),
-                    ("lon", node.lon.into()),
-                    ("inbound_time_s", reach.inbound_time.into()),
-                    ("outbound_time_s", reach.outbound_time.into()),
-                    ("slack_s", reach.slack.into()),
-                ]),
-            )
-        }))
+    fn nodes_geojson(&self, py: Python<'_>) -> String {
+        py.detach(|| {
+            feature_collection(self.feasible().iter().map(|(&idx, reach)| {
+                let node = &self.sg().graph[idx];
+                feature(
+                    point(node),
+                    props([
+                        ("node_id", node.id.into()),
+                        ("lat", node.lat.into()),
+                        ("lon", node.lon.into()),
+                        ("inbound_time_s", reach.inbound_time.into()),
+                        ("outbound_time_s", reach.outbound_time.into()),
+                        ("slack_s", reach.slack.into()),
+                    ]),
+                )
+            }))
+        })
     }
 
-    fn edges_geojson(&self) -> String {
-        feature_collection(labeled_edges(self.sg(), self.feasible()).map(
-            |(edge, source, target)| {
-                let mut properties = edge_properties(edge.weight());
-                properties.extend(endpoint_ids(self.sg(), edge));
-                properties.insert("source_slack_s".into(), source.slack.into());
-                properties.insert("target_slack_s".into(), target.slack.into());
-                feature(edge_line(self.sg(), edge), properties)
-            },
-        ))
+    fn edges_geojson(&self, py: Python<'_>) -> String {
+        py.detach(|| {
+            feature_collection(labeled_edges(self.sg(), self.feasible()).map(
+                |(edge, source, target)| {
+                    let mut properties = edge_properties(edge.weight());
+                    properties.extend(endpoint_ids(self.sg(), edge));
+                    properties.insert("source_slack_s".into(), source.slack.into());
+                    properties.insert("target_slack_s".into(), target.slack.into());
+                    feature(edge_line(self.sg(), edge), properties)
+                },
+            ))
+        })
     }
 
-    fn to_geojson(&self) -> String {
-        let nodes = self.feasible().iter().map(|(&idx, reach)| {
-            let node = &self.sg().graph[idx];
-            feature(
-                point(node),
-                props([
-                    ("kind", "node".into()),
-                    ("node_id", node.id.into()),
-                    ("inbound_time_s", reach.inbound_time.into()),
-                    ("outbound_time_s", reach.outbound_time.into()),
-                    ("slack_s", reach.slack.into()),
-                ]),
-            )
-        });
-        let edges = labeled_edges(self.sg(), self.feasible()).map(|(edge, source, target)| {
-            feature(
-                edge_line(self.sg(), edge),
-                props([
-                    ("kind", "edge".into()),
-                    ("source_slack_s", source.slack.into()),
-                    ("target_slack_s", target.slack.into()),
-                    ("length_m", edge.weight().length.into()),
-                ])
-                .into_iter()
-                .chain(endpoint_ids(self.sg(), edge))
-                .collect(),
-            )
-        });
-        feature_collection(nodes.chain(edges))
+    fn to_geojson(&self, py: Python<'_>) -> String {
+        py.detach(|| {
+            let nodes = self.feasible().iter().map(|(&idx, reach)| {
+                let node = &self.sg().graph[idx];
+                feature(
+                    point(node),
+                    props([
+                        ("kind", "node".into()),
+                        ("node_id", node.id.into()),
+                        ("inbound_time_s", reach.inbound_time.into()),
+                        ("outbound_time_s", reach.outbound_time.into()),
+                        ("slack_s", reach.slack.into()),
+                    ]),
+                )
+            });
+            let edges = labeled_edges(self.sg(), self.feasible()).map(|(edge, source, target)| {
+                feature(
+                    edge_line(self.sg(), edge),
+                    props([
+                        ("kind", "edge".into()),
+                        ("source_slack_s", source.slack.into()),
+                        ("target_slack_s", target.slack.into()),
+                        ("length_m", edge.weight().length.into()),
+                    ])
+                    .into_iter()
+                    .chain(endpoint_ids(self.sg(), edge))
+                    .collect(),
+                )
+            });
+            feature_collection(nodes.chain(edges))
+        })
     }
 
     #[pyo3(signature = (min_slack_s = 0.0))]
@@ -1020,26 +1092,25 @@ impl PyPrismGraph {
     #[pyo3(signature = (origin, minutes, max_snap_m = Some(100.0)))]
     fn isochrone(
         &self,
+        py: Python<'_>,
         origin: (f64, f64),
         minutes: Vec<f64>,
         max_snap_m: Option<f64>,
     ) -> PyResult<Vec<PyIsochroneResult>> {
-        isochrone_results(minutes, |limits| {
-            self.inner
-                .isochrones(origin.0, origin.1, limits, max_snap_m)
+        isochrone_results(py, minutes, |limits| {
+            self.inner.isochrones(origin, limits, max_snap_m)
         })
     }
 
     #[pyo3(signature = (origin, destination, max_snap_m = Some(100.0)))]
     fn route(
         &self,
+        py: Python<'_>,
         origin: (f64, f64),
         destination: (f64, f64),
         max_snap_m: Option<f64>,
     ) -> PyResult<PyRouteResult> {
-        let route =
-            self.inner
-                .route(origin.0, origin.1, destination.0, destination.1, max_snap_m)?;
+        let route = py.detach(|| self.inner.route(origin, destination, max_snap_m))?;
         Ok(PyRouteResult { route })
     }
 
@@ -1059,8 +1130,8 @@ impl PyPrismGraph {
 // ---------------------------------------------------------------------------
 
 #[pyfunction]
-fn geocode(place: String) -> PyResult<(f64, f64)> {
-    Ok(tokio_rt().block_on(geocoding::geocode(&place))?)
+fn geocode(py: Python<'_>, place: String) -> PyResult<(f64, f64)> {
+    Ok(py.detach(|| tokio_rt().block_on(geocoding::geocode(&place)))?)
 }
 
 #[pyfunction]
@@ -1076,7 +1147,7 @@ fn cache_dir() -> String {
 }
 
 #[pymodule]
-fn graphways(_py: Python, m: &PyModule) -> PyResult<()> {
+fn graphways(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyGraph>()?;
     m.add_class::<PyReachableGraph>()?;
     m.add_class::<PyPrismGraph>()?;

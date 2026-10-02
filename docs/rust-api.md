@@ -62,7 +62,7 @@ Controls which OSM highway tags are included in the graph.  See the [Quickstart]
 
 ```rust
 pub struct SpatialGraph {
-    pub graph: Arc<RoadGraph>, // RoadGraph = DiGraph<XmlNode, Edge>
+    pub graph: Arc<RoadGraph>, // RoadGraph = DiGraph<OsmNode, Edge>
     pub poi_snaps: Option<Arc<HashMap<i64, SnappedPoi>>>,
     // internal indexes omitted
 }
@@ -106,14 +106,14 @@ let graph = SpatialGraph::from_osm(xml, NetworkType::Walk, None)?;
 
 ---
 
-### `XmlNode`
+### `OsmNode`
 
 ```rust
-pub struct XmlNode {
+pub struct OsmNode {
     pub id: i64,
     pub lat: f64,
     pub lon: f64,
-    pub tags: Vec<XmlTag>,
+    pub tags: Vec<OsmTag>,
 }
 ```
 
@@ -126,7 +126,7 @@ The weight of every edge in a `RoadGraph`.
 ```rust
 pub struct Edge {
     pub way_id: i64,
-    pub tags: Arc<[XmlTag]>,       // shared by every edge cut from the same way
+    pub tags: Arc<[OsmTag]>,       // shared by every edge cut from the same way
     pub length: f64,               // meters
     pub speed_kph: f64,
     pub walk_travel_time: f64,     // seconds
@@ -140,15 +140,15 @@ Use `edge.travel_time(network_type)`, `edge.tag("highway")` and
 `edge.oriented_geometry(&source, &target)` rather than reading the raw fields;
 the last one handles straight edges and stored geometry that runs backwards.
 
-### `XmlWay`
+### `OsmWay`
 
 The parsed OSM way that `create_graph` consumes:
 
 ```rust
-pub struct XmlWay {
+pub struct OsmWay {
     pub id: i64,
-    pub nodes: Vec<XmlNodeRef>,
-    pub tags: Vec<XmlTag>,
+    pub nodes: Vec<OsmNodeRef>,
+    pub tags: Vec<OsmTag>,
 }
 ```
 
@@ -266,11 +266,11 @@ pub enum OsmGraphError {
 
 ## Migrating from 0.4
 
-- The edge weight type is now `Edge` (was `XmlWay`, which is now only the
-  parse input). `Edge::way_id` replaces `id`; `tags` is a shared `Arc<[XmlTag]>`;
+- The edge weight type is now `Edge` (was `OsmWay`, which is now only the
+  parse input). `Edge::way_id` replaces `id`; `tags` is a shared `Arc<[OsmTag]>`;
   straight edges have empty `geometry`, so read shapes through
   `Edge::oriented_geometry`.
-- `RoadGraph` names `DiGraph<XmlNode, Edge>`.
+- `RoadGraph` names `DiGraph<OsmNode, Edge>`.
 - `compute_reachability(_with)` and `compute_feasibility(_with)` take
   `&SpatialGraph` instead of a bare graph.
 - `ReachabilityResult::distances: HashMap` is now `times: NodeMap<f64>`, and

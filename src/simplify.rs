@@ -11,7 +11,7 @@ use petgraph::visit::EdgeRef;
 use petgraph::Direction::{Incoming, Outgoing};
 use rstar::RTree;
 
-use crate::graph::{edge_geometry, Edge, NodeEntry, RoadGraph, XmlNode};
+use crate::graph::{edge_geometry, Edge, NodeEntry, OsmNode, RoadGraph};
 use crate::utils::{calculate_distance, calculate_travel_time};
 
 const CONSOLIDATION_DISTANCE_M: f64 = 5.0;
@@ -294,13 +294,13 @@ fn cluster_nodes_by_distance(
 /// A lone node is kept as-is (OSM id and tags intact). A real cluster becomes
 /// one untagged node at the members' mean position, identified by the
 /// smallest member OSM id so ids stay stable and meaningful across builds.
-fn merge_nodes(graph: &RoadGraph, indices: &[NodeIndex]) -> XmlNode {
+fn merge_nodes(graph: &RoadGraph, indices: &[NodeIndex]) -> OsmNode {
     if let [single] = indices {
         return graph[*single].clone();
     }
     let count = indices.len() as f64;
     let members = || indices.iter().map(|&i| &graph[i]);
-    XmlNode {
+    OsmNode {
         id: members().map(|n| n.id).min().unwrap_or_default(),
         lat: members().map(|n| n.lat).sum::<f64>() / count,
         lon: members().map(|n| n.lon).sum::<f64>() / count,
@@ -311,10 +311,10 @@ fn merge_nodes(graph: &RoadGraph, indices: &[NodeIndex]) -> XmlNode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{XmlNode, XmlTag};
+    use crate::graph::{OsmNode, OsmTag};
 
-    fn make_node(id: i64, lat: f64, lon: f64) -> XmlNode {
-        XmlNode {
+    fn make_node(id: i64, lat: f64, lon: f64) -> OsmNode {
+        OsmNode {
             id,
             lat,
             lon,
@@ -322,8 +322,8 @@ mod tests {
         }
     }
 
-    fn make_tag(key: &str, value: &str) -> XmlTag {
-        XmlTag {
+    fn make_tag(key: &str, value: &str) -> OsmTag {
+        OsmTag {
             key: key.into(),
             value: value.into(),
         }
