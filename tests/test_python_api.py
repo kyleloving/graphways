@@ -122,7 +122,7 @@ class PythonApiTests(unittest.TestCase):
         self.assertEqual(matrix.shape, (4, 3))
         self.assertEqual(len(matrix.durations_s), 4)
         self.assertIsNone(matrix.origin_snaps[3])
-        self.assertEqual(matrix.durations_s[3], [None, None, None])
+        self.assertEqual(matrix.durations_s[3], (None, None, None))
         self.assertEqual(matrix.durations_s[0][0], 0.0)
         for i, origin in enumerate(points[:3]):
             for j, destination in enumerate(points[:3]):

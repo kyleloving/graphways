@@ -13,7 +13,7 @@ use petgraph::graph::{EdgeReference, NodeIndex};
 use petgraph::visit::EdgeRef;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyDict, PyList, PyTuple};
 
 use crate::error::OsmGraphError;
 use crate::graph::{Edge, NodeMap, OsmNode, SnapResult, SpatialGraph};
@@ -560,15 +560,28 @@ impl PyPoiCollection {
 #[pyclass(name = "TravelTimeMatrix", frozen, skip_from_py_object)]
 struct PyTravelTimeMatrix {
     matrix: crate::matrix::TravelTimeMatrix,
+    /// The table as Python tuples, converted on first access.
+    durations: OnceLock<Py<PyTuple>>,
 }
 
 #[pymethods]
 impl PyTravelTimeMatrix {
     /// `durations_s[i][j]`: seconds from origin `i` to destination `j`,
     /// `None` when there is no route or a point could not be snapped.
+    /// Immutable tuples, converted once, so repeated access is free.
     #[getter]
-    fn durations_s(&self) -> Vec<Vec<Option<f64>>> {
-        self.matrix.durations_s.clone()
+    fn durations_s<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        if let Some(table) = self.durations.get() {
+            return Ok(table.bind(py).clone());
+        }
+        let rows = self
+            .matrix
+            .durations_s
+            .iter()
+            .map(|row| PyTuple::new(py, row))
+            .collect::<PyResult<Vec<_>>>()?;
+        let table = PyTuple::new(py, rows)?.unbind();
+        Ok(self.durations.get_or_init(|| table).bind(py).clone())
     }
 
     /// Where each origin joined the network (`None` if it was too far away).
@@ -818,7 +831,10 @@ impl PyGraph {
             self.sg
                 .travel_time_matrix(&origins, &destinations, max_snap_m)
         });
-        PyTravelTimeMatrix { matrix }
+        PyTravelTimeMatrix {
+            matrix,
+            durations: OnceLock::new(),
+        }
     }
 
     fn fetch_pois(

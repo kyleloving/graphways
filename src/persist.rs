@@ -174,13 +174,23 @@ impl SpatialGraph {
         let edge_count = saved.edges.len();
         let tag_sets: Vec<Arc<[OsmTag]>> = saved.tag_sets.into_iter().map(Arc::from).collect();
 
+        let finite = |(lat, lon): (f64, f64)| lat.is_finite() && lon.is_finite();
         let mut graph: RoadGraph = DiGraph::with_capacity(node_count, edge_count);
         for node in saved.nodes {
+            if !finite((node.lat, node.lon)) {
+                return Err(invalid("node has an invalid coordinate"));
+            }
             graph.add_node(node);
         }
         for e in saved.edges {
             if e.source as usize >= node_count || e.target as usize >= node_count {
                 return Err(invalid("edge refers to a missing node"));
+            }
+            if !(e.length.is_finite() && e.length >= 0.0)
+                || e.times.iter().any(|t| t.is_nan() || *t < 0.0)
+                || !e.geometry.iter().all(|&p| finite(p))
+            {
+                return Err(invalid("edge has an invalid length, time or shape"));
             }
             let tags = tag_sets
                 .get(e.tag_set as usize)
@@ -222,6 +232,9 @@ impl SpatialGraph {
                 if s.node as usize >= node_count || s.edge.is_some_and(|e| !in_range(e)) {
                     return Err(invalid("POI snap refers to a missing node or edge"));
                 }
+                if !(finite(s.input) && finite(s.snapped) && (0.0..=1.0).contains(&s.fraction)) {
+                    return Err(invalid("POI snap has an invalid position"));
+                }
                 let node_index = NodeIndex::new(s.node as usize);
                 let node = &sg.graph[node_index];
                 let snap = SnapResult {
@@ -251,6 +264,7 @@ impl SpatialGraph {
             if hierarchy.node_count() != sg.search_index().node_count() {
                 return Err(invalid("routing hierarchy does not match the graph"));
             }
+            hierarchy.validate(edge_count).map_err(invalid)?;
             let _ = sg.hierarchy_slot().set(hierarchy);
         }
         Ok(sg)
@@ -339,6 +353,45 @@ mod tests {
                 .duration_s
         };
         assert_eq!(route(&loaded), route(&sg));
+    }
+
+    #[test]
+    fn damaged_files_error_instead_of_panicking() {
+        let sg =
+            SpatialGraph::from_pbf("tests/fixtures/tiny_map.osm.pbf", NetworkType::Drive, false)
+                .unwrap();
+        sg.prepare_routing();
+        let path = temp_path("damaged.graph");
+        sg.save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let points: Vec<(f64, f64)> = sg.graph.node_weights().map(|n| (n.lat, n.lon)).collect();
+
+        let mut state = 7u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize
+        };
+        for _ in 0..3000 {
+            let mut damaged = bytes.clone();
+            for _ in 0..1 + next() % 3 {
+                let at = 12 + next() % (damaged.len() - 12);
+                damaged[at] = next() as u8;
+            }
+            std::fs::write(&path, &damaged).unwrap();
+            // Either a clean error, or a graph every query can use.
+            if let Ok(loaded) = SpatialGraph::load(&path) {
+                for &o in &points {
+                    for &d in &points {
+                        let _ = loaded.route(o, d, None);
+                    }
+                }
+                let _ = loaded.travel_time_matrix(&points, &points, None);
+                let _ = loaded.isochrones(points[0], &[60.0, 300.0], None);
+            }
+        }
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

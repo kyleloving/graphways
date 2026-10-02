@@ -165,10 +165,11 @@ class TravelTimeMatrix:
     """Travel times between every origin and every destination."""
 
     @property
-    def durations_s(self) -> list[list[float | None]]:
+    def durations_s(self) -> tuple[tuple[float | None, ...], ...]:
         """
         ``durations_s[i][j]``: seconds from origin ``i`` to destination ``j``;
         ``None`` when there is no route or either point could not be snapped.
+        Immutable, and converted only once, so repeated access is cheap.
         """
         ...
 

@@ -680,6 +680,11 @@ impl LatLon {
         Self { lat, lon }
     }
 
+    /// The point itself, if both coordinates are finite.
+    fn finite(self) -> Option<Self> {
+        (self.lat.is_finite() && self.lon.is_finite()).then_some(self)
+    }
+
     /// Great-circle distance in metres.
     pub fn distance_m(self, other: LatLon) -> f64 {
         calculate_distance(self.lat, self.lon, other.lat, other.lon)
@@ -1012,8 +1017,10 @@ impl SpatialGraph {
         self.poi_snaps = Some(Arc::new(snaps));
     }
 
+    /// The node nearest `point`; `None` for an empty graph or a non-finite
+    /// coordinate.
     pub fn nearest_node(&self, point: impl Into<LatLon>) -> Option<NodeIndex> {
-        let point = point.into();
+        let point = point.into().finite()?;
         self.index
             .tree
             .nearest_neighbor(&spatial_index_point(point.lat, point.lon))
@@ -1021,9 +1028,10 @@ impl SpatialGraph {
     }
 
     /// Snap a coordinate to the closest point on any road. Falls back to the
-    /// nearest node in a graph without edges; `None` only for an empty graph.
+    /// nearest node in a graph without edges; `None` for an empty graph or a
+    /// non-finite coordinate.
     pub fn snap_point(&self, point: impl Into<LatLon>) -> Option<SnapResult> {
-        let point = point.into();
+        let point = point.into().finite()?;
         let query = spatial_index_point(point.lat, point.lon);
         // The index projection is only locally uniform, so refine the few
         // closest candidates in a projection centred on the query point.

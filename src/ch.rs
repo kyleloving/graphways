@@ -404,6 +404,40 @@ impl ContractionHierarchy {
         }
     }
 
+    /// Check that a hierarchy read from a file is internally consistent for
+    /// a graph with `edge_count` edges, so queries cannot index out of range
+    /// or loop forever unpacking shortcuts.
+    pub(crate) fn validate(&self, edge_count: usize) -> Result<(), &'static str> {
+        let arc_count = self.kinds.len();
+        for arcs in [&self.up, &self.down] {
+            let len = arcs.heads.len();
+            if arcs.offsets.len() != self.node_count + 1
+                || arcs.offsets.first() != Some(&0)
+                || arcs.offsets.last().map(|&o| o as usize) != Some(len)
+                || arcs.offsets.windows(2).any(|w| w[0] > w[1])
+                || arcs.weights.len() != len
+                || arcs.arcs.len() != len
+            {
+                return Err("routing hierarchy has a malformed adjacency");
+            }
+            if arcs.heads.iter().any(|&h| h as usize >= self.node_count)
+                || arcs.arcs.iter().any(|&a| a as usize >= arc_count)
+                || arcs.weights.iter().any(|w| !(w.is_finite() && *w >= 0.0))
+            {
+                return Err("routing hierarchy has an arc out of range");
+            }
+        }
+        // Shortcuts only ever combine earlier arcs, which also rules out cycles.
+        let consistent = self.kinds.iter().enumerate().all(|(i, kind)| match *kind {
+            ArcKind::Edge(e) => (e as usize) < edge_count,
+            ArcKind::Shortcut(a, b) => (a as usize) < i && (b as usize) < i,
+        });
+        if !consistent {
+            return Err("routing hierarchy has a shortcut out of range");
+        }
+        Ok(())
+    }
+
     /// Number of shortcut arcs added by preprocessing.
     #[cfg(test)]
     pub(crate) fn shortcut_count(&self) -> usize {

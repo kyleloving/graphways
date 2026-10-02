@@ -102,8 +102,12 @@ fn matrix(
     // A trip along a single road can beat any path through a junction.
     let mut by_edge: HashMap<EdgeIndex, Vec<usize>> = HashMap::new();
     for (j, snap) in destination_snaps.iter().enumerate() {
+        // Indexed under the road's twin too: `twin` is not symmetric when
+        // parallel edges join the same nodes, and `direct_piece` checks both.
         if let Some(edge) = snap.as_ref().and_then(|s| s.edge) {
-            by_edge.entry(edge).or_default().push(j);
+            for key in std::iter::once(edge).chain(sg.twin(edge)) {
+                by_edge.entry(key).or_default().push(j);
+            }
         }
     }
     if !by_edge.is_empty() && width > 0 {
@@ -114,8 +118,16 @@ fn matrix(
                 let Some(origin) = origin else { return };
                 let Some(edge) = origin.edge else { return };
                 let candidates = [Some(edge), sg.twin(edge)];
-                let same_road = candidates.iter().flatten().filter_map(|e| by_edge.get(e));
-                for &j in same_road.flatten() {
+                let mut same_road: Vec<usize> = candidates
+                    .iter()
+                    .flatten()
+                    .filter_map(|e| by_edge.get(e))
+                    .flatten()
+                    .copied()
+                    .collect();
+                same_road.sort_unstable();
+                same_road.dedup();
+                for j in same_road {
                     let destination = destination_snaps[j].as_ref().expect("indexed above");
                     if let Some((cost, _)) =
                         sg.direct_piece(origin, destination, &mut |e| edge_cost(e))
@@ -337,6 +349,52 @@ mod tests {
             assert!(tables[0].destination_snaps[last].is_none());
             assert!(tables[0].durations_s.iter().all(|row| row[last].is_none()));
         }
+    }
+
+    #[test]
+    fn same_road_trips_match_routes_with_parallel_edges() {
+        use crate::graph::{Edge, OsmNode, OsmTag, RoadGraph};
+        use std::sync::Arc;
+        let tags: Arc<[OsmTag]> = vec![OsmTag {
+            key: "highway".into(),
+            value: "residential".into(),
+        }]
+        .into();
+        let node = |id, lon| OsmNode {
+            id,
+            lat: 48.0,
+            lon,
+            tags: vec![],
+        };
+        let mut g = RoadGraph::new();
+        let (n0, n1) = (g.add_node(node(1, 11.0)), g.add_node(node(2, 11.001)));
+        g.add_edge(n0, n1, Edge::from_length(10, tags.clone(), 74.5, 30.0));
+        g.add_edge(n1, n0, Edge::from_length(10, tags.clone(), 74.5, 30.0));
+        let mut curved = Edge::from_length(20, tags, 75.0, 30.0);
+        curved.geometry = vec![(48.0, 11.0), (48.00003, 11.0005), (48.0, 11.001)];
+        g.add_edge(n0, n1, curved);
+        let sg = SpatialGraph::new(g, NetworkType::Walk);
+        let (o, d) = ((48.00004, 11.0006), (47.99999, 11.0002));
+
+        let route = sg.route(o, d, None).unwrap().duration_s;
+        let unprepared = sg.travel_time_matrix(&[o], &[d], None).durations_s[0][0];
+        sg.prepare_routing();
+        let prepared = sg.travel_time_matrix(&[o], &[d], None).durations_s[0][0];
+        for cell in [unprepared, prepared] {
+            assert!((cell.unwrap() - route).abs() < 1e-9, "{cell:?} vs {route}");
+        }
+    }
+
+    #[test]
+    fn non_finite_points_are_unsnapped_not_fatal() {
+        let sg =
+            SpatialGraph::from_pbf("tests/fixtures/tiny_map.osm.pbf", NetworkType::Walk, false)
+                .unwrap();
+        let points = [(f64::NAN, 11.0), (48.0, f64::INFINITY), (48.0, 11.0)];
+        let table = sg.travel_time_matrix(&points, &points, None);
+        assert!(table.origin_snaps[0].is_none() && table.origin_snaps[1].is_none());
+        assert_eq!(table.durations_s[2][2], Some(0.0));
+        assert!(sg.route((f64::NAN, 0.0), (48.0, 11.0), None).is_err());
     }
 
     #[test]

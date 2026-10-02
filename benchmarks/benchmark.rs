@@ -116,6 +116,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         println!("\nverify: routes exceed Dijkstra by at most {worst:.2e} s");
+        if worst > 1e-6 {
+            return Err(format!("a route is {worst} s longer than Dijkstra's").into());
+        }
     }
     Ok(())
 }

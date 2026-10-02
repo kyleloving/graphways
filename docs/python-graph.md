@@ -267,7 +267,7 @@ rather than failing the whole matrix.
 
 | Property | Type | Description |
 |----------|------|-------------|
-| `durations_s` | list of lists of `float` or `None` | `durations_s[i][j]`: seconds from origin `i` to destination `j`; `None` when unreachable or unsnapped |
+| `durations_s` | tuple of tuples of `float` or `None` | `durations_s[i][j]`: seconds from origin `i` to destination `j`; `None` when unreachable or unsnapped |
 | `origin_snaps` | list of `SnapResult` or `None` | Where each origin joined the network |
 | `destination_snaps` | list of `SnapResult` or `None` | Where each destination joined the network |
 | `shape` | `tuple[int, int]` | `(len(origins), len(destinations))` |
