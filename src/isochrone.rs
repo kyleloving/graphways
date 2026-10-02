@@ -154,11 +154,14 @@ impl TriangulatedSurface {
         let mut points: Vec<(LatLon, f64)> =
             Vec::with_capacity(result.times.len() + frontier.len() + 1);
         points.push((result.origin, 0.0));
+        // Only street nodes shape the surface: transit stops and vehicles
+        // share their platform's position at other times.
         points.extend(
             result
                 .times
                 .iter()
                 .chain(frontier.iter().map(|(node, time)| (node, time)))
+                .filter(|(&node, _)| !crate::transit::is_transit(&graph[node].tags))
                 .map(|(&node, &time)| ((&graph[node]).into(), time)),
         );
         let mean_lat = points.iter().map(|(p, _)| p.lat).sum::<f64>() / points.len() as f64;

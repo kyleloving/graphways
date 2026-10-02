@@ -453,6 +453,35 @@ class SpatialGraph:
         """
         ...
 
+    def with_transit(
+        self,
+        gtfs: str | PathLike[str],
+        date: str,
+        start: str = "07:00",
+        end: str = "09:00",
+        wait_factor: float = 0.5,
+        max_link_m: float = 300.0,
+    ) -> SpatialGraph:
+        """
+        A copy of this walking graph that can also ride public transport,
+        from a GTFS feed (``.zip`` or directory).
+
+        The service between ``start`` and ``end`` on ``date``
+        (``"2026-10-06"``) is modelled by its frequencies: boarding costs the
+        expected wait (``wait_factor`` x headway), riding the average running
+        time, and changing lines means walking and waiting again. Routes,
+        matrices, isochrones and accessibility then all use transit.
+        """
+        ...
+
+    @property
+    def transit_summary(self) -> dict[str, int] | None:
+        """
+        What :meth:`with_transit` added (``stops``, ``patterns``,
+        ``unlinked_stops``), or ``None`` for a graph without transit.
+        """
+        ...
+
     def node_count(self) -> int:
         """Number of nodes in the graph."""
         ...

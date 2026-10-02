@@ -16,6 +16,7 @@ pub mod profile;
 pub mod reachability;
 pub mod restrictions;
 pub mod routing;
+pub mod transit;
 pub mod utils;
 
 // Internal implementation details; not part of the public Rust API.

@@ -152,6 +152,22 @@ class PythonApiTests(unittest.TestCase):
         self.assertEqual(seconds, min(t for t in matrix.durations_s[0][1:3] if t is not None))
         self.assertGreater(metres, 0)
 
+    def test_with_transit_rides_the_fixture_line(self):
+        walk_time = self.graph.route((48.0, 11.0), (48.003, 11.0)).duration_s
+        transit = self.graph.with_transit(FIXTURES / "tiny_gtfs", date="2026-10-06")
+        self.assertEqual(transit.transit_summary, {"stops": 2, "patterns": 1, "unlinked_stops": 0})
+        self.assertIsNone(self.graph.transit_summary)
+        # Wait 2.5 min, ride 30 s, a few metres of walking.
+        by_transit = transit.route((48.0, 11.0), (48.003, 11.0)).duration_s
+        self.assertLess(by_transit, walk_time)
+        self.assertAlmostEqual(by_transit, 150 + 30, delta=20)
+        self.assertIn("transit_stops=2", repr(transit))
+        with self.assertRaises(ValueError):
+            self.graph.with_transit(FIXTURES / "tiny_gtfs", date="2026-02-30")
+        drive = gw.SpatialGraph.from_osm((FIXTURES / "tiny_map.osm").read_text(encoding="utf-8"), "drive")
+        with self.assertRaises(ValueError):
+            drive.with_transit(FIXTURES / "tiny_gtfs", date="2026-10-06")
+
     def test_turn_cost_keywords_are_accepted(self):
         xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
         plain = gw.SpatialGraph.from_osm(xml, "drive", turn_penalty_s=0, u_turn_penalty_s=0)

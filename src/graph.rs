@@ -893,9 +893,12 @@ impl SpatialGraph {
         turn_costs.retain(|&(_, _, cost)| cost.is_finite() && cost > 0.0);
         turn_costs.sort_unstable_by_key(|&(a, b, _)| (a, b));
         turn_costs.dedup_by_key(|&mut (a, b, _)| (a, b));
+        // Transit stops and vehicles are not places to start or end a trip:
+        // points snap to the street network only.
         let tree = RTree::bulk_load(
             graph
                 .node_indices()
+                .filter(|&i| !crate::transit::is_transit(&graph[i].tags))
                 .map(|i| NodeEntry::new(&graph[i], i))
                 .collect(),
         );
@@ -1429,7 +1432,7 @@ fn segment_entries(graph: &RoadGraph) -> Vec<SegmentEntry> {
                 (r.weight().length - edge.weight().length).abs()
                     <= 1.0 + 0.01 * edge.weight().length
             });
-        if has_indexed_twin || u == v {
+        if has_indexed_twin || u == v || crate::transit::is_transit(&edge.weight().tags) {
             continue;
         }
         let geometry = edge.weight().oriented_geometry(&graph[u], &graph[v]);

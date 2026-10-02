@@ -142,6 +142,7 @@ an incompatible or damaged file fails with `OsmGraphError::InvalidGraphFile`.
 | `reachable_graph(origin, max_time, max_snap_m)` | `Result<ReachableGraph, _>` |
 | `isochrones(origin, &limits, max_snap_m)` | `Result<Vec<MultiPolygon>, _>` |
 | `prism(origin, destination, available_time, max_snap_m)` | `Result<PrismGraph, _>` |
+| `with_transit(gtfs, &TransitOptions)` | `Result<(SpatialGraph, TransitSummary), _>`: walking plus public transport |
 | `reachable_pois(origin, max_time)` | async, `network` feature |
 
 Times are in seconds for the graph's network type. Every query point snaps to
@@ -203,6 +204,26 @@ each origin (`Decay::Step`, `Linear`, `Exponential`, `Gaussian`).
 their index, duration and route length. Both reduce each origin's row as it
 is computed, so memory grows with the number of points, not with origins ×
 destinations; prepare routing first for more than a handful of origins.
+
+### Public transport
+
+```rust
+use graphways::transit::TransitOptions;
+
+let walk = SpatialGraph::from_pbf("munich.osm.pbf", NetworkType::Walk, false)?;
+let options = TransitOptions::new("2026-10-06", "07:00", "09:00")?;
+let (transit, summary) = walk.with_transit("mvg_gtfs.zip", &options)?;
+let isochrones = transit.isochrones((48.137, 11.575), &[900.0, 1800.0], Some(100.0))?;
+```
+
+`with_transit` adds a GTFS feed (zip or directory) to a walking graph as a
+frequency-based network for one time window: ride edges carry average
+running times, boarding costs `wait_factor` (0.5) times the headway, and
+changing lines means walking and waiting again. Every query works on the
+result unchanged; points still snap only to streets. On Munich the model's
+travel times match r5's median over the window with a mean absolute error
+of 4.3% (see `benchmarks/transit`). See the `transit` module docs for the
+model and its limits.
 
 ### Reachability, isochrones and prisms
 

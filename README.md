@@ -123,6 +123,9 @@ slow = gw.SpatialGraph.from_pbf("dc.osm.pbf", "walk", walk_speed_kph=3.5)
 - Score accessibility (opportunities within reach, gravity-style decay) and
   find each origin's nearest destinations, without holding the full table
   in memory.
+- Add public transport from a GTFS feed to a walking graph (a
+  frequency-based model of a time window, within about 4% of r5's median
+  travel times on Munich), then use every query above on it.
 - Build network-time prisms for "what can I visit between A and B?" analysis.
 - Export nodes, edges, routes, POIs, and isochrones as GeoJSON.
 

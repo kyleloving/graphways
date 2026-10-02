@@ -655,6 +655,7 @@ fn snaps(list: &[Option<SnapResult>]) -> Vec<Option<PySnapResult>> {
 struct PyGraph {
     sg: SpatialGraph,
     routing_requested: AtomicBool,
+    transit: Option<crate::transit::TransitSummary>,
 }
 
 impl PyGraph {
@@ -662,6 +663,7 @@ impl PyGraph {
         Self {
             routing_requested: AtomicBool::new(sg.is_routing_prepared()),
             sg,
+            transit: None,
         }
     }
 
@@ -1048,9 +1050,56 @@ impl PyGraph {
         })
     }
 
+    /// A walking graph that can also ride public transport, from a GTFS
+    /// feed (`.zip` or directory).
+    ///
+    /// The service between `start` and `end` on `date` (`"2026-10-06"`) is
+    /// modelled by its frequencies: boarding a line costs the expected wait
+    /// (`wait_factor` x headway, half the headway by default), riding costs
+    /// the average running time, and changing lines means walking and
+    /// waiting again. Routes, matrices, isochrones and accessibility then all
+    /// use transit. Only works on walking graphs.
+    #[pyo3(signature = (gtfs, date, start = "07:00", end = "09:00", wait_factor = 0.5, max_link_m = 300.0))]
+    #[allow(clippy::too_many_arguments)]
+    fn with_transit(
+        &self,
+        py: Python<'_>,
+        gtfs: std::path::PathBuf,
+        date: &str,
+        start: &str,
+        end: &str,
+        wait_factor: f64,
+        max_link_m: f64,
+    ) -> PyResult<Self> {
+        let mut options = crate::transit::TransitOptions::new(date, start, end)?;
+        options.wait_factor = wait_factor;
+        options.max_link_m = max_link_m;
+        let (sg, summary) = py.detach(|| self.sg.with_transit(gtfs, &options))?;
+        let mut graph = Self::new(sg);
+        graph.transit = Some(summary);
+        Ok(graph)
+    }
+
+    /// What `with_transit` added: `{"stops", "patterns", "unlinked_stops"}`,
+    /// or `None` for a graph without transit.
+    #[getter]
+    fn transit_summary(&self) -> Option<HashMap<&'static str, usize>> {
+        self.transit.map(|t| {
+            HashMap::from([
+                ("stops", t.stops),
+                ("patterns", t.patterns),
+                ("unlinked_stops", t.unlinked_stops),
+            ])
+        })
+    }
+
     fn __repr__(&self) -> String {
+        let transit = match self.transit {
+            Some(t) => format!(", transit_stops={}", t.stops),
+            None => String::new(),
+        };
         format!(
-            "SpatialGraph(nodes={}, edges={}, network_type={:?})",
+            "SpatialGraph(nodes={}, edges={}, network_type={:?}{transit})",
             self.sg.graph.node_count(),
             self.sg.graph.edge_count(),
             self.sg.network_type(),

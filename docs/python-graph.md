@@ -300,6 +300,58 @@ nearest_clinic_minutes = np.nanmin(times, axis=1) / 60
 
 ---
 
+## Public transport
+
+### `with_transit`
+
+```python
+graph.with_transit(
+    gtfs: str | PathLike,
+    date: str,
+    start: str = "07:00",
+    end: str = "09:00",
+    wait_factor: float = 0.5,
+    max_link_m: float = 300.0,
+) -> SpatialGraph
+```
+
+A copy of a walking graph that can also ride public transport, from a GTFS
+feed (a `.zip` or an unpacked directory; [Mobility Database](https://mobilitydatabase.org)
+and [Transitland](https://www.transit.land) list feeds worldwide). Every
+query on it (routes, matrices, isochrones, accessibility) may then take
+transit.
+
+The timetable between `start` and `end` on `date` is modelled by its
+frequencies rather than individual departures:
+
+- each sequence of stops a line serves becomes a chain of "on board" nodes,
+  joined by the average running time in the window;
+- boarding costs the expected wait, `wait_factor` times the headway at that
+  stop (half the headway: someone arriving at a random time waits half the
+  gap between departures);
+- changing lines means getting off, walking (through the streets, or along
+  the feed's `transfers.txt` links) and waiting again;
+- each stop is linked to the nearest street within `max_link_m`.
+
+Points still snap only to streets, and isochrones are shaped by the street
+nodes reached, so islands of reachability appear around distant stops.
+
+This is an approximation. It is closest to the *median* travel time over the
+window that schedule-based tools such as r5 report, and it is most accurate
+where service is frequent; with sparse service the real wait depends on when
+one sets off. See the accuracy notes in the README of `benchmarks/transit`.
+
+```python
+walk = gw.SpatialGraph.from_pbf("munich.osm.pbf", "walk")
+transit = walk.with_transit("mvg_gtfs.zip", date="2026-10-06", start="07:00", end="09:00")
+print(transit.transit_summary)  # {'stops': 2696, 'patterns': 341, 'unlinked_stops': 125}
+
+isochrones = transit.isochrone((48.137, 11.575), minutes=[15, 30])
+jobs = transit.accessibility(homes, workplaces, minutes=[30, 45], weights=job_counts)
+```
+
+---
+
 ## Accessibility
 
 ### `accessibility`
