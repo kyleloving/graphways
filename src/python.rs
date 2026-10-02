@@ -649,6 +649,40 @@ impl PyGraph {
         Ok(Self::new(sg))
     }
 
+    /// Load a graph written by `save()`.
+    ///
+    /// Much faster than rebuilding from OpenStreetMap, and the routing
+    /// index comes back ready if it was built before saving.
+    #[staticmethod]
+    fn load(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Self> {
+        let sg = py.detach(|| SpatialGraph::load(path))?;
+        Ok(Self::new(sg))
+    }
+
+    /// Write the graph to `path` for a fast `SpatialGraph.load()` later.
+    ///
+    /// By default the routing index is built first (if it isn't already) so
+    /// the loaded graph routes at full speed straight away. Pass
+    /// `prepare_routing=False` for a smaller file that builds it on demand.
+    #[pyo3(signature = (path, prepare_routing = true))]
+    fn save(
+        &self,
+        py: Python<'_>,
+        path: std::path::PathBuf,
+        prepare_routing: bool,
+    ) -> PyResult<()> {
+        if prepare_routing {
+            self.routing_requested.store(true, Ordering::Relaxed);
+        }
+        py.detach(|| {
+            if prepare_routing {
+                self.sg.prepare_routing();
+            }
+            self.sg.save(path)
+        })?;
+        Ok(())
+    }
+
     fn node_count(&self) -> usize {
         self.sg.graph.node_count()
     }

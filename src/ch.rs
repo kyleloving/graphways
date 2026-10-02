@@ -15,6 +15,7 @@
 use petgraph::graph::{EdgeIndex, NodeIndex};
 
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::search::{seed, usable, workspace, HeapEntry, SearchIndex, SearchPath, Workspace, NONE};
 
@@ -25,7 +26,7 @@ use crate::search::{seed, usable, workspace, HeapEntry, SearchIndex, SearchPath,
 const CONTRACTION_SETTLE_LIMIT: usize = 300;
 const SIMULATION_SETTLE_LIMIT: usize = 3;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 enum ArcKind {
     /// An original graph edge (petgraph edge index).
     Edge(u32),
@@ -34,6 +35,7 @@ enum ArcKind {
 }
 
 /// One direction of the search graph, grouped by owning node.
+#[derive(Clone, Serialize, Deserialize)]
 struct UpwardArcs {
     offsets: Vec<u32>,
     /// The higher-ranked node at the other end of each arc.
@@ -67,6 +69,7 @@ impl UpwardArcs {
 }
 
 /// A prepared contraction hierarchy for one cost field.
+#[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ContractionHierarchy {
     node_count: usize,
     /// Arcs `u → v` with `rank(v) > rank(u)`, owned by `u` (forward search).
@@ -320,6 +323,11 @@ fn spread(n: u32) -> u32 {
 }
 
 impl ContractionHierarchy {
+    /// Number of search states the hierarchy was built for.
+    pub(crate) fn node_count(&self) -> usize {
+        self.node_count
+    }
+
     /// Contract the graph described by `index` with per-slot forward costs.
     ///
     /// Works in rounds: every node whose priority is a local minimum among

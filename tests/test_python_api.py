@@ -1,4 +1,5 @@
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -90,6 +91,29 @@ class PythonApiTests(unittest.TestCase):
         after = graph.route((48.0, 11.0), (48.001, 11.0))
         self.assertAlmostEqual(before.duration_s, after.duration_s)
         self.assertEqual(before.coordinates, after.coordinates)
+
+    def test_saved_graph_loads_with_identical_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tiny.graphways"
+            self.graph.save(str(path))
+            loaded = gw.SpatialGraph.load(path)
+
+        self.assertTrue(loaded.is_routing_prepared())
+        self.assertEqual(loaded.node_count(), self.graph.node_count())
+        self.assertEqual(loaded.edge_count(), self.graph.edge_count())
+        before = self.graph.route((48.0, 11.0), (48.001, 11.0))
+        after = loaded.route((48.0, 11.0), (48.001, 11.0))
+        self.assertEqual(after.coordinates, before.coordinates)
+        self.assertEqual(after.duration_s, before.duration_s)
+
+    def test_loading_a_foreign_file_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "not-a-graph"
+            path.write_bytes(b"hello world, definitely not a graph")
+            with self.assertRaises(ValueError):
+                gw.SpatialGraph.load(path)
+            with self.assertRaises(OSError):
+                gw.SpatialGraph.load(Path(tmp) / "missing")
 
     def test_profile_keywords_change_travel_times(self):
         xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")

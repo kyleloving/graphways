@@ -57,3 +57,4 @@ rstar = "0.12"
 osmpbf = "0.3"
 rayon = "1.8"
 delaunator = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }

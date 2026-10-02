@@ -8,7 +8,7 @@ const DEFAULT_OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
 const DEFAULT_NOMINATIM_URL: &str = "https://nominatim.openstreetmap.org/search";
 const MAX_RETRIES: usize = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum NetworkType {
     Drive,
     DriveService,
