@@ -91,6 +91,16 @@ class PythonApiTests(unittest.TestCase):
         self.assertAlmostEqual(before.duration_s, after.duration_s)
         self.assertEqual(before.coordinates, after.coordinates)
 
+    def test_profile_keywords_change_travel_times(self):
+        xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
+        slow = gw.SpatialGraph.from_osm(xml, "walk", walk_speed_kph=2.5)
+        normal = self.graph.route((48.0, 11.0), (48.001, 11.0))
+        halved = slow.route((48.0, 11.0), (48.001, 11.0))
+        self.assertAlmostEqual(halved.duration_s, 2 * normal.duration_s, places=6)
+
+        with self.assertRaises(TypeError):
+            gw.SpatialGraph.from_osm(xml, "walk", walk_speed=3)
+
     def test_invalid_osm_raises_value_error(self):
         with self.assertRaises(ValueError):
             gw.SpatialGraph.from_osm("not xml", "walk")

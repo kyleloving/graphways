@@ -5,6 +5,7 @@
 use crate::ch::ContractionHierarchy;
 use crate::error::OsmGraphError;
 use crate::overpass::NetworkType;
+use crate::profile::{BuildOptions, Profile};
 use crate::search::{SearchIndex, SlotCosts};
 use crate::simplify::simplify_graph;
 use crate::utils::{calculate_distance, calculate_travel_time};
@@ -112,19 +113,38 @@ pub struct Edge {
 }
 
 impl Edge {
-    /// A straight edge whose travel times follow from `length` at walking
-    /// pace (5 km/h), cycling pace (15 km/h) and `speed_kph` for driving.
+    /// A straight edge whose travel times follow from `length` at the
+    /// default walking (5 km/h) and cycling (15 km/h) paces and `speed_kph`
+    /// for driving.
     pub fn from_length(way_id: i64, tags: Arc<[OsmTag]>, length: f64, speed_kph: f64) -> Self {
-        Edge {
+        Self::with_profile(way_id, tags, length, speed_kph, &Profile::default())
+    }
+
+    /// Like [`Edge::from_length`] with walking and cycling paces from `profile`.
+    pub fn with_profile(
+        way_id: i64,
+        tags: Arc<[OsmTag]>,
+        length: f64,
+        speed_kph: f64,
+        profile: &Profile,
+    ) -> Self {
+        let mut edge = Edge {
             way_id,
             tags,
-            length,
             speed_kph,
-            walk_travel_time: calculate_travel_time(length, 5.0),
-            bike_travel_time: calculate_travel_time(length, 15.0),
-            drive_travel_time: calculate_travel_time(length, speed_kph),
-            geometry: Vec::new(),
-        }
+            ..Edge::default()
+        };
+        edge.set_length(length, profile);
+        edge
+    }
+
+    /// Set the length and recompute all three travel times from the edge's
+    /// driving speed and `profile`'s walking and cycling paces.
+    pub(crate) fn set_length(&mut self, length: f64, profile: &Profile) {
+        self.length = length;
+        self.walk_travel_time = calculate_travel_time(length, profile.walk_speed_kph);
+        self.bike_travel_time = calculate_travel_time(length, profile.bike_speed_kph);
+        self.drive_travel_time = calculate_travel_time(length, self.speed_kph);
     }
 
     /// Travel time in seconds for `network_type`.
@@ -337,34 +357,12 @@ fn assess_path_directionality(tags: &[OsmTag]) -> Direction {
     }
 }
 
-fn highway_speed_kph(highway: &str) -> Option<f64> {
-    match highway {
-        "motorway" => Some(110.0),
-        "motorway_link" => Some(60.0),
-        "trunk" => Some(90.0),
-        "trunk_link" => Some(45.0),
-        "primary" => Some(65.0),
-        "primary_link" => Some(45.0),
-        "secondary" => Some(55.0),
-        "secondary_link" => Some(40.0),
-        "tertiary" => Some(45.0),
-        "tertiary_link" => Some(35.0),
-        "unclassified" => Some(45.0),
-        "residential" => Some(30.0),
-        "living_street" => Some(10.0),
-        "service" => Some(20.0),
-        "track" => Some(20.0),
-        "road" => Some(50.0),
-        _ => None,
-    }
-}
-
-fn way_speed_kph(tags: &[OsmTag]) -> f64 {
-    const FALLBACK_SPEED_KPH: f64 = 50.0;
-    find_tag(tags, "maxspeed")
-        .and_then(|tag| clean_maxspeed(&tag.value))
-        .or_else(|| find_tag(tags, "highway").and_then(|tag| highway_speed_kph(&tag.value)))
-        .unwrap_or(FALLBACK_SPEED_KPH)
+fn way_speed_kph(tags: &[OsmTag], profile: &Profile) -> f64 {
+    profile
+        .use_maxspeed
+        .then(|| find_tag(tags, "maxspeed").and_then(|tag| clean_maxspeed(&tag.value)))
+        .flatten()
+        .unwrap_or_else(|| profile.drive_speed_kph(find_tag(tags, "highway").map(|t| t.value.as_str())))
 }
 
 /// The tags edges keep; everything else is dropped at build time.
@@ -374,20 +372,33 @@ fn useful_tags(mut tags: Vec<OsmTag>) -> Arc<[OsmTag]> {
     tags.into()
 }
 
-/// Build a directed road graph from parsed OSM nodes and ways.
-///
-/// Every consecutive node pair of a way becomes one edge per traversable
-/// direction; all edges of a way share one copy of its tags. Way references
-/// to nodes missing from `nodes` (common in clipped extracts) are skipped
-/// rather than panicking. Unless `retain_all` is set the graph is then
-/// simplified: nearby intersection nodes are merged and degree-two chains are
-/// collapsed into single edges.
+/// Build a directed road graph from parsed OSM nodes and ways with the
+/// default [`Profile`]. See [`create_graph_with`].
 pub fn create_graph(
     nodes: Vec<OsmNode>,
     ways: Vec<OsmWay>,
     retain_all: bool,
     bidirectional: bool,
 ) -> RoadGraph {
+    create_graph_with(nodes, ways, bidirectional, &BuildOptions::retain_all(retain_all))
+}
+
+/// Build a directed road graph from parsed OSM nodes and ways.
+///
+/// Every consecutive node pair of a way becomes one edge per traversable
+/// direction (both directions when `bidirectional`, as for walking); all
+/// edges of a way share one copy of its tags. Way references to nodes missing
+/// from `nodes` (common in clipped extracts) are skipped rather than
+/// panicking. Unless `options.retain_all` is set the graph is then
+/// simplified: nearby intersection nodes are merged and degree-two chains are
+/// collapsed into single edges.
+pub fn create_graph_with(
+    nodes: Vec<OsmNode>,
+    ways: Vec<OsmWay>,
+    bidirectional: bool,
+    options: &BuildOptions,
+) -> RoadGraph {
+    let profile = &options.profile;
     let segment_count: usize = ways.iter().map(|w| w.nodes.len().saturating_sub(1)).sum();
     let mut graph = DiGraph::with_capacity(nodes.len(), segment_count * 2);
     let mut node_index_map = HashMap::with_capacity(nodes.len());
@@ -399,7 +410,7 @@ pub fn create_graph(
 
     for way in ways {
         let traversals = assess_path_directionality(&way.tags).traversals(bidirectional);
-        let speed_kph = way_speed_kph(&way.tags);
+        let speed_kph = way_speed_kph(&way.tags, profile);
         let tags = useful_tags(way.tags);
 
         for pair in way.nodes.windows(2) {
@@ -413,16 +424,17 @@ pub fn create_graph(
             let length = calculate_distance(pa.0, pa.1, pb.0, pb.1);
             for &reversed in traversals {
                 let (from, to) = if reversed { (b, a) } else { (a, b) };
-                let edge = Edge::from_length(way.id, Arc::clone(&tags), length, speed_kph);
+                let edge =
+                    Edge::with_profile(way.id, Arc::clone(&tags), length, speed_kph, profile);
                 graph.add_edge(from, to, edge);
             }
         }
     }
 
-    if retain_all {
+    if options.retain_all {
         graph
     } else {
-        simplify_graph(graph)
+        simplify_graph(graph, profile)
     }
 }
 
@@ -763,23 +775,42 @@ impl SpatialGraph {
         }
     }
 
-    /// Build a graph from parsed OSM data with [`create_graph`].
+    /// Build a graph from parsed OSM data with the default profile.
     pub fn from_osm_data(data: OsmData, network_type: NetworkType, retain_all: bool) -> Self {
+        Self::from_osm_data_with(data, network_type, &BuildOptions::retain_all(retain_all))
+    }
+
+    /// Build a graph from parsed OSM data with [`create_graph_with`].
+    pub fn from_osm_data_with(
+        data: OsmData,
+        network_type: NetworkType,
+        options: &BuildOptions,
+    ) -> Self {
         let bidirectional = matches!(network_type, NetworkType::Walk);
-        let graph = create_graph(data.nodes, data.ways, retain_all, bidirectional);
+        let graph = create_graph_with(data.nodes, data.ways, bidirectional, options);
         Self::new(graph, network_type)
     }
 
-    /// Parse an OSM XML document (e.g. an Overpass response) and build a graph.
+    /// Parse an OSM XML document (e.g. an Overpass response) and build a
+    /// graph with the default profile.
     pub fn from_osm(
         xml: &str,
         network_type: NetworkType,
         retain_all: bool,
     ) -> Result<Self, OsmGraphError> {
-        Ok(Self::from_osm_data(
+        Self::from_osm_with(xml, network_type, &BuildOptions::retain_all(retain_all))
+    }
+
+    /// Parse an OSM XML document and build a graph with custom options.
+    pub fn from_osm_with(
+        xml: &str,
+        network_type: NetworkType,
+        options: &BuildOptions,
+    ) -> Result<Self, OsmGraphError> {
+        Ok(Self::from_osm_data_with(
             parse_xml(xml)?,
             network_type,
-            retain_all,
+            options,
         ))
     }
 
@@ -1550,6 +1581,28 @@ mod tests {
             Piece::whole(edge).points(&graph),
             vec![(0.0, 0.0), (0.002, 0.0)]
         );
+    }
+
+    #[test]
+    fn profile_sets_speeds_and_overrides_road_classes() {
+        use crate::profile::{BuildOptions, Profile};
+        let nodes = vec![make_node(1, 0.0, 0.0), make_node(2, 0.009, 0.0)];
+        let way = make_way_raw(vec![1, 2], vec![("highway", "primary"), ("maxspeed", "70")]);
+        let options = BuildOptions {
+            retain_all: true,
+            profile: Profile {
+                walk_speed_kph: 4.0,
+                use_maxspeed: false,
+                ..Profile::default().with_drive_speed("primary", 40.0)
+            },
+        };
+
+        let graph = create_graph_with(nodes, vec![way], false, &options);
+
+        let edge = graph.edge_weights().next().unwrap();
+        assert_eq!(edge.speed_kph, 40.0, "maxspeed ignored, class speed used");
+        assert!((edge.walk_travel_time - edge.length / (4.0 / 3.6)).abs() < 1e-9);
+        assert!((edge.bike_travel_time - edge.length / (15.0 / 3.6)).abs() < 1e-9);
     }
 
     #[test]

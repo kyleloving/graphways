@@ -20,6 +20,7 @@ use crate::filters::{is_poi_node, way_passes_road_filter};
 use crate::graph::{OsmData, OsmNode, OsmNodeRef, OsmTag, OsmWay, SpatialGraph};
 use crate::overpass::NetworkType;
 use crate::poi::Poi;
+use crate::profile::BuildOptions;
 
 impl SpatialGraph {
     /// Build a routable [`SpatialGraph`] directly from a local OSM PBF file.
@@ -32,8 +33,17 @@ impl SpatialGraph {
         network_type: NetworkType,
         retain_all: bool,
     ) -> Result<Self, OsmGraphError> {
+        Self::from_pbf_with(path, network_type, &BuildOptions::retain_all(retain_all))
+    }
+
+    /// Like [`SpatialGraph::from_pbf`] with a custom speed profile.
+    pub fn from_pbf_with(
+        path: impl AsRef<Path>,
+        network_type: NetworkType,
+        options: &BuildOptions,
+    ) -> Result<Self, OsmGraphError> {
         let (data, pois) = read_pbf(path, network_type)?;
-        let mut spatial_graph = SpatialGraph::from_osm_data(data, network_type, retain_all);
+        let mut spatial_graph = SpatialGraph::from_osm_data_with(data, network_type, options);
         spatial_graph.snap_pois(&pois);
         Ok(spatial_graph)
     }

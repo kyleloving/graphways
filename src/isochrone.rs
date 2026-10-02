@@ -405,7 +405,7 @@ pub(crate) async fn calculate_isochrones_from_point(
     max_dist: Option<f64>,
     time_limits: Vec<f64>,
     network_type: overpass::NetworkType,
-    retain_all: bool,
+    options: &crate::profile::BuildOptions,
 ) -> Result<(Vec<MultiPolygon>, SpatialGraph), OsmGraphError> {
     use crate::cache;
 
@@ -441,7 +441,7 @@ pub(crate) async fn calculate_isochrones_from_point(
     if parsed.nodes.is_empty() {
         return Err(OsmGraphError::EmptyGraph);
     }
-    let sg = SpatialGraph::from_osm_data(parsed, network_type, retain_all);
+    let sg = SpatialGraph::from_osm_data_with(parsed, network_type, options);
     let origin = sg.snap_endpoint(LatLon::new(lat, lon), Role::Origin, None)?;
     let isochrones = isochrones_from(&sg, &origin, &time_limits);
     Ok((isochrones, sg))

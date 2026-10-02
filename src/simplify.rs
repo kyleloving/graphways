@@ -12,12 +12,11 @@ use petgraph::Direction::{Incoming, Outgoing};
 use rstar::RTree;
 
 use crate::graph::{edge_geometry, Edge, NodeEntry, OsmNode, RoadGraph};
-use crate::utils::{calculate_distance, calculate_travel_time};
+use crate::profile::Profile;
+use crate::utils::calculate_distance;
 
-const CONSOLIDATION_DISTANCE_M: f64 = 5.0;
-
-pub fn simplify_graph(graph: RoadGraph) -> RoadGraph {
-    let (graph, _) = consolidate_intersections(graph, CONSOLIDATION_DISTANCE_M);
+pub fn simplify_graph(graph: RoadGraph, profile: &Profile) -> RoadGraph {
+    let (graph, _) = consolidate_intersections(graph, profile);
 
     let is_endpoint: Vec<bool> = graph
         .node_indices()
@@ -190,10 +189,8 @@ fn is_endpoint(graph: &RoadGraph, node: NodeIndex) -> bool {
 /// stretched if its endpoints now lie farther apart than its length. Travel
 /// times scale with length, keeping each edge's speed, and no edge ends up
 /// "faster than straight" (which would also break the A* lower bound).
-fn consolidate_intersections(
-    graph: RoadGraph,
-    merge_distance_m: f64,
-) -> (RoadGraph, Vec<NodeIndex>) {
+fn consolidate_intersections(graph: RoadGraph, profile: &Profile) -> (RoadGraph, Vec<NodeIndex>) {
+    let merge_distance_m = profile.merge_distance_m;
     let tree = RTree::bulk_load(
         graph
             .node_indices()
@@ -223,7 +220,11 @@ fn consolidate_intersections(
         let mut weight = edge.weight;
         if moved[new_src.index()] || moved[new_dst.index()] {
             let (a, b) = (&new_graph[new_src], &new_graph[new_dst]);
-            refit_length(&mut weight, calculate_distance(a.lat, a.lon, b.lat, b.lon));
+            refit_length(
+                &mut weight,
+                calculate_distance(a.lat, a.lon, b.lat, b.lon),
+                profile,
+            );
         }
         add_or_keep_fastest(&mut new_graph, new_src, new_dst, weight);
     }
@@ -233,7 +234,7 @@ fn consolidate_intersections(
 
 /// Fit `edge` to endpoints `span` metres apart, keeping its speeds: straight
 /// edges take exactly `span`, shaped edges are only ever lengthened.
-fn refit_length(edge: &mut Edge, span: f64) {
+fn refit_length(edge: &mut Edge, span: f64, profile: &Profile) {
     let length = if edge.geometry.is_empty() {
         span
     } else {
@@ -247,12 +248,10 @@ fn refit_length(edge: &mut Edge, span: f64) {
         edge.walk_travel_time *= scale;
         edge.bike_travel_time *= scale;
         edge.drive_travel_time *= scale;
+        edge.length = length;
     } else {
-        edge.walk_travel_time = calculate_travel_time(length, 5.0);
-        edge.bike_travel_time = calculate_travel_time(length, 15.0);
-        edge.drive_travel_time = calculate_travel_time(length, edge.speed_kph);
+        edge.set_length(length, profile);
     }
-    edge.length = length;
 }
 
 /// Greedy clustering in node order: each unassigned node seeds a cluster of
@@ -364,7 +363,7 @@ mod tests {
         graph.add_edge(a, b, make_way(2, 50.0));
 
         assert_eq!(graph.edge_count(), 2);
-        let deduped = simplify_graph(graph);
+        let deduped = simplify_graph(graph, &Profile::default());
         assert!(
             deduped.edge_count() <= 1,
             "Expected at most 1 edge, got {}",
@@ -379,7 +378,7 @@ mod tests {
         let b = graph.add_node(make_node(2, 38.0001, -77.0));
         graph.add_edge(a, b, make_way(1, 1.0));
 
-        let (consolidated, map) = consolidate_intersections(graph, 5.0);
+        let (consolidated, map) = consolidate_intersections(graph, &Profile::default());
 
         assert_eq!(consolidated.node_count(), 2);
         assert_ne!(map[a.index()], map[b.index()]);
@@ -425,7 +424,7 @@ mod tests {
         graph.add_edge(b, c, make_way_with_length(2, 20.0, 200.0));
         graph.add_edge(c, d, make_way_with_length(3, 30.0, 300.0));
 
-        let simplified = simplify_graph(graph);
+        let simplified = simplify_graph(graph, &Profile::default());
 
         assert_eq!(simplified.node_count(), 2);
         assert_eq!(simplified.edge_count(), 1);
@@ -457,7 +456,7 @@ mod tests {
             make_way_with_geometry(3, 30.0, vec![(0.002, 0.0), (0.0025, 0.0002), (0.003, 0.0)]),
         );
 
-        let simplified = simplify_graph(graph);
+        let simplified = simplify_graph(graph, &Profile::default());
         let edge = simplified.edge_weights().next().unwrap();
 
         assert_eq!(
@@ -486,7 +485,7 @@ mod tests {
         graph.add_edge(x, b, make_way(2, 50.0));
         graph.add_edge(a, x, make_way(3, 50.0));
 
-        let simplified = simplify_graph(graph);
+        let simplified = simplify_graph(graph, &Profile::default());
 
         assert_eq!(simplified.edge_count(), 1);
         assert_eq!(
@@ -505,7 +504,7 @@ mod tests {
         graph.add_edge(a, b1, make_way_with_length(1, 30.0, 120.0));
         graph.add_edge(a, b2, make_way_with_length(2, 20.0, 120.0));
 
-        let (consolidated, _) = consolidate_intersections(graph, 5.0);
+        let (consolidated, _) = consolidate_intersections(graph, &Profile::default());
 
         assert_eq!(consolidated.edge_count(), 1);
         // The 20 s edge wins; its length is then refit to the merged span.
@@ -528,7 +527,7 @@ mod tests {
         graph.add_edge(b2, c, make_way(2, 10.0));
         graph.add_edge(b1, d, make_way(3, 10.0));
 
-        let simplified = simplify_graph(graph);
+        let simplified = simplify_graph(graph, &Profile::default());
         let mut ids: Vec<i64> = simplified.node_weights().map(|n| n.id).collect();
         ids.sort_unstable();
 
@@ -549,7 +548,7 @@ mod tests {
         graph.add_edge(b2, c, make_way_with_length(1, 0.1, 1.0));
         graph.add_edge(b1, b2, make_way(2, 1.0));
 
-        let (consolidated, map) = consolidate_intersections(graph, 5.0);
+        let (consolidated, map) = consolidate_intersections(graph, &Profile::default());
         assert_eq!(map[b1.index()], map[b2.index()]);
         let edge = consolidated.edge_weights().next().unwrap();
         let (a, b) = (
@@ -575,7 +574,7 @@ mod tests {
         graph.add_edge(center, east, make_way(2, 10.0));
         graph.add_edge(center, north, make_way(3, 10.0));
 
-        let simplified = simplify_graph(graph);
+        let simplified = simplify_graph(graph, &Profile::default());
 
         assert_eq!(simplified.node_count(), 4);
         assert_eq!(simplified.edge_count(), 3);
@@ -590,7 +589,7 @@ mod tests {
         graph.add_edge(a, b, make_way(1, 10.0));
         graph.add_edge(b, c, make_way(2, 10.0));
 
-        let simplified = simplify_graph(graph);
+        let simplified = simplify_graph(graph, &Profile::default());
         let edge = simplified.edge_references().next().unwrap();
         let source = &simplified[edge.source()];
         let target = &simplified[edge.target()];
@@ -609,7 +608,7 @@ mod tests {
         graph.add_edge(west, east, make_way(1, 10.0));
         graph.add_edge(south, north, make_way(2, 10.0));
 
-        let simplified = simplify_graph(graph);
+        let simplified = simplify_graph(graph, &Profile::default());
 
         assert_eq!(simplified.node_count(), 4);
         assert_eq!(simplified.edge_count(), 2);

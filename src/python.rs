@@ -18,6 +18,7 @@ use pyo3::types::{PyDict, PyList};
 use crate::error::OsmGraphError;
 use crate::graph::{Edge, NodeMap, OsmNode, SnapResult, SpatialGraph};
 use crate::overpass::NetworkType;
+use crate::profile::{BuildOptions, Profile};
 use crate::{cache, feasibility, geocoding, isochrone, poi, reachability, routing, utils};
 
 static TOKIO_RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
@@ -42,6 +43,48 @@ fn parse_network_type(s: &str) -> PyResult<NetworkType> {
             "Invalid network '{s}'. Expected one of: drive, drive_service, walk, bike, all, all_private"
         ))),
     }
+}
+
+const PROFILE_KEYS: &[&str] = &[
+    "walk_speed_kph",
+    "bike_speed_kph",
+    "drive_speeds_kph",
+    "default_drive_speed_kph",
+    "use_maxspeed",
+    "merge_distance_m",
+];
+
+/// Build options from `retain_all` and the optional speed-profile keyword
+/// arguments shared by every graph constructor. Speeds in
+/// `drive_speeds_kph` override the defaults class by class.
+fn build_options(retain_all: bool, kwargs: Option<&Bound<'_, PyDict>>) -> PyResult<BuildOptions> {
+    let mut profile = Profile::default();
+    for (key, value) in kwargs.into_iter().flat_map(|kwargs| kwargs.iter()) {
+        let key: String = key.extract()?;
+        if value.is_none() {
+            continue;
+        }
+        match key.as_str() {
+            "walk_speed_kph" => profile.walk_speed_kph = value.extract()?,
+            "bike_speed_kph" => profile.bike_speed_kph = value.extract()?,
+            "drive_speeds_kph" => profile
+                .drive_speeds_kph
+                .extend(value.extract::<HashMap<String, f64>>()?),
+            "default_drive_speed_kph" => profile.default_drive_speed_kph = value.extract()?,
+            "use_maxspeed" => profile.use_maxspeed = value.extract()?,
+            "merge_distance_m" => profile.merge_distance_m = value.extract()?,
+            _ => {
+                return Err(PyTypeError::new_err(format!(
+                    "unexpected keyword argument '{key}'; profile options are: {}",
+                    PROFILE_KEYS.join(", ")
+                )))
+            }
+        }
+    }
+    Ok(BuildOptions {
+        retain_all,
+        profile,
+    })
 }
 
 /// Snapping failures for area queries (isochrones, reachability, prisms)
@@ -548,33 +591,49 @@ impl PyGraph {
 #[pymethods]
 impl PyGraph {
     #[staticmethod]
-    #[pyo3(signature = (path, network, retain_all = false))]
-    fn from_pbf(py: Python<'_>, path: String, network: String, retain_all: bool) -> PyResult<Self> {
+    #[pyo3(signature = (path, network, retain_all = false, **profile))]
+    fn from_pbf(
+        py: Python<'_>,
+        path: String,
+        network: String,
+        retain_all: bool,
+        profile: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
         let network_type = parse_network_type(&network)?;
-        let sg = py.detach(|| SpatialGraph::from_pbf(path, network_type, retain_all))?;
+        let options = build_options(retain_all, profile)?;
+        let sg = py.detach(|| SpatialGraph::from_pbf_with(path, network_type, &options))?;
         Ok(Self::new(sg))
     }
 
     #[staticmethod]
-    #[pyo3(signature = (xml, network, retain_all = false))]
-    fn from_osm(py: Python<'_>, xml: String, network: String, retain_all: bool) -> PyResult<Self> {
+    #[pyo3(signature = (xml, network, retain_all = false, **profile))]
+    fn from_osm(
+        py: Python<'_>,
+        xml: String,
+        network: String,
+        retain_all: bool,
+        profile: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
         let network_type = parse_network_type(&network)?;
+        let options = build_options(retain_all, profile)?;
         let sg = py
-            .detach(|| SpatialGraph::from_osm(&xml, network_type, retain_all))
+            .detach(|| SpatialGraph::from_osm_with(&xml, network_type, &options))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self::new(sg))
     }
 
     #[staticmethod]
-    #[pyo3(signature = (place, network, max_dist = None, retain_all = false))]
+    #[pyo3(signature = (place, network, max_dist = None, retain_all = false, **profile))]
     fn from_place(
         py: Python<'_>,
         place: String,
         network: String,
         max_dist: Option<f64>,
         retain_all: bool,
+        profile: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<Self> {
         let network_type = parse_network_type(&network)?;
+        let options = build_options(retain_all, profile)?;
         let sg = py.detach(|| -> Result<SpatialGraph, OsmGraphError> {
             let (lat, lon) = tokio_rt().block_on(geocoding::geocode(&place))?;
             let (_, sg) = tokio_rt().block_on(isochrone::calculate_isochrones_from_point(
@@ -583,7 +642,7 @@ impl PyGraph {
                 Some(max_dist.unwrap_or(5_000.0)),
                 vec![],
                 network_type,
-                retain_all,
+                &options,
             ))?;
             Ok(sg)
         })?;

@@ -9,6 +9,7 @@ pub mod isochrone;
 pub mod overpass;
 pub mod pbf;
 pub mod poi;
+pub mod profile;
 pub mod reachability;
 pub mod routing;
 pub mod utils;
