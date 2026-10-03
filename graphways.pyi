@@ -562,15 +562,18 @@ class SpatialGraph:
     def travel_time_matrix(
         self,
         origins: Sequence[tuple[float, float]],
-        destinations: Sequence[tuple[float, float]],
+        destinations: Sequence[tuple[float, float]] | None = None,
         max_snap_m: float | None = 100.0,
+        max_minutes: float | None = None,
     ) -> TravelTimeMatrix:
         """
         Fastest travel times from every ``(lat, lon)`` origin to every
         destination, exactly as :meth:`route` would find them.
 
         Points farther than ``max_snap_m`` from any road get ``None`` times
-        instead of failing the whole matrix. Large matrices build the routing
+        instead of failing the whole matrix. If ``destinations`` is omitted,
+        the matrix is origin-to-origin. Pairs slower than ``max_minutes`` are
+        ``None``, like unreachable ones. Large matrices build the routing
         index first (see :meth:`prepare_routing`), which makes them fast.
         """
         ...

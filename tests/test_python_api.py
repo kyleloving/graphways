@@ -130,6 +130,30 @@ class PythonApiTests(unittest.TestCase):
                 self.assertAlmostEqual(matrix.durations_s[i][j], route.duration_s)
                 self.assertAlmostEqual(matrix.distances_m[i][j], route.distance_m)
 
+    def test_travel_time_matrix_defaults_to_origin_to_origin(self):
+        points = [(48.0, 11.0), (48.001, 11.0), (48.0005, 11.0)]
+        square = self.graph.travel_time_matrix(points)
+        explicit = self.graph.travel_time_matrix(points, points)
+
+        self.assertEqual(square.shape, (3, 3))
+        self.assertEqual(square.durations_s, explicit.durations_s)
+
+    def test_travel_time_matrix_respects_max_minutes(self):
+        points = [(48.0, 11.0), (48.001, 11.0), (48.0005, 11.0)]
+        full = self.graph.travel_time_matrix(points)
+        limit_s = 0.5 * max(t for row in full.durations_s for t in row)
+        cut = self.graph.travel_time_matrix(points, max_minutes=limit_s / 60)
+
+        for full_row, cut_row, cut_dist in zip(full.durations_s, cut.durations_s, cut.distances_m):
+            for t, c, d in zip(full_row, cut_row, cut_dist):
+                if t <= limit_s:
+                    self.assertEqual(c, t)
+                else:
+                    self.assertIsNone(c)
+                    self.assertIsNone(d)
+        with self.assertRaises(ValueError):
+            self.graph.travel_time_matrix(points, max_minutes=-1)
+
     def test_accessibility_and_nearest_destinations(self):
         points = [(48.0, 11.0), (48.001, 11.0), (48.0005, 11.0), (10.0, 10.0)]
         matrix = self.graph.travel_time_matrix(points, points)

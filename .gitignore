@@ -2,5 +2,7 @@
 /.venv
 /cache
 /data
-/site__pycache__/
+/site
+__pycache__/
 *.pyc
+/examples/cache

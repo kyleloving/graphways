@@ -847,29 +847,50 @@ impl PyGraph {
     /// Fastest travel times from every origin to every destination.
     ///
     /// Points farther than `max_snap_m` from any road get `None` times
-    /// instead of failing the whole matrix. Large matrices build the routing
+    /// instead of failing the whole matrix. Without `destinations` the
+    /// matrix is origin-to-origin. Pairs slower than `max_minutes` are
+    /// `None`, like unreachable ones. Large matrices build the routing
     /// index first (see `prepare_routing`), which makes them fast.
-    #[pyo3(signature = (origins, destinations, max_snap_m = Some(100.0)))]
+    #[pyo3(signature = (origins, destinations = None, max_snap_m = Some(100.0), max_minutes = None))]
     fn travel_time_matrix(
         &self,
         py: Python<'_>,
         origins: Vec<(f64, f64)>,
-        destinations: Vec<(f64, f64)>,
+        destinations: Option<Vec<(f64, f64)>>,
         max_snap_m: Option<f64>,
-    ) -> PyTravelTimeMatrix {
+        max_minutes: Option<f64>,
+    ) -> PyResult<PyTravelTimeMatrix> {
+        let max_time_s = match max_minutes {
+            Some(m) if m.is_nan() || m < 0.0 => {
+                return Err(PyValueError::new_err("max_minutes must be non-negative"));
+            }
+            m => m.map(|m| m * 60.0),
+        };
+        let destinations = destinations.as_deref().unwrap_or(&origins);
         // A handful of Dijkstra searches beats building the index; beyond
         // that the index pays for itself within the same call.
         let searches = origins.len().min(destinations.len());
-        let matrix = py.detach(|| {
+        let mut matrix = py.detach(|| {
             self.prepare_for(searches);
             self.sg
-                .travel_time_matrix(&origins, &destinations, max_snap_m)
+                .travel_time_matrix(&origins, destinations, max_snap_m)
         });
-        PyTravelTimeMatrix {
+        if let Some(limit) = max_time_s {
+            let rows = matrix.durations_s.iter_mut().zip(&mut matrix.distances_m);
+            for (durations, distances) in rows {
+                for (duration, distance) in durations.iter_mut().zip(distances) {
+                    if duration.is_some_and(|d| d > limit) {
+                        *duration = None;
+                        *distance = None;
+                    }
+                }
+            }
+        }
+        Ok(PyTravelTimeMatrix {
             matrix,
             durations: OnceLock::new(),
             distances: OnceLock::new(),
-        }
+        })
     }
 
     /// Accessibility score of every origin: the sum over opportunities of
