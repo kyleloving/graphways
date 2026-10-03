@@ -13,7 +13,7 @@ use petgraph::graph::EdgeIndex;
 use rayon::prelude::*;
 
 use crate::ch::Seed;
-use crate::graph::{Anchor, LatLon, Role, Roots, SnapResult, SpatialGraph};
+use crate::graph::{Anchor, LatLon, Pricing, Role, Roots, SnapResult, SpatialGraph};
 use crate::reachability::EdgeInfo;
 use crate::search::dijkstra_with_lengths;
 
@@ -73,6 +73,7 @@ fn seeds_with_lengths(sg: &SpatialGraph, anchors: &[Anchor], roots: &Roots) -> V
 pub(crate) struct Table<'g> {
     sg: &'g SpatialGraph,
     edge_cost: Box<dyn Fn(EdgeIndex) -> f64 + Sync + 'g>,
+    pricing: Pricing,
     pub(crate) origin_snaps: Vec<Option<SnapResult>>,
     pub(crate) destination_snaps: Vec<Option<SnapResult>>,
     from: Vec<Vec<Seed>>,
@@ -93,6 +94,7 @@ impl<'g> Table<'g> {
         destinations: &[LatLon],
         max_snap_m: Option<f64>,
         edge_cost: impl Fn(EdgeIndex) -> f64 + Sync + 'g,
+        pricing: Pricing,
     ) -> Self {
         let origin_snaps = snap_all(sg, origins, Role::Origin, max_snap_m);
         let destination_snaps = snap_all(sg, destinations, Role::Destination, max_snap_m);
@@ -103,7 +105,7 @@ impl<'g> Table<'g> {
             .par_iter()
             .map(|snap| match snap {
                 Some(snap) => {
-                    let anchors = sg.departures(snap, &mut |e| edge_cost(e));
+                    let anchors = sg.departures(snap, &mut |e| edge_cost(e), pricing);
                     seeds_with_lengths(sg, &anchors, &sg.departure_roots(&anchors))
                 }
                 None => Vec::new(),
@@ -113,7 +115,7 @@ impl<'g> Table<'g> {
             .par_iter()
             .map(|snap| match snap {
                 Some(snap) => {
-                    let anchors = sg.arrivals(snap, &mut |e| edge_cost(e));
+                    let anchors = sg.arrivals(snap, &mut |e| edge_cost(e), pricing);
                     seeds_with_lengths(sg, &anchors, &sg.arrival_roots(&anchors))
                 }
                 None => Vec::new(),
@@ -133,6 +135,7 @@ impl<'g> Table<'g> {
         Table {
             sg,
             edge_cost: Box::new(edge_cost),
+            pricing,
             origin_snaps,
             destination_snaps,
             from,
@@ -159,10 +162,12 @@ impl<'g> Table<'g> {
         same_road.dedup();
         for j in same_road {
             let destination = self.destination_snaps[j].as_ref().expect("indexed above");
-            if let Some((cost, piece)) = self
-                .sg
-                .direct_piece(origin, destination, &mut |e| (self.edge_cost)(e))
-            {
+            if let Some((cost, piece)) = self.sg.direct_piece(
+                origin,
+                destination,
+                &mut |e| (self.edge_cost)(e),
+                self.pricing,
+            ) {
                 if cost < row[j].0 {
                     row[j] = (cost, piece.share() * self.sg.graph[piece.edge].length);
                 }
@@ -286,7 +291,11 @@ fn matrix(
     edge_cost: &(dyn Fn(EdgeIndex) -> f64 + Sync),
     costs: Costs<'_>,
 ) -> TravelTimeMatrix {
-    let table = Table::new(sg, &origins, &destinations, max_snap_m, edge_cost);
+    let pricing = match costs {
+        Costs::Native => Pricing::Native,
+        Costs::Custom { .. } => Pricing::Custom,
+    };
+    let table = Table::new(sg, &origins, &destinations, max_snap_m, edge_cost, pricing);
     let known = |x: f64, cell: &Cell| cell.0.is_finite().then_some(x);
     type Row = Vec<Option<f64>>;
     let rows: Vec<(Row, Row)> = table.rows(costs, false, |_, row| {
@@ -355,8 +364,7 @@ impl SpatialGraph {
             adjacency
                 .edges
                 .par_iter()
-                .enumerate()
-                .map(|(slot, &e)| adjacency.slot_cost(slot, edge_cost(EdgeIndex::new(e as usize))))
+                .map(|&e| edge_cost(EdgeIndex::new(e as usize)))
                 .collect()
         };
         let (out, inc) = (slot_costs(&index.out), slot_costs(&index.inc));

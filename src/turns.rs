@@ -42,9 +42,34 @@ fn turn_angle(from: f64, to: f64) -> f64 {
     angle
 }
 
+/// Whether leaving along `exit` goes straight back along the road `into`
+/// arrived on: the same way(s), in reverse, over the same shape. A different
+/// road joining the same two nodes is a turn onto that road, not a U-turn.
+fn reverses(graph: &RoadGraph, into: EdgeIndex, exit: EdgeIndex) -> bool {
+    let (a, b) = (&graph[into], &graph[exit]);
+    if a.way_id != b.last_way_id || a.last_way_id != b.way_id {
+        return false;
+    }
+    let shape = |edge: EdgeIndex| -> Option<Vec<(f64, f64)>> {
+        let (source, target) = graph.edge_endpoints(edge)?;
+        let geometry = graph[edge].oriented_geometry(&graph[source], &graph[target]);
+        Some(geometry.points().collect())
+    };
+    let (Some(there), Some(back)) = (shape(into), shape(exit)) else {
+        return false;
+    };
+    there.len() == back.len()
+        && there
+            .iter()
+            .rev()
+            .zip(&back)
+            .all(|(p, q)| (p.0 - q.0).abs() < 1e-9 && (p.1 - q.1).abs() < 1e-9)
+}
+
 /// The cost of every turn worth pricing, as `(into junction, out of
-/// junction, seconds)`: all turns at junctions of three or more roads, and
-/// U-turns everywhere (back along the road just travelled).
+/// junction, seconds)`: all turns at junctions of three or more roads,
+/// U-turns everywhere (back along the road just travelled), and turns onto
+/// another road leading straight back to where the vehicle came from.
 pub(crate) fn turn_costs(graph: &RoadGraph, costs: &TurnCosts) -> Vec<(EdgeIndex, EdgeIndex, f64)> {
     let mut out = Vec::new();
     if costs.is_none() {
@@ -64,13 +89,14 @@ pub(crate) fn turn_costs(graph: &RoadGraph, costs: &TurnCosts) -> Vec<(EdgeIndex
                 if exit.id() == into.id() {
                     continue; // a self-loop is not a turn
                 }
-                let u_turn = exit.target() == into.source();
-                if !junction && !u_turn {
+                let back_to_start = exit.target() == into.source();
+                if !junction && !back_to_start {
                     continue;
                 }
+                let u_turn = back_to_start && reverses(graph, into.id(), exit.id());
                 let angle = match (arriving, end_heading(graph, exit.id(), false)) {
                     (Some(from), Some(to)) => turn_angle(from, to),
-                    _ if u_turn => 180.0,
+                    _ if back_to_start => 180.0,
                     _ => 0.0,
                 };
                 let cost = costs.cost(angle, u_turn);
@@ -144,5 +170,38 @@ mod tests {
         assert!(back > 20.0);
         // Dead ends at the arm tips allow only U-turns, which are priced.
         assert!(costs.iter().any(|&(a, b, _)| a == exit[0] && b == into[0]));
+    }
+
+    #[test]
+    fn a_parallel_road_back_is_a_turn_not_a_u_turn() {
+        // Way 1 runs north from a to b (both ways); way 2 bends east on its
+        // way from b back to a.
+        let tags: Arc<[OsmTag]> = Vec::new().into();
+        let mut g = RoadGraph::new();
+        let node = |id, lat, lon| OsmNode {
+            id,
+            lat,
+            lon,
+            tags: vec![],
+        };
+        let a = g.add_node(node(1, 0.0, 0.0));
+        let b = g.add_node(node(2, 0.001, 0.0));
+        let north = g.add_edge(a, b, Edge::from_length(1, tags.clone(), 111.0, 50.0));
+        let south = g.add_edge(b, a, Edge::from_length(1, tags.clone(), 111.0, 50.0));
+        let mut bend = Edge::from_length(2, tags.clone(), 130.0, 50.0);
+        bend.geometry = vec![(0.001, 0.0), (0.0005, 0.0004), (0.0, 0.0)];
+        let around = g.add_edge(b, a, bend);
+
+        let costs = turn_costs(&g, &TurnCosts::default());
+        let cost_of = |x: EdgeIndex, y: EdgeIndex| {
+            costs
+                .iter()
+                .find(|&&(p, q, _)| p == x && q == y)
+                .map_or(0.0, |&(_, _, c)| c)
+        };
+        let u_turn = cost_of(north, south);
+        let onto_way_2 = cost_of(north, around);
+        assert!(u_turn > 20.0, "{u_turn}");
+        assert!(onto_way_2 < 10.0, "{onto_way_2}");
     }
 }

@@ -109,10 +109,26 @@ pub fn check_disk_xml_cache(query: &str) -> Option<String> {
 }
 
 /// Persist an Overpass XML response to disk. Best-effort — silently ignores errors.
+///
+/// The response goes to a temporary file first and is then renamed into
+/// place, so an interrupted or concurrent write never leaves a truncated
+/// file for later reads to pick up.
 pub fn write_disk_xml_cache(query: &str, xml: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITES: AtomicU64 = AtomicU64::new(0);
+
     let dir = disk_cache_dir();
-    if std::fs::create_dir_all(&dir).is_ok() {
-        let _ = std::fs::write(disk_xml_path(query), xml);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = disk_xml_path(query);
+    let temp = path.with_extension(format!(
+        "{}-{}.tmp",
+        std::process::id(),
+        WRITES.fetch_add(1, Ordering::Relaxed)
+    ));
+    if std::fs::write(&temp, xml).is_err() || std::fs::rename(&temp, &path).is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
 }
 
@@ -157,6 +173,15 @@ mod tests {
         assert_eq!(result, Some("<xml>hello</xml>".to_string()));
 
         assert!(check_disk_xml_cache("other_query").is_none());
+
+        // Rewriting replaces the entry and leaves no temporary files behind.
+        write_disk_xml_cache("test_query", "<xml>again</xml>");
+        assert_eq!(
+            check_disk_xml_cache("test_query"),
+            Some("<xml>again</xml>".to_string())
+        );
+        let files: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+        assert_eq!(files.len(), 1, "{files:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
         std::env::remove_var("GRAPHWAYS_CACHE_DIR");

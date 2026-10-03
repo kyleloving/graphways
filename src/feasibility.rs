@@ -41,8 +41,8 @@ use petgraph::graph::{EdgeIndex, NodeIndex};
 
 use crate::error::OsmGraphError;
 use crate::graph::seeds;
-use crate::graph::{LatLon, NodeMap, RoadGraph, Role, SnapResult, SpatialGraph};
-use crate::reachability::{induced_edge_count, EdgeInfo};
+use crate::graph::{LatLon, NodeMap, Pricing, RoadGraph, Role, SnapResult, SpatialGraph};
+use crate::reachability::{induced_edge_count, street_node_count, EdgeInfo};
 use crate::search::{astar, dijkstra};
 
 // ---------------------------------------------------------------------------
@@ -149,13 +149,14 @@ fn feasibility(
     destination: &SnapResult,
     available_time: f64,
     edge_cost: &mut dyn FnMut(EdgeIndex) -> f64,
+    pricing: Pricing,
     mut price: impl FnMut(Side, usize) -> f64,
 ) -> Result<FeasibilityResult, InfeasibleReason> {
     let index = sg.search_index();
-    let departures = seeds(&sg.departure_roots(&sg.departures(origin, edge_cost)));
-    let arrivals = seeds(&sg.arrival_roots(&sg.arrivals(destination, edge_cost)));
+    let departures = seeds(&sg.departure_roots(&sg.departures(origin, edge_cost, pricing)));
+    let arrivals = seeds(&sg.arrival_roots(&sg.arrivals(destination, edge_cost, pricing)));
     let direct = sg
-        .direct_piece(origin, destination, edge_cost)
+        .direct_piece(origin, destination, edge_cost, pricing)
         .map(|(cost, _)| cost);
 
     // Forward search: origin → every node within budget.
@@ -257,7 +258,8 @@ fn feasibility(
 /// *original* graph orientation — `source` and `target` are not flipped for
 /// the reverse search — so cost models keyed by edge identity, density, or
 /// node position see a consistent view in both directions. Costs that are
-/// negative, NaN or infinite make an edge impassable.
+/// negative, NaN or infinite make an edge impassable. Turn restrictions
+/// still apply; turn costs (seconds) are not added to custom costs.
 pub fn compute_feasibility_with<F>(
     sg: &SpatialGraph,
     origin: &SnapResult,
@@ -277,12 +279,13 @@ where
         destination,
         available_time,
         &mut |e| price_edge(e.index() as u32),
+        Pricing::Custom,
         |side, slot| {
             let adjacency = match side {
                 Side::Out => &index.out,
                 Side::In => &index.inc,
             };
-            adjacency.slot_cost(slot, price_edge(adjacency.edges[slot]))
+            price_edge(adjacency.edges[slot])
         },
     )
 }
@@ -305,6 +308,7 @@ pub fn compute_feasibility(
         destination,
         available_time,
         &mut |e| sg.graph[e].travel_time(nt),
+        Pricing::Native,
         |side, slot| match side {
             Side::Out => costs.out[slot],
             Side::In => costs.inc[slot],
@@ -335,7 +339,7 @@ pub fn build_feasibility_polygon(
     let points: MultiPoint<f64> = result
         .feasible
         .iter()
-        .filter(|(_, n)| n.slack >= min_slack)
+        .filter(|(&idx, n)| n.slack >= min_slack && !crate::transit::is_transit(&graph[idx].tags))
         .map(|(&idx, _)| {
             let node = &graph[idx];
             geo::Point::new(node.lon, node.lat)
@@ -355,8 +359,9 @@ pub fn build_feasibility_polygon(
 // ---------------------------------------------------------------------------
 
 impl PrismGraph {
+    /// Number of street nodes in the prism.
     pub fn node_count(&self) -> usize {
-        self.result.feasible.len()
+        street_node_count(&self.graph, &self.result.feasible)
     }
 
     /// Number of directed edges between prism nodes.

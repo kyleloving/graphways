@@ -177,6 +177,7 @@ fn collapse_path_edges(graph: &RoadGraph, edges: &[EdgeIndex]) -> Edge {
         way.walk_travel_time += part.walk_travel_time;
         way.bike_travel_time += part.bike_travel_time;
         way.drive_travel_time += part.drive_travel_time;
+        way.signal_delay_s += part.signal_delay_s;
         weighted_speed_sum += part.speed_kph * part.length;
 
         // Consecutive edges share their joint point; keep it only once.
@@ -299,7 +300,9 @@ fn refit_length(edge: &mut Edge, span: f64, profile: &Profile) {
         let scale = length / edge.length;
         edge.walk_travel_time *= scale;
         edge.bike_travel_time *= scale;
-        edge.drive_travel_time *= scale;
+        // Signal waits do not grow with the road.
+        let delay = edge.signal_delay_s;
+        edge.drive_travel_time = (edge.drive_travel_time - delay) * scale + delay;
         edge.length = length;
     } else {
         edge.set_length(length, profile);
@@ -551,6 +554,26 @@ mod tests {
         assert_eq!(
             simplified.edge_weights().next().unwrap().drive_travel_time,
             10.0
+        );
+    }
+
+    #[test]
+    fn refitting_length_keeps_signal_waits_whole() {
+        let mut edge = Edge {
+            signal_delay_s: 2.0,
+            ..make_way_with_length(1, 12.0, 100.0)
+        };
+        refit_length(&mut edge, 200.0, &Profile::default());
+        assert!(
+            (edge.drive_travel_time - 22.0).abs() < 1e-9,
+            "{}",
+            edge.drive_travel_time
+        );
+        edge.set_length(0.0, &Profile::default());
+        assert!(
+            (edge.drive_travel_time - 2.0).abs() < 1e-9,
+            "{}",
+            edge.drive_travel_time
         );
     }
 

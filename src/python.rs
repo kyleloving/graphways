@@ -146,16 +146,31 @@ fn nearest_of(
         .map(|(_, node)| (node.id, node.lat, node.lon))
 }
 
-/// Edges of `sg` whose endpoints both carry a label, with those labels.
-/// Visits only the labelled nodes' edges, not the whole graph.
+/// The labels of street nodes: transit stops and vehicles added by
+/// `with_transit` only carry the search and are not reported.
+fn street_labels<'a, L>(
+    sg: &'a SpatialGraph,
+    labels: &'a NodeMap<L>,
+) -> impl Iterator<Item = (&'a NodeIndex, &'a L)> + 'a {
+    labels
+        .iter()
+        .filter(move |(&node, _)| sg.is_street_node(node))
+}
+
+/// Edges of `sg` whose endpoints are both labelled street nodes, with those
+/// labels. Visits only the labelled nodes' edges, not the whole graph.
 fn labeled_edges<'a, L>(
     sg: &'a SpatialGraph,
     labels: &'a NodeMap<L>,
 ) -> impl Iterator<Item = (EdgeReference<'a, Edge>, &'a L, &'a L)> + 'a {
-    labels.iter().flat_map(move |(&source, source_label)| {
-        sg.graph
-            .edges(source)
-            .filter_map(move |edge| Some((edge, source_label, labels.get(edge.target())?)))
+    street_labels(sg, labels).flat_map(move |(&source, source_label)| {
+        sg.graph.edges(source).filter_map(move |edge| {
+            let target = edge.target();
+            if !sg.is_street_node(target) {
+                return None;
+            }
+            Some((edge, source_label, labels.get(target)?))
+        })
     })
 }
 
@@ -1169,7 +1184,12 @@ impl PyReachableGraph {
     }
 
     fn nearest_node(&self, lat: f64, lon: f64) -> Option<(i64, f64, f64)> {
-        nearest_of(self.sg(), self.times().keys(), lat, lon)
+        nearest_of(
+            self.sg(),
+            street_labels(self.sg(), self.times()).map(|(&n, _)| n),
+            lat,
+            lon,
+        )
     }
 
     fn travel_time_to_node_id(&self, node_id: i64) -> Option<f64> {
@@ -1178,7 +1198,7 @@ impl PyReachableGraph {
 
     fn nodes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let items = PyList::empty(py);
-        for (&idx, &travel_time_s) in self.times() {
+        for (&idx, &travel_time_s) in street_labels(self.sg(), self.times()) {
             let node = &self.sg().graph[idx];
             let dict = PyDict::new(py);
             dict.set_item("node_id", node.id)?;
@@ -1192,18 +1212,20 @@ impl PyReachableGraph {
 
     fn nodes_geojson(&self, py: Python<'_>) -> String {
         py.detach(|| {
-            feature_collection(self.times().iter().map(|(&idx, &travel_time_s)| {
-                let node = &self.sg().graph[idx];
-                feature(
-                    point(node),
-                    props([
-                        ("node_id", node.id.into()),
-                        ("lat", node.lat.into()),
-                        ("lon", node.lon.into()),
-                        ("travel_time_s", travel_time_s.into()),
-                    ]),
-                )
-            }))
+            feature_collection(street_labels(self.sg(), self.times()).map(
+                |(&idx, &travel_time_s)| {
+                    let node = &self.sg().graph[idx];
+                    feature(
+                        point(node),
+                        props([
+                            ("node_id", node.id.into()),
+                            ("lat", node.lat.into()),
+                            ("lon", node.lon.into()),
+                            ("travel_time_s", travel_time_s.into()),
+                        ]),
+                    )
+                },
+            ))
         })
     }
 
@@ -1223,7 +1245,7 @@ impl PyReachableGraph {
 
     fn to_geojson(&self, py: Python<'_>) -> String {
         py.detach(|| {
-            let nodes = self.times().iter().map(|(&idx, &travel_time_s)| {
+            let nodes = street_labels(self.sg(), self.times()).map(|(&idx, &travel_time_s)| {
                 let node = &self.sg().graph[idx];
                 feature(
                     point(node),
@@ -1350,7 +1372,12 @@ impl PyPrismGraph {
     }
 
     fn nearest_node(&self, lat: f64, lon: f64) -> Option<(i64, f64, f64)> {
-        nearest_of(self.sg(), self.feasible().keys(), lat, lon)
+        nearest_of(
+            self.sg(),
+            street_labels(self.sg(), self.feasible()).map(|(&n, _)| n),
+            lat,
+            lon,
+        )
     }
 
     fn slack_at_node_id(&self, node_id: i64) -> Option<f64> {
@@ -1359,7 +1386,7 @@ impl PyPrismGraph {
 
     fn nodes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let items = PyList::empty(py);
-        for (&idx, reach) in self.feasible() {
+        for (&idx, reach) in street_labels(self.sg(), self.feasible()) {
             let node = &self.sg().graph[idx];
             let dict = PyDict::new(py);
             dict.set_item("node_id", node.id)?;
@@ -1375,20 +1402,22 @@ impl PyPrismGraph {
 
     fn nodes_geojson(&self, py: Python<'_>) -> String {
         py.detach(|| {
-            feature_collection(self.feasible().iter().map(|(&idx, reach)| {
-                let node = &self.sg().graph[idx];
-                feature(
-                    point(node),
-                    props([
-                        ("node_id", node.id.into()),
-                        ("lat", node.lat.into()),
-                        ("lon", node.lon.into()),
-                        ("inbound_time_s", reach.inbound_time.into()),
-                        ("outbound_time_s", reach.outbound_time.into()),
-                        ("slack_s", reach.slack.into()),
-                    ]),
-                )
-            }))
+            feature_collection(
+                street_labels(self.sg(), self.feasible()).map(|(&idx, reach)| {
+                    let node = &self.sg().graph[idx];
+                    feature(
+                        point(node),
+                        props([
+                            ("node_id", node.id.into()),
+                            ("lat", node.lat.into()),
+                            ("lon", node.lon.into()),
+                            ("inbound_time_s", reach.inbound_time.into()),
+                            ("outbound_time_s", reach.outbound_time.into()),
+                            ("slack_s", reach.slack.into()),
+                        ]),
+                    )
+                }),
+            )
         })
     }
 
@@ -1408,7 +1437,7 @@ impl PyPrismGraph {
 
     fn to_geojson(&self, py: Python<'_>) -> String {
         py.detach(|| {
-            let nodes = self.feasible().iter().map(|(&idx, reach)| {
+            let nodes = street_labels(self.sg(), self.feasible()).map(|(&idx, reach)| {
                 let node = &self.sg().graph[idx];
                 feature(
                     point(node),

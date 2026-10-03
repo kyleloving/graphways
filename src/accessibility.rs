@@ -9,7 +9,7 @@
 use petgraph::graph::EdgeIndex;
 
 use crate::error::OsmGraphError;
-use crate::graph::{LatLon, SpatialGraph};
+use crate::graph::{LatLon, Pricing, SpatialGraph};
 use crate::matrix::{Costs, Table};
 
 /// How an opportunity's contribution falls off with travel time `t` (seconds).
@@ -177,6 +177,7 @@ impl SpatialGraph {
             &destinations,
             max_snap_m,
             move |e: EdgeIndex| self.graph[e].travel_time(nt),
+            Pricing::Native,
         )
     }
 }

@@ -581,6 +581,7 @@ fn transit_edge(tags: Arc<[OsmTag]>, length: f64, seconds: f64) -> Edge {
         walk_travel_time: seconds,
         bike_travel_time: f64::INFINITY,
         drive_travel_time: f64::INFINITY,
+        signal_delay_s: 0.0,
         geometry: Vec::new(),
     }
 }
@@ -619,11 +620,19 @@ impl SpatialGraph {
                 "wait_factor must be a non-negative number".into(),
             ));
         }
+        if options.max_link_m.is_nan() || options.max_link_m < 0.0 {
+            return Err(OsmGraphError::InvalidInput(
+                "max_link_m must be a non-negative number".into(),
+            ));
+        }
         let service = Service::read(gtfs.as_ref(), options)?;
         let mut graph: RoadGraph = (*self.graph).clone();
         let walk_mps = walk_speed_mps(&graph);
         let mut summary = TransitSummary::default();
-        let mut next_id = -1_i64;
+        // New nodes count down from below every id in use, so a graph that
+        // already carries transit (or negative OSM ids) keeps ids unique.
+        let lowest = graph.node_weights().map(|n| n.id).min().unwrap_or(0);
+        let mut next_id = lowest.min(0) - 1;
         let mut new_node = |graph: &mut RoadGraph, lat: f64, lon: f64, tags: Vec<OsmTag>| {
             let id = next_id;
             next_id -= 1;
@@ -768,6 +777,9 @@ impl SpatialGraph {
             if let (Some(from), Some(to)) = (stop_nodes[a as usize], stop_nodes[b as usize]) {
                 let (sa, sb) = (&service.stops[a as usize], &service.stops[b as usize]);
                 let metres = LatLon::new(sa.lat, sa.lon).distance_m(LatLon::new(sb.lat, sb.lon));
+                // A transfer is walked: `min_transfer_time` can add to the
+                // walk, never shorten it (types 0/1 give no time at all).
+                let seconds = seconds.max(metres / walk_mps);
                 graph.add_edge(from, to, transit_edge(transfer.clone(), metres, seconds));
             }
         }
@@ -989,6 +1001,98 @@ mod tests {
         std::fs::remove_dir_all(&not_a_feed).ok();
         let drive = SpatialGraph::new((*walk.graph).clone(), NetworkType::Drive);
         assert!(drive.with_transit(&path, &options).is_err());
+    }
+
+    #[test]
+    fn transfers_take_at_least_the_walk() {
+        // A "timed" transfer (type 0) from W to E, 5.5 km apart: it must not
+        // move anyone there faster than walking.
+        let walk = long_street();
+        let dir = temp("transfers");
+        write_feed(&dir);
+        std::fs::write(
+            dir.join("transfers.txt"),
+            "from_stop_id,to_stop_id,transfer_type\nW,E,0\nE,W,2\n",
+        )
+        .unwrap();
+        let options = TransitOptions::new("2026-10-06", "07:00", "09:00").unwrap();
+        let (sg, _) = walk.with_transit(&dir, &options).unwrap();
+        let expected = 300.0 + 480.0 + 2.0 * 11.1 / (5.0 / 3.6);
+        assert!(
+            (end_to_end(&sg) - expected).abs() < 2.0,
+            "{}",
+            end_to_end(&sg)
+        );
+        let back = sg.route((0.0, 0.05), (0.0, 0.0), None).unwrap().duration_s;
+        assert!(back > 3600.0, "{back}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reachable_and_prism_views_report_only_streets() {
+        let walk = long_street();
+        let dir = temp("views");
+        write_feed(&dir);
+        let options = TransitOptions::new("2026-10-06", "07:00", "09:00").unwrap();
+        let (sg, _) = walk.with_transit(&dir, &options).unwrap();
+        // Street nodes keep their OSM ids; transit ones count down from -1.
+        let street = |node: NodeIndex| sg.graph[node].id > 0;
+
+        // Fifteen minutes reaches both ends of the street (riding to the
+        // far one), passing through stops and platforms on the way.
+        let reach = sg.reachable_graph((0.0, 0.0), 900.0, None).unwrap();
+        let reached = |node: NodeIndex| street(node) && reach.result.times.contains_key(node);
+        let streets = reach.result.times.keys().filter(|&n| street(n)).count();
+        assert!(streets < reach.result.times.len(), "transit was used");
+        assert_eq!(reach.node_count(), streets);
+        let street_edges = sg
+            .graph
+            .edge_indices()
+            .filter(|&e| {
+                let (a, b) = sg.graph.edge_endpoints(e).unwrap();
+                reached(a) && reached(b)
+            })
+            .count();
+        assert_eq!(reach.edge_count(), street_edges);
+
+        let prism = sg.prism((0.0, 0.0), (0.0, 0.05), 900.0, None).unwrap();
+        let in_prism = prism.result.feasible.keys().filter(|&n| street(n)).count();
+        assert!(in_prism < prism.result.feasible.len(), "transit was used");
+        assert_eq!(prism.node_count(), in_prism);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn adding_transit_twice_keeps_node_ids_unique() {
+        let walk = long_street();
+        let dir = temp("twice");
+        write_feed(&dir);
+        let options = TransitOptions::new("2026-10-06", "07:00", "09:00").unwrap();
+        let (once, _) = walk.with_transit(&dir, &options).unwrap();
+        let (twice, _) = once.with_transit(&dir, &options).unwrap();
+        let mut ids: Vec<i64> = twice.graph.node_weights().map(|n| n.id).collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total);
+        assert!(total > once.graph.node_count());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn link_distance_must_be_a_number() {
+        let walk = long_street();
+        let dir = temp("link");
+        write_feed(&dir);
+        for bad in [f64::NAN, -1.0] {
+            let mut options = TransitOptions::new("2026-10-06", "07:00", "09:00").unwrap();
+            options.max_link_m = bad;
+            assert!(matches!(
+                walk.with_transit(&dir, &options),
+                Err(OsmGraphError::InvalidInput(_))
+            ));
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -330,7 +330,8 @@ frequencies rather than individual departures:
   stop (half the headway: someone arriving at a random time waits half the
   gap between departures);
 - changing lines means getting off, walking (through the streets, or along
-  the feed's `transfers.txt` links) and waiting again;
+  the feed's `transfers.txt` links, which take at least the time to walk
+  them) and waiting again;
 - each stop is linked to the nearest street within `max_link_m`.
 
 Points still snap only to streets, and isochrones are shaped by the street

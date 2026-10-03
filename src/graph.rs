@@ -134,6 +134,10 @@ pub struct Edge {
     pub walk_travel_time: f64,
     pub bike_travel_time: f64,
     pub drive_travel_time: f64,
+    /// The part of `drive_travel_time` spent waiting at traffic signals,
+    /// counted at the edge's end: a trip over only part of the edge pays it
+    /// only if it reaches the end.
+    pub signal_delay_s: f64,
     /// Intermediate shape as `(lat, lon)` points. Empty means a straight
     /// segment between the endpoints, which is what unsimplified edges use.
     /// Read it through [`Edge::oriented_geometry`], which handles both cases
@@ -174,7 +178,8 @@ impl Edge {
         self.length = length;
         self.walk_travel_time = calculate_travel_time(length, profile.walk_speed_kph);
         self.bike_travel_time = calculate_travel_time(length, profile.bike_speed_kph);
-        self.drive_travel_time = calculate_travel_time(length, self.speed_kph);
+        self.drive_travel_time =
+            calculate_travel_time(length, self.speed_kph) + self.signal_delay_s;
     }
 
     /// Travel time in seconds for `network_type`.
@@ -279,6 +284,15 @@ pub fn edge_geometry(graph: &RoadGraph, edge: EdgeIndex) -> EdgeGeometry<'_> {
         .edge_endpoints(edge)
         .expect("edge index belongs to this graph");
     graph[edge].oriented_geometry(&graph[source], &graph[target])
+}
+
+/// What an edge-cost callback returns: the graph's own travel times, whose
+/// signal waits sit at the end of each edge, or a caller's costs in unknown
+/// units, shared out along an edge in proportion to length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pricing {
+    Native,
+    Custom,
 }
 
 /// A stretch of one edge between two fractions of its length, `0 <= from <=
@@ -492,6 +506,7 @@ fn build_graph(
                 };
                 if delayed && edge.drive_travel_time.is_finite() {
                     edge.drive_travel_time += profile.traffic_signal_s;
+                    edge.signal_delay_s = profile.traffic_signal_s;
                 }
                 graph.add_edge(from, to, edge);
             }
@@ -880,8 +895,9 @@ impl SpatialGraph {
     /// Wrap a road graph with banned turns and with turn costs: each
     /// `(into junction, out of junction, seconds)` in `turn_costs` adds that
     /// many seconds to the turn (e.g. from [`crate::profile::TurnCosts`]).
-    /// Turn costs add to whatever edge cost a query uses, including the
-    /// closures of the `_with` queries.
+    /// Turn costs add to the graph's own travel times; the closures of the
+    /// `_with` queries, whose units need not be seconds, still respect banned
+    /// turns but pay no turn costs.
     pub fn with_turns(
         graph: RoadGraph,
         network_type: NetworkType,
@@ -1217,6 +1233,32 @@ impl SpatialGraph {
         }
     }
 
+    /// Whether `node` is part of the street network, as opposed to the stops
+    /// and vehicles [`SpatialGraph::with_transit`] adds for its searches.
+    pub(crate) fn is_street_node(&self, node: NodeIndex) -> bool {
+        !crate::transit::is_transit(&self.graph[node].tags)
+    }
+
+    /// The signal wait at the end of `edge` under `pricing`: part of the
+    /// graph's own driving times, unknown for custom costs.
+    pub(crate) fn end_wait(&self, edge: EdgeIndex, pricing: Pricing) -> f64 {
+        match pricing {
+            Pricing::Native if self.network_type() == NetworkType::Drive => {
+                self.graph[edge].signal_delay_s
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Cost of covering `piece`, given its edge's whole cost: the moving
+    /// time in proportion to the share covered, plus the edge's signal wait
+    /// if the piece reaches the end where it sits.
+    pub(crate) fn piece_cost(&self, piece: &Piece, edge_cost: f64, pricing: Pricing) -> f64 {
+        let wait = self.end_wait(piece.edge, pricing);
+        let at_end = if piece.to >= 1.0 { wait } else { 0.0 };
+        (edge_cost - wait) * piece.share() + at_end
+    }
+
     /// The edge running the opposite way along the same road as `edge`, if
     /// one exists.
     pub(crate) fn twin(&self, edge: EdgeIndex) -> Option<EdgeIndex> {
@@ -1280,8 +1322,9 @@ impl SpatialGraph {
         &self,
         snap: &SnapResult,
         cost: &mut dyn FnMut(EdgeIndex) -> f64,
+        pricing: Pricing,
     ) -> Vec<Anchor> {
-        self.anchors(snap, cost, true)
+        self.anchors(snap, cost, pricing, true)
     }
 
     /// Ways from the network to `snap`, priced by `cost`.
@@ -1289,14 +1332,16 @@ impl SpatialGraph {
         &self,
         snap: &SnapResult,
         cost: &mut dyn FnMut(EdgeIndex) -> f64,
+        pricing: Pricing,
     ) -> Vec<Anchor> {
-        self.anchors(snap, cost, false)
+        self.anchors(snap, cost, pricing, false)
     }
 
     fn anchors(
         &self,
         snap: &SnapResult,
         cost: &mut dyn FnMut(EdgeIndex) -> f64,
+        pricing: Pricing,
         depart: bool,
     ) -> Vec<Anchor> {
         let Some(edge) = snap.edge else {
@@ -1314,7 +1359,7 @@ impl SpatialGraph {
                 let piece = Piece { edge, from, to };
                 anchors.push(Anchor {
                     node,
-                    cost: cost * piece.share(),
+                    cost: self.piece_cost(&piece, cost, pricing),
                     piece: Some(piece),
                 });
             }
@@ -1352,6 +1397,7 @@ impl SpatialGraph {
         origin: &SnapResult,
         destination: &SnapResult,
         cost: &mut dyn FnMut(EdgeIndex) -> f64,
+        pricing: Pricing,
     ) -> Option<(f64, Piece)> {
         let (eo, ed) = (origin.edge?, destination.edge?);
         let twin = self.twin(eo);
@@ -1373,7 +1419,7 @@ impl SpatialGraph {
             let edge_cost = cost(edge);
             if to >= from && edge_cost.is_finite() && edge_cost >= 0.0 {
                 let piece = Piece { edge, from, to };
-                let total = edge_cost * piece.share();
+                let total = self.piece_cost(&piece, edge_cost, pricing);
                 if best.is_none_or(|(b, _)| total < b) {
                     best = Some((total, piece));
                 }

@@ -28,7 +28,7 @@ use crate::graph::{Edge, OsmNode, OsmTag, RoadGraph, SnapResult, SnappedPoi, Spa
 use crate::overpass::NetworkType;
 
 const MAGIC: &[u8; 8] = b"GRAPHWAY";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct SavedGraph {
@@ -52,6 +52,7 @@ struct SavedEdge {
     length: f64,
     speed_kph: f64,
     times: [f64; 3],
+    signal_delay_s: f64,
     geometry: Vec<(f64, f64)>,
 }
 
@@ -135,6 +136,7 @@ impl SpatialGraph {
                         way.bike_travel_time,
                         way.drive_travel_time,
                     ],
+                    signal_delay_s: way.signal_delay_s,
                     geometry: way.geometry.clone(),
                 }
             })
@@ -194,6 +196,9 @@ impl SpatialGraph {
             }
             if !(e.length.is_finite() && e.length >= 0.0)
                 || e.times.iter().any(|t| t.is_nan() || *t < 0.0)
+                || e.signal_delay_s.is_nan()
+                || e.signal_delay_s < 0.0
+                || e.signal_delay_s.is_infinite()
                 || !e.geometry.iter().all(|&p| finite(p))
             {
                 return Err(invalid("edge has an invalid length, time or shape"));
@@ -213,6 +218,7 @@ impl SpatialGraph {
                     walk_travel_time: e.times[0],
                     bike_travel_time: e.times[1],
                     drive_travel_time: e.times[2],
+                    signal_delay_s: e.signal_delay_s,
                     geometry: e.geometry,
                 },
             );

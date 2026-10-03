@@ -8,7 +8,9 @@
 use petgraph::graph::{EdgeIndex, NodeIndex};
 
 use crate::error::OsmGraphError;
-use crate::graph::{seeds, Edge, LatLon, NodeMap, RoadGraph, Role, SnapResult, SpatialGraph};
+use crate::graph::{
+    seeds, Edge, LatLon, NodeMap, Pricing, RoadGraph, Role, SnapResult, SpatialGraph,
+};
 use crate::search::dijkstra;
 
 /// Result of a one-to-many shortest-path search from a single origin.
@@ -56,7 +58,7 @@ impl ReachabilityResult {
     /// Respects turn restrictions on the way onto that road.
     pub fn time_to(&self, sg: &SpatialGraph, snap: &SnapResult) -> Option<f64> {
         let nt = sg.network_type();
-        let arrivals = sg.arrivals(snap, &mut |e| sg.graph[e].travel_time(nt));
+        let arrivals = sg.arrivals(snap, &mut |e| sg.graph[e].travel_time(nt), Pricing::Native);
         let best = match &self.state_times {
             Some(states) => sg
                 .arrival_roots(&arrivals)
@@ -119,7 +121,8 @@ impl<'a> EdgeInfo<'a> {
 /// The closure is called once per edge relaxation. Use it to inject
 /// density-based traffic penalties, externally-supplied multipliers from a
 /// traffic API, time-of-day adjustments, or any custom cost model. Costs that
-/// are negative, NaN or infinite make an edge impassable.
+/// are negative, NaN or infinite make an edge impassable. Turn restrictions
+/// still apply; turn costs (seconds) are not added to custom costs.
 pub fn compute_reachability_with<F>(
     sg: &SpatialGraph,
     origin: &SnapResult,
@@ -129,13 +132,15 @@ pub fn compute_reachability_with<F>(
 where
     F: FnMut(EdgeInfo<'_>) -> f64,
 {
-    let departures = sg.departures(origin, &mut |e| {
-        cost(EdgeInfo::of(&sg.graph, e.index() as u32))
-    });
+    let departures = sg.departures(
+        origin,
+        &mut |e| cost(EdgeInfo::of(&sg.graph, e.index() as u32)),
+        Pricing::Custom,
+    );
     let sources = seeds(&sg.departure_roots(&departures));
     let out = &sg.search_index().out;
     let states = dijkstra(out, &sources, max_cost, |slot| {
-        out.slot_cost(slot, cost(EdgeInfo::of(&sg.graph, out.edges[slot])))
+        cost(EdgeInfo::of(&sg.graph, out.edges[slot]))
     });
     ReachabilityResult::from_states(sg, origin.snapped(), max_cost, states)
 }
@@ -149,7 +154,11 @@ pub fn compute_reachability(
     max_cost: f64,
 ) -> ReachabilityResult {
     let nt = sg.network_type();
-    let departures = sg.departures(origin, &mut |e| sg.graph[e].travel_time(nt));
+    let departures = sg.departures(
+        origin,
+        &mut |e| sg.graph[e].travel_time(nt),
+        Pricing::Native,
+    );
     let sources = seeds(&sg.departure_roots(&departures));
     let costs = &sg.slot_costs().out;
     let states = dijkstra(&sg.search_index().out, &sources, max_cost, |slot| {
@@ -158,22 +167,30 @@ pub fn compute_reachability(
     ReachabilityResult::from_states(sg, origin.snapped(), max_cost, states)
 }
 
-/// Number of edges of `sg` with both endpoints in `nodes`.
+/// Number of street nodes in `nodes` (transit stops and vehicles are left
+/// out: they only carry the search).
+pub(crate) fn street_node_count<T>(sg: &SpatialGraph, nodes: &NodeMap<T>) -> usize {
+    nodes.keys().filter(|&node| sg.is_street_node(node)).count()
+}
+
+/// Number of edges of `sg` between street nodes in `nodes`.
 pub(crate) fn induced_edge_count<T>(sg: &SpatialGraph, nodes: &NodeMap<T>) -> usize {
     nodes
         .keys()
+        .filter(|&node| sg.is_street_node(node))
         .map(|node| {
             sg.graph
                 .neighbors(node)
-                .filter(|&next| nodes.contains_key(next))
+                .filter(|&next| nodes.contains_key(next) && sg.is_street_node(next))
                 .count()
         })
         .sum()
 }
 
 impl ReachableGraph {
+    /// Number of reachable street nodes.
     pub fn node_count(&self) -> usize {
-        self.result.times.len()
+        street_node_count(&self.graph, &self.result.times)
     }
 
     /// Number of directed edges between reachable nodes.

@@ -107,8 +107,10 @@ a right and 5 s for a left turn in right-hand traffic, plus 20 s for a
 U-turn; `left_hand_traffic` mirrors it and `TurnCosts::none()` turns it off.
 Driving graphs built from OSM data get these costs automatically; for your
 own graphs pass `(into, out, seconds)` triples to
-`SpatialGraph::with_turns`. Turn costs are added to whatever edge cost a
-query uses, including custom cost closures.
+`SpatialGraph::with_turns`. Turn costs and signal delays are part of the
+graph's own travel times; custom cost closures (the `_with` queries) still
+obey banned turns but pay no turn costs, since their units need not be
+seconds.
 
 ### Saving and loading
 
@@ -171,7 +173,8 @@ pub struct Route {
 ```
 
 `route_with` takes a closure `Fn(EdgeInfo) -> f64` (live traffic, penalties);
-negative, NaN or infinite costs make an edge impassable.
+negative, NaN or infinite costs make an edge impassable. Banned turns still
+apply; turn costs (seconds) are not added to the closure's costs.
 
 ### Travel-time matrices
 

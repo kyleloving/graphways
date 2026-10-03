@@ -11,7 +11,7 @@ use petgraph::graph::EdgeIndex;
 
 use crate::ch::ContractionHierarchy;
 use crate::error::OsmGraphError;
-use crate::graph::{anchor_at, seeds, LatLon, Piece, Role, SnapResult, SpatialGraph};
+use crate::graph::{anchor_at, seeds, LatLon, Piece, Pricing, Role, SnapResult, SpatialGraph};
 use crate::reachability::EdgeInfo;
 use crate::search::{astar, SearchPath};
 
@@ -41,15 +41,16 @@ pub(crate) fn best_pieces(
     origin: &SnapResult,
     destination: &SnapResult,
     cost: &mut dyn FnMut(EdgeIndex) -> f64,
+    pricing: Pricing,
     search: impl FnOnce(
         &[(u32, f64)],
         &[(u32, f64)],
         &mut dyn FnMut(EdgeIndex) -> f64,
     ) -> Option<SearchPath>,
 ) -> Option<(f64, Vec<Piece>)> {
-    let departures = sg.departures(origin, cost);
-    let arrivals = sg.arrivals(destination, cost);
-    let direct = sg.direct_piece(origin, destination, cost);
+    let departures = sg.departures(origin, cost, pricing);
+    let arrivals = sg.arrivals(destination, cost, pricing);
+    let direct = sg.direct_piece(origin, destination, cost, pricing);
     let (from, to) = (sg.departure_roots(&departures), sg.arrival_roots(&arrivals));
 
     let via_network = search(&seeds(&from), &seeds(&to), cost).map(|path| {
@@ -76,36 +77,45 @@ fn shortest_pieces(
 ) -> Option<(f64, Vec<Piece>)> {
     let nt = sg.network_type();
     let mut cost = |e: EdgeIndex| sg.graph[e].travel_time(nt);
-    best_pieces(sg, origin, destination, &mut cost, |sources, targets, _| {
-        if let Some(hierarchy) = sg.hierarchy_slot().get() {
-            return hierarchy.shortest_path(sources, targets);
-        }
-        let speed = sg.max_straight_line_speed();
-        let goal = destination.snapped();
-        let remaining_lower_bound = |state: u32| {
-            if !(speed.is_finite() && speed > 0.0) {
-                return 0.0;
+    best_pieces(
+        sg,
+        origin,
+        destination,
+        &mut cost,
+        Pricing::Native,
+        |sources, targets, _| {
+            if let Some(hierarchy) = sg.hierarchy_slot().get() {
+                return hierarchy.shortest_path(sources, targets);
             }
-            sg.state_point(state).distance_m(goal) / speed
-        };
-        let costs = &sg.slot_costs().out;
-        astar(
-            &sg.search_index().out,
-            sources,
-            targets,
-            |slot| costs[slot],
-            remaining_lower_bound,
-        )
-    })
+            let speed = sg.max_straight_line_speed();
+            let goal = destination.snapped();
+            let remaining_lower_bound = |state: u32| {
+                if !(speed.is_finite() && speed > 0.0) {
+                    return 0.0;
+                }
+                sg.state_point(state).distance_m(goal) / speed
+            };
+            let costs = &sg.slot_costs().out;
+            astar(
+                &sg.search_index().out,
+                sources,
+                targets,
+                |slot| costs[slot],
+                remaining_lower_bound,
+            )
+        },
+    )
 }
 
 /// Route coordinates with travel time interpolated along each piece's shape
-/// in proportion to segment length.
+/// in proportion to segment length. Turn costs and signal waits (seconds) are
+/// part of the graph's own travel times only (`Pricing::Native`).
 fn assemble(
     sg: &SpatialGraph,
     (origin_snap, destination_snap): (SnapResult, SnapResult),
     pieces: Vec<Piece>,
     cost: &mut dyn FnMut(EdgeIndex) -> f64,
+    pricing: Pricing,
 ) -> Route {
     let mut coordinates = Vec::new();
     let mut cumulative_times_s = Vec::new();
@@ -118,13 +128,23 @@ fn assemble(
         // Time lost turning onto this piece at the junction it starts from,
         // counted even for an empty piece: the search priced that turn too.
         if let Some(into) = previous.replace(piece.edge) {
-            duration_s += sg.turn_cost(into, piece.edge);
+            if pricing == Pricing::Native {
+                duration_s += sg.turn_cost(into, piece.edge);
+            }
         }
         if piece.share() <= 0.0 {
             continue;
         }
         let points = piece.points(&sg.graph);
-        let piece_time = cost(piece.edge) * piece.share();
+        let piece_time = sg.piece_cost(piece, cost(piece.edge), pricing);
+        // A signal wait the piece reaches is spent at its end, not spread
+        // along the way.
+        let wait = if piece.to >= 1.0 {
+            sg.end_wait(piece.edge, pricing)
+        } else {
+            0.0
+        };
+        let moving_time = piece_time - wait;
         let piece_start_time = duration_s;
 
         segment_lengths.clear();
@@ -134,7 +154,7 @@ fn assemble(
                 .map(|w| LatLon::from(w[0]).distance_m(LatLon::from(w[1]))),
         );
         let geometry_length: f64 = segment_lengths.iter().sum();
-        let evenly_split = piece_time / (segment_lengths.len().max(1) as f64);
+        let evenly_split = moving_time / (segment_lengths.len().max(1) as f64);
 
         if coordinates.is_empty() {
             coordinates.push(points[0]);
@@ -143,7 +163,7 @@ fn assemble(
         let mut elapsed = 0.0;
         for (&point, &segment_len) in points[1..].iter().zip(&segment_lengths) {
             elapsed += if geometry_length > 0.0 {
-                piece_time * (segment_len / geometry_length)
+                moving_time * (segment_len / geometry_length)
             } else {
                 evenly_split
             };
@@ -228,16 +248,22 @@ impl SpatialGraph {
         let (_, pieces) =
             shortest_pieces(self, &snaps.0, &snaps.1).ok_or(OsmGraphError::PathNotFound)?;
         let nt = self.network_type();
-        Ok(assemble(self, snaps, pieces, &mut |e| {
-            self.graph[e].travel_time(nt)
-        }))
+        Ok(assemble(
+            self,
+            snaps,
+            pieces,
+            &mut |e| self.graph[e].travel_time(nt),
+            Pricing::Native,
+        ))
     }
 
     /// Find the cheapest route under a caller-supplied edge cost, e.g. live
     /// traffic or a penalty on certain road classes.
     ///
     /// The returned durations are in the closure's units. Costs that are
-    /// negative, NaN or infinite make an edge impassable. Arbitrary costs rule
+    /// negative, NaN or infinite make an edge impassable. Turn restrictions
+    /// still apply, but turn costs (in seconds) are not added, since the
+    /// closure's units need not be seconds. Arbitrary costs rule
     /// out precomputation and distance bounds, so this runs a plain Dijkstra
     /// search; prefer [`SpatialGraph::route`] for the built-in travel times.
     pub fn route_with<F>(
@@ -258,18 +284,25 @@ impl SpatialGraph {
             &snaps.0,
             &snaps.1,
             &mut edge_cost,
+            Pricing::Custom,
             |sources, targets, edge_cost| {
                 astar(
                     out,
                     sources,
                     targets,
-                    |slot| out.slot_cost(slot, edge_cost(EdgeIndex::new(out.edges[slot] as usize))),
+                    |slot| edge_cost(EdgeIndex::new(out.edges[slot] as usize)),
                     |_| 0.0,
                 )
             },
         )
         .ok_or(OsmGraphError::PathNotFound)?;
-        Ok(assemble(self, snaps, pieces, &mut edge_cost))
+        Ok(assemble(
+            self,
+            snaps,
+            pieces,
+            &mut edge_cost,
+            Pricing::Custom,
+        ))
     }
 }
 
@@ -303,6 +336,7 @@ mod tests {
             walk_travel_time: length / (5.0 / 3.6),
             bike_travel_time: length / (15.0 / 3.6),
             drive_travel_time,
+            signal_delay_s: 0.0,
             geometry: Vec::new(),
         }
     }
@@ -321,6 +355,7 @@ mod tests {
             walk_travel_time,
             bike_travel_time: walk_travel_time,
             drive_travel_time,
+            signal_delay_s: 0.0,
             geometry: Vec::new(),
         }
     }
@@ -607,6 +642,72 @@ mod tests {
 
         assert_eq!(route.coordinates.len(), 3);
         assert_eq!(route.duration_s, 60.0);
+    }
+
+    #[test]
+    fn custom_costs_pay_no_turn_costs() {
+        // a → b → c with a 10 s turn at b.
+        let mut g = DiGraph::new();
+        let a = g.add_node(make_node(1, 0.0, 0.0));
+        let b = g.add_node(make_node(2, 0.001, 0.0));
+        let c = g.add_node(make_node(3, 0.001, 0.001));
+        let ab = g.add_edge(a, b, make_way(10.0, 111.0));
+        let bc = g.add_edge(b, c, make_way(10.0, 111.0));
+        let sg = SpatialGraph::with_turns(g, NetworkType::Drive, vec![], vec![(ab, bc, 10.0)]);
+
+        let timed = sg.route((0.0, 0.0), (0.001, 0.001), None).unwrap();
+        assert!(
+            (timed.duration_s - 30.0).abs() < 1e-9,
+            "{}",
+            timed.duration_s
+        );
+
+        // Shortest distance: metres only, no seconds of turning mixed in.
+        let metres = sg
+            .route_with((0.0, 0.0), (0.001, 0.001), None, |e| e.weight.length)
+            .unwrap();
+        assert!(
+            (metres.duration_s - 222.0).abs() < 1e-9,
+            "{}",
+            metres.duration_s
+        );
+        let matrix =
+            sg.travel_time_matrix_with(&[(0.0, 0.0)], &[(0.001, 0.001)], None, |e| e.weight.length);
+        assert!((matrix.durations_s[0][0].unwrap() - 222.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn signal_waits_sit_at_the_end_of_their_edge() {
+        // A straight road a - s - b with a signal at s; simplification merges
+        // it into one edge a → b (and back) carrying the wait.
+        let xml = r#"<osm>
+            <node id="1" lat="0" lon="0"/>
+            <node id="2" lat="0" lon="0.005"><tag k="highway" v="traffic_signals"/></node>
+            <node id="3" lat="0" lon="0.01"/>
+            <way id="1"><nd ref="1"/><nd ref="2"/><nd ref="3"/><tag k="highway" v="residential"/></way>
+        </osm>"#;
+        let sg = SpatialGraph::from_osm(xml, NetworkType::Drive, false).unwrap();
+        assert_eq!(sg.graph.edge_count(), 2);
+        let edge = sg.graph.edge_weights().next().unwrap();
+        assert!((edge.signal_delay_s - 2.0).abs() < 1e-9);
+        let moving = edge.drive_travel_time - edge.signal_delay_s;
+
+        let whole = sg.route((0.0, 0.0), (0.0, 0.01), None).unwrap();
+        assert!((whole.duration_s - (moving + 2.0)).abs() < 1e-6);
+        // A trip that stops a tenth of the way along pays no wait at all.
+        let short = sg.route((0.0, 0.0), (0.0, 0.001), None).unwrap();
+        assert!(
+            (short.duration_s - 0.1 * moving).abs() < 1e-6,
+            "{}",
+            short.duration_s
+        );
+        // One that starts a tenth of the way along still pays it in full...
+        let rest = sg.route((0.0, 0.001), (0.0, 0.01), None).unwrap();
+        assert!((rest.duration_s - (0.9 * moving + 2.0)).abs() < 1e-6);
+        // ...at the end, not spread along the way: the midpoint is reached
+        // after 0.4 of the moving time.
+        assert_eq!(rest.coordinates.len(), 3);
+        assert!((rest.cumulative_times_s[1] - 0.4 * moving).abs() < 1e-6);
     }
 
     #[test]
