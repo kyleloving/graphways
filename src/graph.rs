@@ -432,6 +432,7 @@ pub fn create_graph(
         bidirectional,
         &BuildOptions::retain_all(retain_all),
     )
+    .expect("the default profile is valid")
 }
 
 /// Build a directed road graph from parsed OSM nodes and ways.
@@ -443,13 +444,23 @@ pub fn create_graph(
 /// panicking. Unless `options.retain_all` is set the graph is then
 /// simplified: nearby intersection nodes are merged and degree-two chains are
 /// collapsed into single edges.
+///
+/// Fails with [`OsmGraphError::InvalidInput`] if the profile does not
+/// validate (see [`Profile::validate`]).
 pub fn create_graph_with(
     nodes: Vec<OsmNode>,
     ways: Vec<OsmWay>,
     bidirectional: bool,
     options: &BuildOptions,
-) -> RoadGraph {
-    build_graph(nodes, ways, bidirectional, options, &HashSet::new())
+) -> Result<RoadGraph, OsmGraphError> {
+    options.profile.validate()?;
+    Ok(build_graph(
+        nodes,
+        ways,
+        bidirectional,
+        options,
+        &HashSet::new(),
+    ))
 }
 
 /// [`create_graph_with`], keeping the nodes with OSM ids in `protected`
@@ -940,14 +951,17 @@ impl SpatialGraph {
     /// Build a graph from parsed OSM data with the default profile.
     pub fn from_osm_data(data: OsmData, network_type: NetworkType, retain_all: bool) -> Self {
         Self::from_osm_data_with(data, network_type, &BuildOptions::retain_all(retain_all))
+            .expect("the default profile is valid")
     }
 
-    /// Build a graph from parsed OSM data with [`create_graph_with`].
+    /// Build a graph from parsed OSM data with [`create_graph_with`]; fails
+    /// if the profile does not validate.
     pub fn from_osm_data_with(
         data: OsmData,
         network_type: NetworkType,
         options: &BuildOptions,
-    ) -> Self {
+    ) -> Result<Self, OsmGraphError> {
+        options.profile.validate()?;
         let bidirectional = matches!(network_type, NetworkType::Walk);
         let restrictions = if restrictions::applies_to(network_type) {
             restrictions::parse_restrictions(&data.relations)
@@ -962,7 +976,7 @@ impl SpatialGraph {
         } else {
             Vec::new()
         };
-        Self::with_turns(graph, network_type, turns, turn_costs)
+        Ok(Self::with_turns(graph, network_type, turns, turn_costs))
     }
 
     /// Parse an OSM XML document (e.g. an Overpass response) and build a
@@ -981,11 +995,8 @@ impl SpatialGraph {
         network_type: NetworkType,
         options: &BuildOptions,
     ) -> Result<Self, OsmGraphError> {
-        Ok(Self::from_osm_data_with(
-            parse_xml(xml)?,
-            network_type,
-            options,
-        ))
+        options.profile.validate()?;
+        Self::from_osm_data_with(parse_xml(xml)?, network_type, options)
     }
 
     /// The network type whose travel times every query uses.
@@ -1881,7 +1892,7 @@ mod tests {
             },
         };
 
-        let graph = create_graph_with(nodes, vec![way], false, &options);
+        let graph = create_graph_with(nodes, vec![way], false, &options).unwrap();
 
         let edge = graph.edge_weights().next().unwrap();
         assert_eq!(edge.speed_kph, 40.0, "maxspeed ignored, class speed used");

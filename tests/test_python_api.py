@@ -130,6 +130,25 @@ class PythonApiTests(unittest.TestCase):
                 self.assertAlmostEqual(matrix.durations_s[i][j], route.duration_s)
                 self.assertAlmostEqual(matrix.distances_m[i][j], route.distance_m)
 
+    def test_invalid_profiles_are_rejected(self):
+        xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
+        for bad in [{"walk_speed_kph": 0}, {"walk_speed_kph": float("nan")},
+                    {"drive_speeds_kph": {"residential": -30}}, {"traffic_signal_s": -1}]:
+            with self.assertRaises(ValueError, msg=str(bad)):
+                gw.SpatialGraph.from_osm(xml, "walk", **bad)
+
+    def test_auto_prepare_routing_can_be_switched_off(self):
+        xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
+        graph = gw.SpatialGraph.from_osm(xml, "walk")
+        self.assertTrue(graph.auto_prepare_routing)
+        graph.auto_prepare_routing = False
+        points = [(48.0, 11.0), (48.001, 11.0)] * 20
+        graph.route(points[0], points[1])
+        graph.travel_time_matrix(points, points)
+        self.assertFalse(graph.is_routing_prepared())
+        graph.prepare_routing()
+        self.assertTrue(graph.is_routing_prepared())
+
     def test_travel_time_matrix_defaults_to_origin_to_origin(self):
         points = [(48.0, 11.0), (48.001, 11.0), (48.0005, 11.0)]
         square = self.graph.travel_time_matrix(points)

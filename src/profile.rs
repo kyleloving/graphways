@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 
+use crate::error::OsmGraphError;
+
 /// Travel-speed assumptions used to cost edges when a graph is built.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Profile {
@@ -98,6 +100,42 @@ impl Default for TurnCosts {
 }
 
 impl Profile {
+    /// Check that every number makes sense: speeds positive and finite,
+    /// distances and delays non-negative and finite, `turn_bias` positive.
+    /// Graph constructors call this, so a bad profile is an error rather
+    /// than a graph on which nothing is reachable.
+    pub fn validate(&self) -> Result<(), OsmGraphError> {
+        let positive = |name: &str, value: f64| {
+            if value.is_finite() && value > 0.0 {
+                Ok(())
+            } else {
+                Err(OsmGraphError::InvalidInput(format!(
+                    "{name} must be a positive number, got {value}"
+                )))
+            }
+        };
+        let non_negative = |name: &str, value: f64| {
+            if value.is_finite() && value >= 0.0 {
+                Ok(())
+            } else {
+                Err(OsmGraphError::InvalidInput(format!(
+                    "{name} must be a non-negative number, got {value}"
+                )))
+            }
+        };
+        positive("walk_speed_kph", self.walk_speed_kph)?;
+        positive("bike_speed_kph", self.bike_speed_kph)?;
+        positive("default_drive_speed_kph", self.default_drive_speed_kph)?;
+        for (class, &kph) in &self.drive_speeds_kph {
+            positive(&format!("drive_speeds_kph['{class}']"), kph)?;
+        }
+        non_negative("merge_distance_m", self.merge_distance_m)?;
+        non_negative("traffic_signal_s", self.traffic_signal_s)?;
+        non_negative("turn_penalty_s", self.turn_costs.turn_penalty_s)?;
+        positive("turn_bias", self.turn_costs.turn_bias)?;
+        non_negative("u_turn_penalty_s", self.turn_costs.u_turn_penalty_s)
+    }
+
     /// Driving speed for a way with the given `highway` value.
     pub fn drive_speed_kph(&self, highway: Option<&str>) -> f64 {
         highway
@@ -185,5 +223,49 @@ mod tests {
         };
         assert!((uk.cost(-90.0, false) - right).abs() < 1e-9, "mirror image");
         assert_eq!(TurnCosts::none().cost(-120.0, true), 0.0);
+    }
+
+    #[test]
+    fn validation_rejects_nonsense_numbers() {
+        assert!(Profile::default().validate().is_ok());
+        let none = Profile {
+            turn_costs: TurnCosts::none(),
+            traffic_signal_s: 0.0,
+            merge_distance_m: 0.0,
+            ..Profile::default()
+        };
+        assert!(none.validate().is_ok(), "zero delays and merging are fine");
+        let bad = [
+            Profile {
+                walk_speed_kph: 0.0,
+                ..Profile::default()
+            },
+            Profile {
+                bike_speed_kph: f64::NAN,
+                ..Profile::default()
+            },
+            Profile::default().with_drive_speed("residential", -30.0),
+            Profile {
+                traffic_signal_s: -1.0,
+                ..Profile::default()
+            },
+            Profile {
+                merge_distance_m: f64::INFINITY,
+                ..Profile::default()
+            },
+            Profile {
+                turn_costs: TurnCosts {
+                    turn_bias: 0.0,
+                    ..TurnCosts::default()
+                },
+                ..Profile::default()
+            },
+        ];
+        for profile in bad {
+            assert!(
+                matches!(profile.validate(), Err(OsmGraphError::InvalidInput(_))),
+                "{profile:?}"
+            );
+        }
     }
 }

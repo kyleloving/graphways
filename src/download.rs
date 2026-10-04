@@ -46,6 +46,7 @@ impl SpatialGraph {
                 "radius_m must be a positive number, got {radius_m}"
             )));
         }
+        options.profile.validate()?;
         let center = center.into();
         let bbox = overpass::bbox_from_point(center.lat, center.lon, radius_m);
         let query = overpass::create_overpass_query(&bbox, network_type);
@@ -54,11 +55,7 @@ impl SpatialGraph {
         if data.nodes.is_empty() {
             return Err(OsmGraphError::EmptyGraph);
         }
-        Ok(SpatialGraph::from_osm_data_with(
-            data,
-            network_type,
-            options,
-        ))
+        SpatialGraph::from_osm_data_with(data, network_type, options)
     }
 
     /// Geocode `place` with Nominatim, then download the road network within

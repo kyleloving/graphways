@@ -76,6 +76,14 @@ let graph = SpatialGraph::from_point((48.137, 11.575), 2_000.0, NetworkType::Wal
 let graph = SpatialGraph::new(road_graph, NetworkType::Drive);
 ```
 
+Downloads are cached on disk in the user's cache directory
+(`%LOCALAPPDATA%\graphways\cache` on Windows, `~/Library/Caches/graphways` on
+macOS, `$XDG_CACHE_HOME/graphways` or `~/.cache/graphways` elsewhere); set
+`GRAPHWAYS_CACHE_DIR` to put them somewhere else. (The Python package caches in
+`./cache` next to your notebooks instead.) The `_with` constructors check the
+profile with `Profile::validate` and return `OsmGraphError::InvalidInput`
+for nonsense numbers such as a zero or negative speed.
+
 The `_with` variants (`from_pbf_with`, `from_osm_with`, `from_osm_data_with`)
 take [`BuildOptions`](#speed-profiles) with a custom speed profile.
 `retain_all = true` keeps every OSM node instead of simplifying the graph.

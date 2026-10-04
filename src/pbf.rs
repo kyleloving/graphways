@@ -44,8 +44,9 @@ impl SpatialGraph {
         network_type: NetworkType,
         options: &BuildOptions,
     ) -> Result<Self, OsmGraphError> {
+        options.profile.validate()?;
         let (data, pois) = read_pbf(path, network_type)?;
-        let mut spatial_graph = SpatialGraph::from_osm_data_with(data, network_type, options);
+        let mut spatial_graph = SpatialGraph::from_osm_data_with(data, network_type, options)?;
         spatial_graph.snap_pois(&pois);
         Ok(spatial_graph)
     }

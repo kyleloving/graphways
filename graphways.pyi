@@ -559,6 +559,20 @@ class SpatialGraph:
         """Whether the routing index has been built."""
         ...
 
+    @property
+    def auto_prepare_routing(self) -> bool:
+        """
+        Whether queries build the routing index on their own (default
+        ``True``): ``route()`` starts it in the background on first use, and
+        matrices and accessibility build it up front when that is faster.
+        Set to ``False`` to keep memory and CPU use predictable;
+        :meth:`prepare_routing` still builds it on request.
+        """
+        ...
+
+    @auto_prepare_routing.setter
+    def auto_prepare_routing(self, enabled: bool) -> None: ...
+
     def travel_time_matrix(
         self,
         origins: Sequence[tuple[float, float]],

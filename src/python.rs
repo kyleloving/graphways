@@ -670,6 +670,8 @@ fn snaps(list: &[Option<SnapResult>]) -> Vec<Option<PySnapResult>> {
 struct PyGraph {
     sg: SpatialGraph,
     routing_requested: AtomicBool,
+    /// Whether queries may build the routing index on their own.
+    auto_prepare: AtomicBool,
     transit: Option<crate::transit::TransitSummary>,
 }
 
@@ -677,6 +679,7 @@ impl PyGraph {
     fn new(sg: SpatialGraph) -> Self {
         Self {
             routing_requested: AtomicBool::new(sg.is_routing_prepared()),
+            auto_prepare: AtomicBool::new(true),
             sg,
             transit: None,
         }
@@ -686,6 +689,9 @@ impl PyGraph {
     /// routing index now when that many Dijkstra searches would cost more
     /// than building it, otherwise start it in the background for next time.
     fn prepare_for(&self, searches: usize) {
+        if !self.auto_prepare.load(Ordering::Relaxed) {
+            return;
+        }
         if searches > 16 {
             self.routing_requested.store(true, Ordering::Relaxed);
             self.sg.prepare_routing();
@@ -697,7 +703,9 @@ impl PyGraph {
     /// Start building the routing index on a background thread, once.
     /// Routes are answered with A* until it is ready, so no call waits on it.
     fn prepare_routing_in_background(&self) {
-        if !self.routing_requested.swap(true, Ordering::Relaxed) {
+        if self.auto_prepare.load(Ordering::Relaxed)
+            && !self.routing_requested.swap(true, Ordering::Relaxed)
+        {
             let sg = self.sg.clone();
             std::thread::spawn(move || sg.prepare_routing());
         }
@@ -844,6 +852,20 @@ impl PyGraph {
     /// Whether the routing index is built (see `prepare_routing`).
     fn is_routing_prepared(&self) -> bool {
         self.sg.is_routing_prepared()
+    }
+
+    /// Whether queries build the routing index on their own: `route()` in
+    /// the background on first use, matrices and accessibility up front
+    /// when that is faster. Set it to `False` to keep memory and CPU use
+    /// predictable; `prepare_routing()` still builds the index on request.
+    #[getter]
+    fn auto_prepare_routing(&self) -> bool {
+        self.auto_prepare.load(Ordering::Relaxed)
+    }
+
+    #[setter]
+    fn set_auto_prepare_routing(&self, enabled: bool) {
+        self.auto_prepare.store(enabled, Ordering::Relaxed);
     }
 
     #[pyo3(signature = (origin, destination, max_snap_m = Some(100.0)))]

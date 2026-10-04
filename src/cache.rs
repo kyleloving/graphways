@@ -80,14 +80,43 @@ fn fnv1a(s: &str) -> u64 {
 }
 
 /// Returns the disk cache directory, overridable via `GRAPHWAYS_CACHE_DIR`.
-/// Defaults to a `cache/` folder in the current working directory — the same
-/// convention used by OSMnx, so researchers get persistent, visible caching
-/// next to their notebooks and scripts.
+///
+/// The Python package defaults to a `cache/` folder in the current working
+/// directory — the same convention used by OSMnx, so researchers get
+/// persistent, visible caching next to their notebooks and scripts. As a Rust
+/// library it defaults to the user's cache directory instead, so programs
+/// using it do not find folders appearing wherever they run.
 pub fn disk_cache_dir() -> PathBuf {
     std::env::var_os("GRAPHWAYS_CACHE_DIR")
         .or_else(|| std::env::var_os("OSM_GRAPH_CACHE_DIR"))
         .map(PathBuf::from)
+        .or_else(|| {
+            if cfg!(feature = "extension-module") {
+                None
+            } else {
+                user_cache_dir()
+            }
+        })
         .unwrap_or_else(|| PathBuf::from("cache"))
+}
+
+/// The platform's per-user cache location for graphways: `%LOCALAPPDATA%`
+/// on Windows, `~/Library/Caches` on macOS, `$XDG_CACHE_HOME` or `~/.cache`
+/// elsewhere. `None` when the environment does not say where that is.
+fn user_cache_dir() -> Option<PathBuf> {
+    let var = |name: &str| {
+        std::env::var_os(name)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+    };
+    let base = if cfg!(windows) {
+        return var("LOCALAPPDATA").map(|d| d.join("graphways").join("cache"));
+    } else if cfg!(target_os = "macos") {
+        var("HOME")?.join("Library").join("Caches")
+    } else {
+        var("XDG_CACHE_HOME").or_else(|| Some(var("HOME")?.join(".cache")))?
+    };
+    Some(base.join("graphways"))
 }
 
 #[cfg(any(test, feature = "extension-module"))]
@@ -185,6 +214,34 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         std::env::remove_var("GRAPHWAYS_CACHE_DIR");
+    }
+
+    #[test]
+    fn default_cache_dir_depends_on_the_build() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let saved: Vec<_> = ["GRAPHWAYS_CACHE_DIR", "OSM_GRAPH_CACHE_DIR"]
+            .into_iter()
+            .map(|k| (k, std::env::var_os(k)))
+            .collect();
+        for (k, _) in &saved {
+            std::env::remove_var(k);
+        }
+
+        let dir = disk_cache_dir();
+        if cfg!(feature = "extension-module") {
+            // Python: next to the notebook, OSMnx style.
+            assert_eq!(dir, PathBuf::from("cache"));
+        } else {
+            // Rust library: the user's cache directory, not the working one.
+            assert!(dir.is_absolute(), "{}", dir.display());
+            assert!(dir.components().any(|c| c.as_os_str() == "graphways"));
+        }
+
+        for (k, v) in saved {
+            if let Some(v) = v {
+                std::env::set_var(k, v);
+            }
+        }
     }
 
     #[test]

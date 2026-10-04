@@ -550,8 +550,12 @@ fn active_services(feed: &FeedSource, date: u32) -> Result<HashSet<String>, OsmG
 // Building the combined graph
 // ---------------------------------------------------------------------------
 
-/// The tag that marks transit nodes and edges (`transit=stop`, `ride`, ...).
-pub(crate) const TRANSIT_TAG: &str = "transit";
+/// The tag that marks transit nodes and edges (`graphways:transit=stop`,
+/// `ride`, ...).
+/// Namespaced so no OSM tag can collide with it: street nodes keep all their
+/// OSM tags, and a node mistaken for transit is dropped from snapping and
+/// isochrones.
+pub(crate) const TRANSIT_TAG: &str = "graphways:transit";
 
 /// Whether a node or edge belongs to the transit layer (not the streets).
 pub(crate) fn is_transit(tags: &[OsmTag]) -> bool {
@@ -1026,6 +1030,20 @@ mod tests {
         let back = sg.route((0.0, 0.05), (0.0, 0.0), None).unwrap().duration_s;
         assert!(back > 3600.0, "{back}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn osm_transit_tags_do_not_hide_street_nodes() {
+        // A real OSM node tagged `transit=*` is still a street node.
+        let xml = r#"<osm>
+            <node id="1" lat="0" lon="0"><tag k="transit" v="yes"/></node>
+            <node id="2" lat="0" lon="0.001"/>
+            <way id="1"><nd ref="1"/><nd ref="2"/><tag k="highway" v="footway"/></way>
+        </osm>"#;
+        let sg = SpatialGraph::from_osm(xml, NetworkType::Walk, true).unwrap();
+        let node = sg.node_index(1).unwrap();
+        assert!(sg.is_street_node(node));
+        assert_eq!(sg.snap_point((0.0, -0.0001)).unwrap().node_id, 1);
     }
 
     #[test]
