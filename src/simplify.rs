@@ -1,388 +1,381 @@
+//! Graph simplification: merge intersection nodes that sit within a few
+//! metres of each other, then collapse chains of degree-two nodes into single
+//! edges that keep the original road geometry.
+//!
+//! All per-node bookkeeping uses `Vec`s indexed by `NodeIndex` instead of hash
+//! maps, and edge weights are moved rather than cloned wherever the old graph
+//! is no longer needed.
+
+use std::collections::{HashMap, HashSet};
+
 use petgraph::graph::{DiGraph, EdgeIndex, NodeIndex};
 use petgraph::visit::EdgeRef;
-use rstar::{PointDistance, RTree, RTreeObject, AABB};
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use petgraph::Direction::{Incoming, Outgoing};
+use rstar::RTree;
 
-use crate::graph::{XmlNode, XmlTag, XmlWay};
+use crate::graph::{edge_geometry, Edge, NodeEntry, OsmNode, RoadGraph};
+use crate::profile::Profile;
 use crate::utils::calculate_distance;
 
-static ID_COUNTER: AtomicUsize = AtomicUsize::new(1);
+/// Simplify a raw road graph. Nodes whose OSM ids are in `protected` (the
+/// via nodes of turn restrictions) are never merged or collapsed away.
+pub fn simplify_graph(graph: RoadGraph, profile: &Profile, protected: &HashSet<i64>) -> RoadGraph {
+    let (graph, _) = consolidate_intersections(graph, profile, protected);
 
-const CONSOLIDATION_DISTANCE_M: f64 = 5.0;
+    let mut is_endpoint: Vec<bool> = graph
+        .node_indices()
+        .map(|node| protected.contains(&graph[node].id) || is_endpoint(&graph, node))
+        .collect();
+    keep_roads_distinct(&graph, &mut is_endpoint);
+    let endpoints = || graph.node_indices().filter(|n| is_endpoint[n.index()]);
 
-pub fn simplify_graph(graph: &DiGraph<XmlNode, XmlWay>) -> DiGraph<XmlNode, XmlWay> {
-    let (consolidated_graph, _) = consolidate_intersections(graph, CONSOLIDATION_DISTANCE_M);
-
-    let mut simplified_graph = DiGraph::new();
-    let mut endpoints: HashSet<NodeIndex> = HashSet::new();
-    let mut index_map: HashMap<NodeIndex, NodeIndex> = HashMap::new();
-
-    for node in consolidated_graph.node_indices() {
-        if is_endpoint(&consolidated_graph, node) {
-            endpoints.insert(node);
-            let new_index = simplified_graph.add_node(consolidated_graph[node].clone());
-            index_map.insert(node, new_index);
-        }
+    let mut simplified = DiGraph::new();
+    let mut new_index = vec![NodeIndex::end(); graph.node_count()];
+    for node in endpoints() {
+        new_index[node.index()] = simplified.add_node(graph[node].clone());
     }
 
-    let mut added_edges: HashSet<(NodeIndex, NodeIndex)> = HashSet::new();
-
-    for &endpoint in &endpoints {
-        for edge in consolidated_graph.edges_directed(endpoint, petgraph::Outgoing) {
-            let neighbor = edge.target();
-            if added_edges.contains(&(endpoint, neighbor)) {
-                continue;
-            }
-
-            let path = build_path(
-                &consolidated_graph,
-                endpoint,
-                neighbor,
-                edge.id(),
-                &endpoints,
-            );
-            let Some(&last) = path.nodes.last() else {
-                continue;
-            };
-            if !endpoints.contains(&last) || path.edges.is_empty() {
-                continue;
-            }
-
-            let collapsed_way = collapse_path_edges(&consolidated_graph, &path.edges);
-
-            if let (Some(&new_src), Some(&new_dst)) =
-                (index_map.get(&endpoint), index_map.get(&last))
-            {
-                simplified_graph.add_edge(new_src, new_dst, collapsed_way);
-                added_edges.insert((endpoint, last));
+    let mut chain: Vec<EdgeIndex> = Vec::new();
+    for start in endpoints() {
+        for first in graph.edges(start) {
+            chain.clear();
+            chain.push(first.id());
+            let end = follow_chain(&graph, &is_endpoint, start, first.target(), &mut chain);
+            if is_endpoint[end.index()] {
+                let way = collapse_path_edges(&graph, &chain);
+                let (source, target) = (new_index[start.index()], new_index[end.index()]);
+                add_or_keep_fastest(&mut simplified, source, target, way);
             }
         }
     }
 
-    deduplicate_edges(simplified_graph)
+    simplified
 }
 
-fn collapse_path_edges(graph: &DiGraph<XmlNode, XmlWay>, edges: &[EdgeIndex]) -> XmlWay {
-    let mut total_length = 0.0;
-    let mut total_walk = 0.0;
-    let mut total_bike = 0.0;
-    let mut total_drive = 0.0;
-    let mut weighted_speed_sum = 0.0;
-    let mut tags: Option<Vec<XmlTag>> = None;
-    let mut geometry: Vec<(f64, f64)> = Vec::new();
-
-    for &edge in edges {
-        let way = graph.edge_weight(edge).unwrap();
-        total_length += way.length;
-        total_walk += way.walk_travel_time;
-        total_bike += way.bike_travel_time;
-        total_drive += way.drive_travel_time;
-        weighted_speed_sum += way.speed_kph * way.length;
-        if tags.is_none() {
-            tags = Some(way.tags.clone());
+/// Add `way` from `source` to `target` unless an edge between the same pair
+/// is already at least as fast; a slower existing edge is replaced in place.
+///
+/// Every ordered node pair therefore carries at most one edge, the fastest by
+/// drive time (the first one seen on ties). Road nodes have a handful of
+/// edges, so the adjacency scan in `find_edge` beats a hash map here.
+fn add_or_keep_fastest(graph: &mut RoadGraph, source: NodeIndex, target: NodeIndex, way: Edge) {
+    match graph.find_edge(source, target) {
+        None => {
+            graph.add_edge(source, target, way);
         }
-        append_edge_geometry(graph, edge, &mut geometry);
-    }
-
-    let speed_kph = if total_length > 0.0 {
-        weighted_speed_sum / total_length
-    } else {
-        0.0
-    };
-
-    XmlWay {
-        id: get_unique_id(),
-        nodes: Vec::new(),
-        tags: tags.unwrap_or_default(),
-        length: total_length,
-        speed_kph,
-        walk_travel_time: total_walk,
-        bike_travel_time: total_bike,
-        drive_travel_time: total_drive,
-        geometry,
+        Some(existing) => {
+            let kept = &mut graph[existing];
+            if way.drive_travel_time < kept.drive_travel_time {
+                *kept = way;
+            }
+        }
     }
 }
 
-fn append_edge_geometry(
-    graph: &DiGraph<XmlNode, XmlWay>,
-    edge: EdgeIndex,
-    out: &mut Vec<(f64, f64)>,
-) {
-    let (source, target) = graph.edge_endpoints(edge).unwrap();
-    let way = graph.edge_weight(edge).unwrap();
-    let mut points = if way.geometry.len() >= 2 {
-        way.geometry.clone()
-    } else {
-        vec![
-            (graph[source].lat, graph[source].lon),
-            (graph[target].lat, graph[target].lon),
-        ]
-    };
-
-    let source_point = (graph[source].lat, graph[source].lon);
-    let target_point = (graph[target].lat, graph[target].lon);
-    let first = *points.first().unwrap();
-    let last = *points.last().unwrap();
-    let matches_forward = calculate_distance(first.0, first.1, source_point.0, source_point.1)
-        + calculate_distance(last.0, last.1, target_point.0, target_point.1)
-        <= calculate_distance(first.0, first.1, target_point.0, target_point.1)
-            + calculate_distance(last.0, last.1, source_point.0, source_point.1);
-    if !matches_forward {
-        points.reverse();
-    }
-
-    if out.is_empty() {
-        out.extend(points);
-    } else {
-        out.extend(points.into_iter().skip(1));
-    }
-}
-
-fn deduplicate_edges(graph: DiGraph<XmlNode, XmlWay>) -> DiGraph<XmlNode, XmlWay> {
-    let mut best: HashMap<(NodeIndex, NodeIndex), &XmlWay> = HashMap::new();
-    for edge in graph.edge_references() {
-        let key = (edge.source(), edge.target());
-        let way = edge.weight();
-        best.entry(key)
-            .and_modify(|existing| {
-                if way.drive_travel_time < existing.drive_travel_time {
-                    *existing = way;
+/// Collapsing chains must not lose roads. A chain that comes back to its own
+/// start would become a self-loop, and two different chains joining the same
+/// ordered pair of junctions would become parallel edges, of which
+/// deduplication keeps only the faster. Keep the middle node of each such
+/// chain (repeating until none is left) so every road survives as its own
+/// edge, which matters once points snap onto roads.
+fn keep_roads_distinct(graph: &RoadGraph, is_endpoint: &mut [bool]) {
+    let mut chain = Vec::new();
+    loop {
+        let mut first_chain: HashMap<(NodeIndex, NodeIndex), EdgeIndex> = HashMap::new();
+        let mut split = Vec::new();
+        for start in graph.node_indices() {
+            if !is_endpoint[start.index()] {
+                continue;
+            }
+            for first in graph.edges(start) {
+                chain.clear();
+                chain.push(first.id());
+                let end = follow_chain(graph, is_endpoint, start, first.target(), &mut chain);
+                if !is_endpoint[end.index()] || chain.len() < 2 {
+                    continue;
                 }
-            })
-            .or_insert(way);
+                let duplicate = end == start
+                    || *first_chain.entry((start, end)).or_insert(first.id()) != first.id();
+                if duplicate {
+                    let middle = graph
+                        .edge_endpoints(chain[(chain.len() - 1) / 2])
+                        .unwrap()
+                        .1;
+                    split.push(middle);
+                }
+            }
+        }
+        if split.is_empty() {
+            break;
+        }
+        for node in split {
+            is_endpoint[node.index()] = true;
+        }
     }
-
-    let mut deduped = DiGraph::new();
-    let mut node_map: HashMap<NodeIndex, NodeIndex> = HashMap::new();
-    for old_idx in graph.node_indices() {
-        let new_idx = deduped.add_node(graph[old_idx].clone());
-        node_map.insert(old_idx, new_idx);
-    }
-    for ((src, dst), way) in &best {
-        deduped.add_edge(node_map[src], node_map[dst], (*way).clone());
-    }
-
-    deduped
 }
 
-struct Path {
-    nodes: Vec<NodeIndex>,
-    edges: Vec<EdgeIndex>,
-}
-
-fn build_path(
-    graph: &DiGraph<XmlNode, XmlWay>,
-    start: NodeIndex,
-    first_step: NodeIndex,
-    first_edge: EdgeIndex,
-    endpoints: &HashSet<NodeIndex>,
-) -> Path {
-    let mut path = Path {
-        nodes: vec![start, first_step],
-        edges: vec![first_edge],
-    };
-    let mut prev = start;
-    let mut current = first_step;
-
-    while !endpoints.contains(&current) {
+/// Walk forward from `current` (entered from `prev`) through degree-two nodes,
+/// appending traversed edges to `chain`. Returns the node where the walk
+/// stopped: an endpoint, or a node with no unambiguous way forward.
+fn follow_chain(
+    graph: &RoadGraph,
+    is_endpoint: &[bool],
+    mut prev: NodeIndex,
+    mut current: NodeIndex,
+    chain: &mut Vec<EdgeIndex>,
+) -> NodeIndex {
+    while !is_endpoint[current.index()] {
         let Some((next, edge)) = next_chain_step(graph, current, prev) else {
             break;
         };
+        chain.push(edge);
         prev = current;
         current = next;
-        path.nodes.push(next);
-        path.edges.push(edge);
     }
-
-    path
+    current
 }
 
+/// The single onward neighbour of `current` (excluding `prev`) and the fastest
+/// edge to it, or `None` when there are zero or several distinct neighbours.
 fn next_chain_step(
-    graph: &DiGraph<XmlNode, XmlWay>,
+    graph: &RoadGraph,
     current: NodeIndex,
     prev: NodeIndex,
 ) -> Option<(NodeIndex, EdgeIndex)> {
-    let mut by_target: HashMap<NodeIndex, EdgeIndex> = HashMap::new();
-    for edge in graph.edges_directed(current, petgraph::Outgoing) {
+    let mut step: Option<(NodeIndex, EdgeIndex)> = None;
+    for edge in graph.edges(current) {
         let target = edge.target();
         if target == prev {
             continue;
         }
-        by_target
-            .entry(target)
-            .and_modify(|existing| {
-                let old = graph.edge_weight(*existing).unwrap();
-                if edge.weight().drive_travel_time < old.drive_travel_time {
-                    *existing = edge.id();
+        match step {
+            None => step = Some((target, edge.id())),
+            Some((seen, best)) if seen == target => {
+                if edge.weight().drive_travel_time < graph[best].drive_travel_time {
+                    step = Some((target, edge.id()));
                 }
-            })
-            .or_insert(edge.id());
+            }
+            Some(_) => return None,
+        }
+    }
+    step
+}
+
+fn collapse_path_edges(graph: &RoadGraph, edges: &[EdgeIndex]) -> Edge {
+    let first = &graph[edges[0]];
+    let mut way = Edge {
+        way_id: first.way_id,
+        last_way_id: graph[edges[edges.len() - 1]].last_way_id,
+        tags: first.tags.clone(),
+        ..Edge::default()
+    };
+    let mut weighted_speed_sum = 0.0;
+
+    for &edge in edges {
+        let part = &graph[edge];
+        way.length += part.length;
+        way.walk_travel_time += part.walk_travel_time;
+        way.bike_travel_time += part.bike_travel_time;
+        way.drive_travel_time += part.drive_travel_time;
+        way.signal_delay_s += part.signal_delay_s;
+        weighted_speed_sum += part.speed_kph * part.length;
+
+        // Consecutive edges share their joint point; keep it only once.
+        let skip = usize::from(!way.geometry.is_empty());
+        way.geometry
+            .extend(edge_geometry(graph, edge).points().skip(skip));
     }
 
-    if by_target.len() == 1 {
-        by_target.into_iter().next()
+    way.speed_kph = if way.length > 0.0 {
+        weighted_speed_sum / way.length
     } else {
-        None
-    }
+        0.0
+    };
+    way
 }
 
-fn is_endpoint(graph: &DiGraph<XmlNode, XmlWay>, node_index: NodeIndex) -> bool {
-    let out: Vec<NodeIndex> = graph
-        .neighbors_directed(node_index, petgraph::Outgoing)
-        .collect();
-    let incoming: Vec<NodeIndex> = graph
-        .neighbors_directed(node_index, petgraph::Incoming)
-        .collect();
+/// A node survives simplification unless it is the interior of a chain:
+/// it has both in- and out-edges, no self-loop, and exactly two distinct
+/// neighbours.
+fn is_endpoint(graph: &RoadGraph, node: NodeIndex) -> bool {
+    let mut neighbours = [NodeIndex::end(); 2];
+    let mut distinct = 0;
+    let (mut has_out, mut has_in) = (false, false);
 
-    if out.is_empty() || incoming.is_empty() {
-        return true;
-    }
-    if out.iter().chain(incoming.iter()).any(|&n| n == node_index) {
-        return true;
-    }
-
-    let mut neighbors = out;
-    neighbors.extend(incoming);
-    neighbors.sort_unstable();
-    neighbors.dedup();
-    neighbors.len() != 2
-}
-
-fn consolidate_intersections(
-    graph: &DiGraph<XmlNode, XmlWay>,
-    merge_distance_m: f64,
-) -> (DiGraph<XmlNode, XmlWay>, HashMap<NodeIndex, NodeIndex>) {
-    let entries: Vec<NodeEntry> = graph
-        .node_indices()
-        .map(|index| NodeEntry {
-            point: projected_point(graph[index].lat, graph[index].lon),
-            index,
-        })
-        .collect();
-    let tree = RTree::bulk_load(entries);
-    let clusters = cluster_nodes_by_distance(graph, &tree, merge_distance_m);
-
-    let mut new_graph = DiGraph::new();
-    let mut old_to_new: HashMap<NodeIndex, NodeIndex> = HashMap::new();
-
-    for cluster in clusters {
-        let merged = merge_nodes(graph, &cluster.members);
-        let new_idx = new_graph.add_node(merged);
-        for &old_idx in &cluster.members {
-            old_to_new.insert(old_idx, new_idx);
+    let outgoing = graph.neighbors_directed(node, Outgoing).map(|n| (n, true));
+    let incoming = graph.neighbors_directed(node, Incoming).map(|n| (n, false));
+    for (neighbour, is_out) in outgoing.chain(incoming) {
+        if is_out {
+            has_out = true;
+        } else {
+            has_in = true;
+        }
+        if neighbour == node {
+            return true; // self-loop
+        }
+        if !neighbours[..distinct].contains(&neighbour) {
+            if distinct == neighbours.len() {
+                return true; // three or more distinct neighbours: a junction
+            }
+            neighbours[distinct] = neighbour;
+            distinct += 1;
         }
     }
 
-    let mut seen_edges: HashSet<(NodeIndex, NodeIndex)> = HashSet::new();
-    for edge in graph.edge_references() {
-        let new_src = old_to_new[&edge.source()];
-        let new_dst = old_to_new[&edge.target()];
+    !(has_out && has_in) || distinct != 2
+}
+
+/// Merge nodes within `merge_distance_m` of a cluster seed into one node.
+///
+/// Returns the consolidated graph and, for every old node index, the index of
+/// the node it was merged into. Edges are moved, not cloned; an edge whose
+/// endpoints land in the same cluster is dropped, and parallel edges between
+/// two clusters are reduced to the fastest.
+///
+/// Merging moves nodes by up to `merge_distance_m`, so edges touching a merged
+/// node are refit to their new endpoints: a straight edge takes the new
+/// straight-line length (longer or shorter), and an edge with shape points is
+/// stretched if its endpoints now lie farther apart than its length. Travel
+/// times scale with length, keeping each edge's speed, and no edge ends up
+/// "faster than straight" (which would also break the A* lower bound).
+fn consolidate_intersections(
+    graph: RoadGraph,
+    profile: &Profile,
+    protected: &HashSet<i64>,
+) -> (RoadGraph, Vec<NodeIndex>) {
+    let merge_distance_m = profile.merge_distance_m;
+    let tree = RTree::bulk_load(
+        graph
+            .node_indices()
+            .map(|index| NodeEntry::new(&graph[index], index))
+            .collect(),
+    );
+    let clusters = cluster_nodes_by_distance(&graph, &tree, merge_distance_m, protected);
+
+    let mut new_graph = DiGraph::with_capacity(clusters.len(), graph.edge_count());
+    let mut old_to_new = vec![NodeIndex::end(); graph.node_count()];
+    let mut moved = Vec::with_capacity(clusters.len());
+    for members in &clusters {
+        let new_idx = new_graph.add_node(merge_nodes(&graph, members));
+        moved.push(members.len() > 1);
+        for &old_idx in members {
+            old_to_new[old_idx.index()] = new_idx;
+        }
+    }
+
+    let (_, edges) = graph.into_nodes_edges();
+    for edge in edges {
+        let new_src = old_to_new[edge.source().index()];
+        let new_dst = old_to_new[edge.target().index()];
         if new_src == new_dst {
             continue;
         }
-        if seen_edges.insert((new_src, new_dst)) {
-            new_graph.add_edge(new_src, new_dst, edge.weight().clone());
+        let mut weight = edge.weight;
+        if moved[new_src.index()] || moved[new_dst.index()] {
+            let (a, b) = (&new_graph[new_src], &new_graph[new_dst]);
+            refit_length(
+                &mut weight,
+                calculate_distance(a.lat, a.lon, b.lat, b.lon),
+                profile,
+            );
         }
+        add_or_keep_fastest(&mut new_graph, new_src, new_dst, weight);
     }
 
     (new_graph, old_to_new)
 }
 
-struct Cluster {
-    members: Vec<NodeIndex>,
+/// Fit `edge` to endpoints `span` metres apart, keeping its speeds: straight
+/// edges take exactly `span`, shaped edges are only ever lengthened.
+fn refit_length(edge: &mut Edge, span: f64, profile: &Profile) {
+    let length = if edge.geometry.is_empty() {
+        span
+    } else {
+        edge.length.max(span)
+    };
+    if length.is_nan() || length == edge.length {
+        return;
+    }
+    if edge.length > 0.0 && length > 0.0 {
+        let scale = length / edge.length;
+        edge.walk_travel_time *= scale;
+        edge.bike_travel_time *= scale;
+        // Signal waits do not grow with the road.
+        let delay = edge.signal_delay_s;
+        edge.drive_travel_time = (edge.drive_travel_time - delay) * scale + delay;
+        edge.length = length;
+    } else {
+        edge.set_length(length, profile);
+    }
 }
 
+/// Greedy clustering in node order: each unassigned node seeds a cluster of
+/// all unassigned nodes within `merge_distance_m` of it.
 fn cluster_nodes_by_distance(
-    graph: &DiGraph<XmlNode, XmlWay>,
+    graph: &RoadGraph,
     tree: &RTree<NodeEntry>,
     merge_distance_m: f64,
-) -> Vec<Cluster> {
-    let mut clusters: Vec<Cluster> = Vec::new();
-    let mut assigned: HashSet<NodeIndex> = HashSet::new();
+    protected: &HashSet<i64>,
+) -> Vec<Vec<NodeIndex>> {
+    let mut clusters = Vec::new();
+    let mut assigned = vec![false; graph.node_count()];
+    let is_protected = |idx: NodeIndex| protected.contains(&graph[idx].id);
 
     for idx in graph.node_indices() {
-        if assigned.contains(&idx) {
+        if assigned[idx.index()] {
+            continue;
+        }
+        if is_protected(idx) {
+            assigned[idx.index()] = true;
+            clusters.push(vec![idx]);
             continue;
         }
         let node = &graph[idx];
-        let center = projected_point(node.lat, node.lon);
+        let center = NodeEntry::new(node, idx).point;
         let members: Vec<NodeIndex> = tree
             .locate_within_distance(center, merge_distance_m * merge_distance_m)
-            .filter_map(|entry| {
-                if assigned.contains(&entry.index) {
-                    return None;
-                }
+            .filter(|entry| !assigned[entry.index.index()] && !is_protected(entry.index))
+            .filter(|entry| {
                 let candidate = &graph[entry.index];
-                (calculate_distance(node.lat, node.lon, candidate.lat, candidate.lon)
-                    <= merge_distance_m)
-                    .then_some(entry.index)
+                calculate_distance(node.lat, node.lon, candidate.lat, candidate.lon)
+                    <= merge_distance_m
             })
+            .map(|entry| entry.index)
             .collect();
 
         for member in &members {
-            assigned.insert(*member);
+            assigned[member.index()] = true;
         }
-        clusters.push(Cluster { members });
+        clusters.push(members);
     }
 
     clusters
 }
 
-#[derive(Clone, Copy)]
-struct NodeEntry {
-    point: [f64; 2],
-    index: NodeIndex,
-}
-
-impl RTreeObject for NodeEntry {
-    type Envelope = AABB<[f64; 2]>;
-
-    fn envelope(&self) -> Self::Envelope {
-        AABB::from_point(self.point)
+/// A lone node is kept as-is (OSM id and tags intact). A real cluster becomes
+/// one untagged node at the members' mean position, identified by the
+/// smallest member OSM id so ids stay stable and meaningful across builds.
+fn merge_nodes(graph: &RoadGraph, indices: &[NodeIndex]) -> OsmNode {
+    if let [single] = indices {
+        return graph[*single].clone();
     }
-}
-
-impl PointDistance for NodeEntry {
-    fn distance_2(&self, point: &[f64; 2]) -> f64 {
-        let dx = self.point[0] - point[0];
-        let dy = self.point[1] - point[1];
-        dx * dx + dy * dy
-    }
-}
-
-fn projected_point(lat: f64, lon: f64) -> [f64; 2] {
-    const METERS_PER_DEGREE: f64 = 111_320.0;
-    [
-        lat * METERS_PER_DEGREE,
-        lon * METERS_PER_DEGREE * lat.to_radians().cos(),
-    ]
-}
-
-fn merge_nodes(graph: &DiGraph<XmlNode, XmlWay>, indices: &[NodeIndex]) -> XmlNode {
     let count = indices.len() as f64;
-    let avg_lat = indices.iter().map(|&i| graph[i].lat).sum::<f64>() / count;
-    let avg_lon = indices.iter().map(|&i| graph[i].lon).sum::<f64>() / count;
-
-    XmlNode {
-        id: get_unique_id(),
-        lat: avg_lat,
-        lon: avg_lon,
+    let members = || indices.iter().map(|&i| &graph[i]);
+    OsmNode {
+        id: members().map(|n| n.id).min().unwrap_or_default(),
+        lat: members().map(|n| n.lat).sum::<f64>() / count,
+        lon: members().map(|n| n.lon).sum::<f64>() / count,
         tags: Vec::new(),
     }
-}
-
-fn get_unique_id() -> i64 {
-    ID_COUNTER.fetch_add(1, Ordering::Relaxed) as i64
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{XmlNode, XmlTag, XmlWay};
+    use crate::graph::{OsmNode, OsmTag};
 
-    fn make_node(id: i64, lat: f64, lon: f64) -> XmlNode {
-        XmlNode {
+    fn make_node(id: i64, lat: f64, lon: f64) -> OsmNode {
+        OsmNode {
             id,
             lat,
             lon,
@@ -390,40 +383,34 @@ mod tests {
         }
     }
 
-    fn make_tag(key: &str, value: &str) -> XmlTag {
-        XmlTag {
+    fn make_tag(key: &str, value: &str) -> OsmTag {
+        OsmTag {
             key: key.into(),
             value: value.into(),
         }
     }
 
-    fn make_way(id: i64, drive_travel_time: f64) -> XmlWay {
-        XmlWay {
-            id,
-            nodes: Vec::new(),
-            tags: Vec::new(),
+    fn make_way(id: i64, drive_travel_time: f64) -> Edge {
+        Edge {
+            way_id: id,
             length: 100.0,
             speed_kph: 50.0,
             walk_travel_time: 72.0,
             bike_travel_time: 24.0,
             drive_travel_time,
-            geometry: Vec::new(),
+            ..Edge::default()
         }
     }
 
-    fn make_way_with_length(id: i64, drive_travel_time: f64, length: f64) -> XmlWay {
-        XmlWay {
+    fn make_way_with_length(id: i64, drive_travel_time: f64, length: f64) -> Edge {
+        Edge {
             length,
             ..make_way(id, drive_travel_time)
         }
     }
 
-    fn make_way_with_geometry(
-        id: i64,
-        drive_travel_time: f64,
-        geometry: Vec<(f64, f64)>,
-    ) -> XmlWay {
-        XmlWay {
+    fn make_way_with_geometry(id: i64, drive_travel_time: f64, geometry: Vec<(f64, f64)>) -> Edge {
+        Edge {
             geometry,
             ..make_way(id, drive_travel_time)
         }
@@ -438,7 +425,7 @@ mod tests {
         graph.add_edge(a, b, make_way(2, 50.0));
 
         assert_eq!(graph.edge_count(), 2);
-        let deduped = simplify_graph(&graph);
+        let deduped = simplify_graph(graph, &Profile::default(), &HashSet::new());
         assert!(
             deduped.edge_count() <= 1,
             "Expected at most 1 edge, got {}",
@@ -453,10 +440,11 @@ mod tests {
         let b = graph.add_node(make_node(2, 38.0001, -77.0));
         graph.add_edge(a, b, make_way(1, 1.0));
 
-        let (consolidated, map) = consolidate_intersections(&graph, 5.0);
+        let (consolidated, map) =
+            consolidate_intersections(graph, &Profile::default(), &HashSet::new());
 
         assert_eq!(consolidated.node_count(), 2);
-        assert_ne!(map[&a], map[&b]);
+        assert_ne!(map[a.index()], map[b.index()]);
     }
 
     #[test]
@@ -483,11 +471,7 @@ mod tests {
         let e2 = graph.add_edge(b, c, make_way(3, 20.0));
         graph.add_edge(b, c, make_way(4, 200.0));
 
-        let path = Path {
-            nodes: vec![a, b, c],
-            edges: vec![e1, e2],
-        };
-        let collapsed = collapse_path_edges(&graph, &path.edges);
+        let collapsed = collapse_path_edges(&graph, &[e1, e2]);
 
         assert_eq!(collapsed.drive_travel_time, 30.0);
     }
@@ -503,7 +487,7 @@ mod tests {
         graph.add_edge(b, c, make_way_with_length(2, 20.0, 200.0));
         graph.add_edge(c, d, make_way_with_length(3, 30.0, 300.0));
 
-        let simplified = simplify_graph(&graph);
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
 
         assert_eq!(simplified.node_count(), 2);
         assert_eq!(simplified.edge_count(), 1);
@@ -535,7 +519,7 @@ mod tests {
             make_way_with_geometry(3, 30.0, vec![(0.002, 0.0), (0.0025, 0.0002), (0.003, 0.0)]),
         );
 
-        let simplified = simplify_graph(&graph);
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
         let edge = simplified.edge_weights().next().unwrap();
 
         assert_eq!(
@@ -553,6 +537,143 @@ mod tests {
     }
 
     #[test]
+    fn faster_direct_edge_beats_slower_parallel_chain() {
+        // a → b directly (10 s) and a → x → b via a detour (2 × 50 s). The
+        // chain is visited first but must not shadow the faster direct edge.
+        let mut graph = DiGraph::new();
+        let a = graph.add_node(make_node(1, 0.0, 0.0));
+        let b = graph.add_node(make_node(2, 0.002, 0.0));
+        let x = graph.add_node(make_node(3, 0.001, 0.001));
+        graph.add_edge(a, b, make_way(1, 10.0));
+        graph.add_edge(x, b, make_way(2, 50.0));
+        graph.add_edge(a, x, make_way(3, 50.0));
+
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
+
+        assert_eq!(simplified.edge_count(), 1);
+        assert_eq!(
+            simplified.edge_weights().next().unwrap().drive_travel_time,
+            10.0
+        );
+    }
+
+    #[test]
+    fn refitting_length_keeps_signal_waits_whole() {
+        let mut edge = Edge {
+            signal_delay_s: 2.0,
+            ..make_way_with_length(1, 12.0, 100.0)
+        };
+        refit_length(&mut edge, 200.0, &Profile::default());
+        assert!(
+            (edge.drive_travel_time - 22.0).abs() < 1e-9,
+            "{}",
+            edge.drive_travel_time
+        );
+        edge.set_length(0.0, &Profile::default());
+        assert!(
+            (edge.drive_travel_time - 2.0).abs() < 1e-9,
+            "{}",
+            edge.drive_travel_time
+        );
+    }
+
+    #[test]
+    fn consolidation_keeps_fastest_parallel_edge() {
+        // b1 and b2 are 0.1 m apart and merge; both connect to a.
+        let mut graph = DiGraph::new();
+        let a = graph.add_node(make_node(1, 0.0, 0.0));
+        let b1 = graph.add_node(make_node(2, 0.001, 0.0));
+        let b2 = graph.add_node(make_node(3, 0.001000001, 0.0));
+        graph.add_edge(a, b1, make_way_with_length(1, 30.0, 120.0));
+        graph.add_edge(a, b2, make_way_with_length(2, 20.0, 120.0));
+
+        let (consolidated, _) =
+            consolidate_intersections(graph, &Profile::default(), &HashSet::new());
+
+        assert_eq!(consolidated.edge_count(), 1);
+        // The 20 s edge wins; its length is then refit to the merged span.
+        let edge = consolidated.edge_weights().next().unwrap();
+        assert!((edge.drive_travel_time - 20.0 * edge.length / 120.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn simplification_keeps_osm_ids_and_merges_to_smallest_member_id() {
+        let mut graph = DiGraph::new();
+        let mut tagged = make_node(10, 0.0, 0.0);
+        tagged.tags.push(make_tag("highway", "traffic_signals"));
+        let a = graph.add_node(tagged);
+        let b1 = graph.add_node(make_node(30, 0.001, 0.0));
+        let b2 = graph.add_node(make_node(20, 0.001000001, 0.0));
+        let c = graph.add_node(make_node(40, 0.002, 0.0));
+        let d = graph.add_node(make_node(50, 0.001, 0.001));
+        // A T-junction at b, whose two OSM nodes sit 0.1 m apart.
+        graph.add_edge(a, b1, make_way(1, 10.0));
+        graph.add_edge(b2, c, make_way(2, 10.0));
+        graph.add_edge(b1, d, make_way(3, 10.0));
+
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
+        let mut ids: Vec<i64> = simplified.node_weights().map(|n| n.id).collect();
+        ids.sort_unstable();
+
+        // a, c, d keep their ids; b1/b2 merge into one node with id 20.
+        assert_eq!(ids, vec![10, 20, 40, 50]);
+        let a_node = simplified.node_weights().find(|n| n.id == 10).unwrap();
+        assert_eq!(a_node.tags.len(), 1, "unmerged nodes keep their tags");
+    }
+
+    #[test]
+    fn merged_endpoints_refit_straight_edges_to_their_new_span() {
+        // b1/b2 sit 4 m apart and merge to their midpoint; the 1 m edge from
+        // b2 to c ends up spanning ~3 m, so it must be stretched.
+        let mut graph = DiGraph::new();
+        let b1 = graph.add_node(make_node(1, 0.0, 0.0));
+        let b2 = graph.add_node(make_node(2, 0.000036, 0.0));
+        let c = graph.add_node(make_node(3, 0.000045, 0.0));
+        graph.add_edge(b2, c, make_way_with_length(1, 0.1, 1.0));
+        graph.add_edge(b1, b2, make_way(2, 1.0));
+
+        let (consolidated, map) =
+            consolidate_intersections(graph, &Profile::default(), &HashSet::new());
+        assert_eq!(map[b1.index()], map[b2.index()]);
+        let edge = consolidated.edge_weights().next().unwrap();
+        let (a, b) = (
+            &consolidated[map[b2.index()]],
+            &consolidated[map[c.index()]],
+        );
+        let span = calculate_distance(a.lat, a.lon, b.lat, b.lon);
+        assert!((edge.length - span).abs() < 1e-9 && span > 2.0);
+        assert!(
+            (edge.drive_travel_time - 0.1 * span).abs() < 1e-9,
+            "speed kept"
+        );
+    }
+
+    #[test]
+    fn loop_road_keeps_both_directions() {
+        // A two-way loop V → A → B → V hanging off junction V, plus a spur.
+        let mut graph = DiGraph::new();
+        let spur = graph.add_node(make_node(1, -0.001, 0.0));
+        let v = graph.add_node(make_node(2, 0.0, 0.0));
+        let a = graph.add_node(make_node(3, 0.001, 0.0));
+        let b = graph.add_node(make_node(4, 0.001, 0.001));
+        for (x, y) in [(spur, v), (v, a), (a, b), (b, v)] {
+            graph.add_edge(x, y, make_way(1, 10.0));
+            graph.add_edge(y, x, make_way(2, 10.0));
+        }
+
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
+
+        assert!(
+            simplified
+                .edge_references()
+                .all(|e| e.source() != e.target()),
+            "no self-loops"
+        );
+        // Spur both ways + the three sides of the loop, each both ways.
+        assert_eq!(simplified.edge_count(), 8);
+    }
+
+    #[test]
     fn t_junction_preserves_decision_node() {
         let mut graph = DiGraph::new();
         let west = graph.add_node(make_node(1, 0.0, 0.0));
@@ -563,7 +684,7 @@ mod tests {
         graph.add_edge(center, east, make_way(2, 10.0));
         graph.add_edge(center, north, make_way(3, 10.0));
 
-        let simplified = simplify_graph(&graph);
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
 
         assert_eq!(simplified.node_count(), 4);
         assert_eq!(simplified.edge_count(), 3);
@@ -578,7 +699,7 @@ mod tests {
         graph.add_edge(a, b, make_way(1, 10.0));
         graph.add_edge(b, c, make_way(2, 10.0));
 
-        let simplified = simplify_graph(&graph);
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
         let edge = simplified.edge_references().next().unwrap();
         let source = &simplified[edge.source()];
         let target = &simplified[edge.target()];
@@ -597,7 +718,7 @@ mod tests {
         graph.add_edge(west, east, make_way(1, 10.0));
         graph.add_edge(south, north, make_way(2, 10.0));
 
-        let simplified = simplify_graph(&graph);
+        let simplified = simplify_graph(graph, &Profile::default(), &HashSet::new());
 
         assert_eq!(simplified.node_count(), 4);
         assert_eq!(simplified.edge_count(), 2);

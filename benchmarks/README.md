@@ -4,21 +4,25 @@ This directory keeps benchmark and external comparison artifacts.
 
 ## Local PBF Pipeline
 
-`benchmark.rs` is a Rust harness for profiling the local PBF pipeline. It
-measures one-shot setup costs separately from steady-state hot-path timings.
-It is kept in `benchmarks/` as a repo-local profiling tool rather than as part
-of the published Rust crate.
+`benchmark.rs` is a Rust harness for the local PBF pipeline, run through Cargo:
+
+```bash
+cargo bench --bench pipeline                          # bundled Munich extract, driving
+NETWORK=walk VERIFY=1 cargo bench --bench pipeline
+cargo bench --bench pipeline -- path/to/extract.osm.pbf
+```
+
+It times one-shot setup (PBF load, routing preparation, save and load)
+separately from steady-state queries (reachability, isochrones, prisms,
+routes before and after preparation, travel-time matrices). Query points are
+drawn with a fixed seed, so runs are comparable.
 
 Useful environment variables:
 
 - `NETWORK=drive|walk|bike`
-- `LIMITS=300,600,900`
-- `LAT=38.9097`
-- `LON=-77.0432`
-- `ITERS=20`
-- `WARMUP=5`
-- `RETAIN_ALL=1`
-- `PROFILE_LOOP=1`
+- `ITERS=20` (queries per measured stage)
+- `BUDGET=600` (reachability budget in seconds)
+- `VERIFY=1` (also check every route against plain Dijkstra)
 
 ## External Comparison
 

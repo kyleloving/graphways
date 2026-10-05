@@ -3,3 +3,6 @@
 /cache
 /data
 /site
+__pycache__/
+*.pyc
+/examples/cache

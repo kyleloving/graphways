@@ -1,4 +1,5 @@
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -36,7 +37,8 @@ class PythonApiTests(unittest.TestCase):
         self.assertEqual([iso.minutes for iso in isochrones], [1.0, 3.0])
         self.assertTrue(all(type(iso).__name__ == "IsochroneResult" for iso in isochrones))
         geojson = json.loads(isochrones[0].to_geojson())
-        self.assertEqual(geojson["type"], "Polygon")
+        self.assertEqual(geojson["type"], "MultiPolygon")
+        self.assertEqual(isochrones[0].__geo_interface__, geojson)
 
     def test_snap_point_returns_structured_result(self):
         snap = self.graph.snap_point(48.0, 11.0)
@@ -68,6 +70,164 @@ class PythonApiTests(unittest.TestCase):
         route = self.graph.route((47.999, 11.0), (48.001, 11.0), max_snap_m=None)
         self.assertEqual(type(route).__name__, "RouteResult")
         self.assertGreater(route.origin_snap.distance_m, 100.0)
+
+    def test_snap_lands_on_the_road_between_nodes(self):
+        snap = self.graph.snap_point(48.0005, 11.0001)
+
+        self.assertLess(snap.distance_m, 10.0)
+        self.assertAlmostEqual(snap.snapped_lat, 48.0005, places=5)
+        self.assertIn("snapped_lon", snap.as_dict())
+
+    def test_results_expose_geo_interface(self):
+        route = self.graph.route((48.0, 11.0), (48.001, 11.0))
+        self.assertEqual(route.__geo_interface__["geometry"]["type"], "LineString")
+
+    def test_prepare_routing_gives_identical_routes(self):
+        xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
+        graph = gw.SpatialGraph.from_osm(xml, "walk")
+        before = graph.route((48.0, 11.0), (48.001, 11.0))
+        graph.prepare_routing()
+        self.assertTrue(graph.is_routing_prepared())
+        after = graph.route((48.0, 11.0), (48.001, 11.0))
+        self.assertAlmostEqual(before.duration_s, after.duration_s)
+        self.assertEqual(before.coordinates, after.coordinates)
+
+    def test_saved_graph_loads_with_identical_routes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "tiny.graphways"
+            self.graph.save(str(path))
+            loaded = gw.SpatialGraph.load(path)
+
+        self.assertTrue(loaded.is_routing_prepared())
+        self.assertEqual(loaded.node_count(), self.graph.node_count())
+        self.assertEqual(loaded.edge_count(), self.graph.edge_count())
+        before = self.graph.route((48.0, 11.0), (48.001, 11.0))
+        after = loaded.route((48.0, 11.0), (48.001, 11.0))
+        self.assertEqual(after.coordinates, before.coordinates)
+        self.assertEqual(after.duration_s, before.duration_s)
+
+    def test_loading_a_foreign_file_raises_value_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "not-a-graph"
+            path.write_bytes(b"hello world, definitely not a graph")
+            with self.assertRaises(ValueError):
+                gw.SpatialGraph.load(path)
+            with self.assertRaises(OSError):
+                gw.SpatialGraph.load(Path(tmp) / "missing")
+
+    def test_travel_time_matrix_matches_routes(self):
+        points = [(48.0, 11.0), (48.001, 11.0), (48.0005, 11.0), (10.0, 10.0)]
+        matrix = self.graph.travel_time_matrix(points, points[:3])
+
+        self.assertEqual(matrix.shape, (4, 3))
+        self.assertEqual(len(matrix.durations_s), 4)
+        self.assertIsNone(matrix.origin_snaps[3])
+        self.assertEqual(matrix.durations_s[3], (None, None, None))
+        self.assertEqual(matrix.durations_s[0][0], 0.0)
+        for i, origin in enumerate(points[:3]):
+            for j, destination in enumerate(points[:3]):
+                route = self.graph.route(origin, destination)
+                self.assertAlmostEqual(matrix.durations_s[i][j], route.duration_s)
+                self.assertAlmostEqual(matrix.distances_m[i][j], route.distance_m)
+
+    def test_invalid_profiles_are_rejected(self):
+        xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
+        for bad in [{"walk_speed_kph": 0}, {"walk_speed_kph": float("nan")},
+                    {"drive_speeds_kph": {"residential": -30}}, {"traffic_signal_s": -1}]:
+            with self.assertRaises(ValueError, msg=str(bad)):
+                gw.SpatialGraph.from_osm(xml, "walk", **bad)
+
+    def test_auto_prepare_routing_can_be_switched_off(self):
+        xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
+        graph = gw.SpatialGraph.from_osm(xml, "walk")
+        self.assertTrue(graph.auto_prepare_routing)
+        graph.auto_prepare_routing = False
+        points = [(48.0, 11.0), (48.001, 11.0)] * 20
+        graph.route(points[0], points[1])
+        graph.travel_time_matrix(points, points)
+        self.assertFalse(graph.is_routing_prepared())
+        graph.prepare_routing()
+        self.assertTrue(graph.is_routing_prepared())
+
+    def test_travel_time_matrix_defaults_to_origin_to_origin(self):
+        points = [(48.0, 11.0), (48.001, 11.0), (48.0005, 11.0)]
+        square = self.graph.travel_time_matrix(points)
+        explicit = self.graph.travel_time_matrix(points, points)
+
+        self.assertEqual(square.shape, (3, 3))
+        self.assertEqual(square.durations_s, explicit.durations_s)
+
+    def test_travel_time_matrix_respects_max_minutes(self):
+        points = [(48.0, 11.0), (48.001, 11.0), (48.0005, 11.0)]
+        full = self.graph.travel_time_matrix(points)
+        limit_s = 0.5 * max(t for row in full.durations_s for t in row)
+        cut = self.graph.travel_time_matrix(points, max_minutes=limit_s / 60)
+
+        for full_row, cut_row, cut_dist in zip(full.durations_s, cut.durations_s, cut.distances_m):
+            for t, c, d in zip(full_row, cut_row, cut_dist):
+                if t <= limit_s:
+                    self.assertEqual(c, t)
+                else:
+                    self.assertIsNone(c)
+                    self.assertIsNone(d)
+        with self.assertRaises(ValueError):
+            self.graph.travel_time_matrix(points, max_minutes=-1)
+
+    def test_accessibility_and_nearest_destinations(self):
+        points = [(48.0, 11.0), (48.001, 11.0), (48.0005, 11.0), (10.0, 10.0)]
+        matrix = self.graph.travel_time_matrix(points, points)
+        scores = self.graph.accessibility(points, points, minutes=[1, 60], weights=[1, 2, 3, 4])
+        self.assertIsNone(scores[3])
+        for i in range(3):
+            within = [w for t, w in zip(matrix.durations_s[i], [1, 2, 3, 4]) if t is not None and t <= 60]
+            self.assertAlmostEqual(scores[i][0], sum(within))
+            self.assertAlmostEqual(scores[i][1], 6)
+        decayed = self.graph.accessibility(points, points, minutes=[2], decay="exponential")
+        self.assertTrue(0 < decayed[0][0] < 3)
+        with self.assertRaises(ValueError):
+            self.graph.accessibility(points, points, minutes=[5], decay="cubic")
+        with self.assertRaises(ValueError):
+            self.graph.accessibility(points, points, minutes=[5], weights=[1])
+
+        nearest = self.graph.nearest_destinations(points, points[1:3], k=1)
+        self.assertEqual(nearest[3], [])
+        index, seconds, metres = nearest[0][0]
+        self.assertEqual(seconds, min(t for t in matrix.durations_s[0][1:3] if t is not None))
+        self.assertGreater(metres, 0)
+
+    def test_with_transit_rides_the_fixture_line(self):
+        walk_time = self.graph.route((48.0, 11.0), (48.003, 11.0)).duration_s
+        transit = self.graph.with_transit(FIXTURES / "tiny_gtfs", date="2026-10-06")
+        self.assertEqual(transit.transit_summary, {"stops": 2, "patterns": 1, "unlinked_stops": 0})
+        self.assertIsNone(self.graph.transit_summary)
+        # Wait 2.5 min, ride 30 s, a few metres of walking.
+        by_transit = transit.route((48.0, 11.0), (48.003, 11.0)).duration_s
+        self.assertLess(by_transit, walk_time)
+        self.assertAlmostEqual(by_transit, 150 + 30, delta=20)
+        self.assertIn("transit_stops=2", repr(transit))
+        with self.assertRaises(ValueError):
+            self.graph.with_transit(FIXTURES / "tiny_gtfs", date="2026-02-30")
+        drive = gw.SpatialGraph.from_osm((FIXTURES / "tiny_map.osm").read_text(encoding="utf-8"), "drive")
+        with self.assertRaises(ValueError):
+            drive.with_transit(FIXTURES / "tiny_gtfs", date="2026-10-06")
+
+    def test_turn_cost_keywords_are_accepted(self):
+        xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
+        plain = gw.SpatialGraph.from_osm(xml, "drive", turn_penalty_s=0, u_turn_penalty_s=0)
+        priced = gw.SpatialGraph.from_osm(xml, "drive", u_turn_penalty_s=100, traffic_signal_s=5)
+        self.assertEqual(plain.node_count(), priced.node_count())
+        with self.assertRaises(TypeError):
+            gw.SpatialGraph.from_osm(xml, "drive", turn_penalty=1)
+
+    def test_profile_keywords_change_travel_times(self):
+        xml = (FIXTURES / "tiny_map.osm").read_text(encoding="utf-8")
+        slow = gw.SpatialGraph.from_osm(xml, "walk", walk_speed_kph=2.5)
+        normal = self.graph.route((48.0, 11.0), (48.001, 11.0))
+        halved = slow.route((48.0, 11.0), (48.001, 11.0))
+        self.assertAlmostEqual(halved.duration_s, 2 * normal.duration_s, places=6)
+
+        with self.assertRaises(TypeError):
+            gw.SpatialGraph.from_osm(xml, "walk", walk_speed=3)
 
     def test_invalid_osm_raises_value_error(self):
         with self.assertRaises(ValueError):

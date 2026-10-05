@@ -11,6 +11,18 @@ Full runnable source: [`examples/python_example.py`](https://github.com/kylelovi
 
 ---
 
+## Food access screening
+
+Notebook: [`examples/food_deserts_dc.ipynb`](https://github.com/kyleloving/graphways/blob/main/examples/food_deserts_dc.ipynb)
+
+This notebook shows a network-based food-access workflow in Washington, DC:
+build a walking graph, fetch grocery-like OSM POIs, sample neighborhood points,
+and mark places where no grocery store is reachable within a chosen walking
+time. It is framed as a screening analysis rather than an official food-desert
+classification.
+
+---
+
 ## Walking isochrones
 
 Graduated colour bands from a central point, rendered largest-first so smaller

@@ -1,0 +1,227 @@
+name: Release
+
+# Pushing a tag `vX.Y.Z` (matching the version in Cargo.toml) runs the full
+# CI suite, builds and tests wheels for every platform plus the source
+# distribution, then publishes to PyPI and crates.io and creates a GitHub
+# release. Pull requests that touch packaging, and manual runs ("Run
+# workflow"), build and test everything without publishing.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - Cargo.toml
+      - Cargo.lock
+      - pyproject.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the Cargo.toml version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+  # The full CI suite gates publishing (pull requests already run it).
+  ci:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: version
+    uses: ./.github/workflows/ci.yml
+
+  # One abi3 wheel per platform covers every CPython from 3.8 up.
+  wheels:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64, manylinux: auto }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64, manylinux: auto }
+          - { name: macos-arm64, os: macos-14, target: aarch64 }
+          - { name: macos-x86_64, os: macos-14, target: x86_64 }
+          - { name: windows-x86_64, os: windows-latest, target: x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # aws-lc (the TLS backend behind the `network` feature) assembles its
+      # x86-64 Windows code with NASM.
+      - if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # Install each wheel on its own platform, on the oldest and newest Python
+  # it is tested with, and run the Python test suite against it.
+  test-wheels:
+    needs: wheels
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, python: "3.8", wheels: linux-x86_64 }
+          - { os: ubuntu-latest, python: "3.13", wheels: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, python: "3.13", wheels: linux-aarch64 }
+          - { os: macos-14, python: "3.9", wheels: macos-arm64 }
+          - { os: macos-14, python: "3.13", wheels: macos-arm64 }
+          - { os: windows-latest, python: "3.8", wheels: windows-x86_64 }
+          - { os: windows-latest, python: "3.13", wheels: windows-x86_64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-${{ matrix.wheels }}
+          path: dist
+
+      - name: Install the wheel and run the Python tests
+        shell: bash
+        run: |
+          python -m pip install --no-index --find-links dist graphways
+          python -m unittest discover -s tests -p "test_*.py"
+
+  # The source distribution is the fallback for platforms without a wheel:
+  # make sure it builds and works.
+  test-sdist:
+    needs: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: Build from the sdist and run the Python tests
+        run: |
+          python -m pip install dist/*.tar.gz
+          python -m unittest discover -s tests -p "test_*.py"
+
+  publish-pypi:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [ci, test-wheels, test-sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/graphways/
+    permissions:
+      id-token: write # trusted publishing: no API token stored in the repo
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-crates:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [ci, test-wheels, test-sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io
+      url: https://crates.io/crates/graphways
+    permissions:
+      id-token: write # trusted publishing: no API token stored in the repo
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  github-release:
+    needs: [publish-pypi, publish-crates]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist
+
+      - name: Create the GitHub release with the built files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            --verify-tag

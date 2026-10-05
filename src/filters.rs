@@ -8,6 +8,17 @@ use crate::overpass::NetworkType;
 // Road / way filter
 // ---------------------------------------------------------------------------
 
+/// Value of the first tag named `key`, if any.
+fn tag_value<'a, K, V>(tags: &'a [(K, V)], key: &str) -> Option<&'a str>
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    tags.iter()
+        .find(|(k, _)| k.as_ref() == key)
+        .map(|(_, v)| v.as_ref())
+}
+
 /// Return `true` if a way with the given tags should be included in the road
 /// network for `network_type`.
 ///
@@ -15,8 +26,15 @@ use crate::overpass::NetworkType;
 /// change the other. The Overpass filter is a string passed to the API; this
 /// function is the equivalent predicate applied to already-fetched data (PBF
 /// or cached XML).
-pub fn way_passes_road_filter(tags: &[(String, String)], network_type: NetworkType) -> bool {
-    let get = |k: &str| tags.iter().find(|(tk, _)| tk == k).map(|(_, v)| v.as_str());
+///
+/// Accepts any `(key, value)` string pairs, so callers can pass borrowed
+/// `(&str, &str)` tags straight from a PBF block without allocating.
+pub fn way_passes_road_filter<K, V>(tags: &[(K, V)], network_type: NetworkType) -> bool
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let get = |key: &str| tag_value(tags, key);
 
     let highway = match get("highway") {
         Some(v) => v,
@@ -212,8 +230,12 @@ pub fn way_passes_road_filter(tags: &[(String, String)], network_type: NetworkTy
 /// The categories here must stay in sync with the selectors in
 /// `poi::create_poi_query`. If you add a category to the Overpass query,
 /// add the matching arm here so PBF parsing picks it up too.
-pub fn is_poi_node(tags: &[(String, String)]) -> bool {
-    let get = |k: &str| tags.iter().find(|(tk, _)| tk == k).map(|(_, v)| v.as_str());
+pub fn is_poi_node<K, V>(tags: &[(K, V)]) -> bool
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+{
+    let get = |key: &str| tag_value(tags, key);
 
     if get("tourism").is_some() {
         return true;
@@ -313,7 +335,7 @@ mod tests {
 
     #[test]
     fn poi_no_tags() {
-        assert!(!is_poi_node(&[]));
+        assert!(!is_poi_node::<&str, &str>(&[]));
     }
 
     // --- Road filter ---

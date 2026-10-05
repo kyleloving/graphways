@@ -1,0 +1,3 @@
+stop_id,stop_name,stop_lat,stop_lon
+S1,South,48.0000,11.0001
+S4,North,48.0030,11.0001

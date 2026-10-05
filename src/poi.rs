@@ -1,10 +1,13 @@
-use crate::cache;
+#[cfg(any(test, feature = "network"))]
 use crate::error::OsmGraphError;
-use crate::graph::{SpatialGraph, XmlData};
+#[cfg(feature = "network")]
+use crate::graph::{OsmData, SpatialGraph};
+#[cfg(feature = "network")]
 use crate::overpass;
+#[cfg(feature = "network")]
 use crate::reachability::ReachabilityResult;
 #[cfg(any(test, feature = "extension-module"))]
-use geo::{Coord, LineString, Polygon};
+use geo::{Coord, LineString, MultiPolygon, Polygon};
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
@@ -36,6 +39,7 @@ pub struct ReachablePoi {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "network")]
 fn create_poi_query(bbox: &str) -> String {
     format!(
         "[out:xml];(\
@@ -50,69 +54,71 @@ fn create_poi_query(bbox: &str) -> String {
     )
 }
 
-/// Extract a `south,west,north,east` Overpass bbox from an isochrone polygon.
-/// Internal coordinate convention: x = lat, y = lon.
+/// A `south,west,north,east` Overpass bbox around an area (x = lon, y = lat).
 #[cfg(feature = "extension-module")]
-fn bbox_from_polygon(polygon: &Polygon<f64>) -> String {
-    let mut min_lat = f64::MAX;
-    let mut max_lat = f64::MIN;
-    let mut min_lon = f64::MAX;
-    let mut max_lon = f64::MIN;
-    for coord in polygon.exterior().coords() {
-        min_lat = min_lat.min(coord.x);
-        max_lat = max_lat.max(coord.x);
-        min_lon = min_lon.min(coord.y);
-        max_lon = max_lon.max(coord.y);
-    }
-    format!("{},{},{},{}", min_lat, min_lon, max_lat, max_lon)
-}
-
-async fn fetch_xml_cached(query: &str) -> Result<String, OsmGraphError> {
-    if let Some(cached) = cache::check_xml_cache(query)? {
-        return Ok(cached);
-    }
-    if let Some(disk) = cache::check_disk_xml_cache(query) {
-        cache::insert_into_xml_cache(query.to_string(), disk.clone())?;
-        return Ok(disk);
-    }
-    let fetched = overpass::make_request(&overpass::overpass_url(), query).await?;
-    cache::write_disk_xml_cache(query, &fetched);
-    cache::insert_into_xml_cache(query.to_string(), fetched.clone())?;
-    Ok(fetched)
+fn bbox_from_area(area: &MultiPolygon<f64>) -> Option<String> {
+    use geo::BoundingRect;
+    let rect = area.bounding_rect()?;
+    Some(format!(
+        "{},{},{},{}",
+        rect.min().y,
+        rect.min().x,
+        rect.max().y,
+        rect.max().x
+    ))
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Parse a GeoJSON geometry string (as produced by `polygon_to_geojson_string`)
-/// back into a `geo::Polygon<f64>` using the library's internal x=lat, y=lon convention.
+/// Parse a GeoJSON Polygon or MultiPolygon (a bare geometry or a Feature)
+/// into a `geo::MultiPolygon` with x = longitude, y = latitude.
 #[cfg(any(test, feature = "extension-module"))]
-pub(crate) fn parse_isochrone(geojson_str: &str) -> Result<Polygon<f64>, OsmGraphError> {
+pub(crate) fn parse_area(geojson_str: &str) -> Result<MultiPolygon<f64>, OsmGraphError> {
     let gj: geojson::GeoJson = geojson_str
         .parse()
         .map_err(|_| OsmGraphError::InvalidInput("invalid GeoJSON".into()))?;
-    let rings = match gj {
-        geojson::GeoJson::Geometry(geom) => match geom.value {
-            geojson::Value::Polygon(rings) => rings,
-            _ => {
-                return Err(OsmGraphError::InvalidInput(
-                    "expected Polygon geometry".into(),
-                ))
-            }
-        },
+    let value = match gj {
+        geojson::GeoJson::Geometry(geometry) => geometry.value,
+        geojson::GeoJson::Feature(geojson::Feature {
+            geometry: Some(geometry),
+            ..
+        }) => geometry.value,
         _ => {
             return Err(OsmGraphError::InvalidInput(
-                "expected a GeoJSON Geometry, not a Feature or FeatureCollection".into(),
+                "expected a Polygon or MultiPolygon geometry or Feature".into(),
             ))
         }
     };
-    // GeoJSON coords are [lon, lat]; internal convention is x=lat, y=lon.
-    let exterior: Vec<Coord<f64>> = rings[0]
-        .iter()
-        .map(|c| Coord { x: c[1], y: c[0] })
-        .collect();
-    Ok(Polygon::new(LineString::from(exterior), vec![]))
+    let ring = |points: &Vec<geojson::Position>| -> LineString<f64> {
+        points
+            .iter()
+            .map(|c| Coord { x: c[0], y: c[1] })
+            .collect::<Vec<_>>()
+            .into()
+    };
+    let polygon = |rings: &Vec<Vec<geojson::Position>>| -> Option<Polygon<f64>> {
+        let (exterior, interiors) = rings.split_first()?;
+        Some(Polygon::new(
+            ring(exterior),
+            interiors.iter().map(ring).collect(),
+        ))
+    };
+    let polygons = match &value {
+        geojson::GeometryValue::Polygon { coordinates: rings } => {
+            polygon(rings).into_iter().collect()
+        }
+        geojson::GeometryValue::MultiPolygon { coordinates: parts } => {
+            parts.iter().filter_map(polygon).collect()
+        }
+        _ => {
+            return Err(OsmGraphError::InvalidInput(
+                "expected Polygon or MultiPolygon geometry".into(),
+            ))
+        }
+    };
+    Ok(MultiPolygon(polygons))
 }
 
 /// Fetch POIs within a polygon and filter by geometric containment.
@@ -122,18 +128,20 @@ pub(crate) fn parse_isochrone(geojson_str: &str) -> Result<Polygon<f64>, OsmGrap
 /// network reachability. Prefer [`fetch_pois_within_reachability`] when a
 /// [`ReachabilityResult`] is already available.
 #[cfg(feature = "extension-module")]
-pub(crate) async fn fetch_pois_within(polygon: &Polygon<f64>) -> Result<Vec<Poi>, OsmGraphError> {
+pub(crate) async fn fetch_pois_within(area: &MultiPolygon<f64>) -> Result<Vec<Poi>, OsmGraphError> {
     use geo::{Contains, Point};
 
-    let bbox = bbox_from_polygon(polygon);
+    let Some(bbox) = bbox_from_area(area) else {
+        return Ok(Vec::new());
+    };
     let query = create_poi_query(&bbox);
-    let xml = fetch_xml_cached(&query).await?;
-    let data: XmlData = quick_xml::de::from_str(&xml)?;
+    let xml = crate::download::fetch_cached(&query).await?;
+    let data: OsmData = quick_xml::de::from_str(&xml)?;
 
     let pois = data
         .nodes
         .into_iter()
-        .filter(|n| polygon.contains(&Point::new(n.lat, n.lon)))
+        .filter(|n| area.contains(&Point::new(n.lon, n.lat)))
         .map(|n| Poi {
             id: n.id,
             lat: n.lat,
@@ -145,40 +153,46 @@ pub(crate) async fn fetch_pois_within(polygon: &Polygon<f64>) -> Result<Vec<Poi>
     Ok(pois)
 }
 
+#[cfg(feature = "network")]
 /// Fetch POIs and filter them by actual network travel time.
 ///
 /// Uses the [`ReachabilityResult`] from a prior graph search as the truth
 /// source instead of polygon containment:
 ///
-/// 1. Derives a bounding box from the origin node and `max_cost`.
+/// 1. Derives a bounding box from the origin and `max_cost`.
 /// 2. Fetches POI nodes from Overpass within that box (cached).
-/// 3. Snaps each POI to its nearest graph node via the spatial index.
-/// 4. Keeps only POIs whose snapped node appears in `reachability.distances`.
+/// 3. Snaps each POI to the nearest road.
+/// 4. Keeps POIs whose snapped road point is reachable within `max_cost`.
 ///
-/// The `travel_time_s` on each [`ReachablePoi`] is the Dijkstra distance to
-/// the snapped node — the same value that drove the isochrone — not a
-/// straight-line estimate. POIs that snap to unreachable nodes (across a
-/// river, behind a highway, in a disconnected subgraph) are correctly excluded.
+/// The `travel_time_s` on each [`ReachablePoi`] is the network travel time to
+/// that road point — the same search that drove the isochrone — not a
+/// straight-line estimate. POIs whose road is unreachable (across a river,
+/// behind a highway, in a disconnected subgraph) are correctly excluded.
 pub(crate) async fn fetch_pois_within_reachability(
     sg: &SpatialGraph,
     reachability: &ReachabilityResult,
 ) -> Result<Vec<ReachablePoi>, OsmGraphError> {
     // Size the bbox using the same generous speed assumption as isochrone
     // bbox sizing so the box always contains the full reachable area.
-    let origin = &sg.graph[reachability.start];
+    let origin = reachability.origin;
     let max_speed_m_per_s = 120.0_f64 / 3.6;
     let radius_m = reachability.max_cost * max_speed_m_per_s * 1.2;
     let bbox = overpass::bbox_from_point(origin.lat, origin.lon, radius_m);
     let query = create_poi_query(&bbox);
-    let xml = fetch_xml_cached(&query).await?;
-    let data: XmlData = quick_xml::de::from_str(&xml)?;
+    let xml = crate::download::fetch_cached(&query).await?;
+    let data: OsmData = quick_xml::de::from_str(&xml)?;
 
     let pois = data
         .nodes
         .into_iter()
         .filter_map(|n| {
-            let snapped = sg.poi_snaps.as_ref()?.get(&n.id).copied()?;
-            let travel_time_s = *reachability.distances.get(&snapped.snap.node_index)?;
+            // Pre-snapped POIs (PBF graphs) are an O(1) lookup; otherwise
+            // snap on the fly through the spatial index.
+            let snap = match &sg.poi_snaps {
+                Some(snaps) => snaps.get(&n.id)?.snap,
+                None => sg.snap_point((n.lat, n.lon))?,
+            };
+            let travel_time_s = reachability.time_to(sg, &snap)?;
             Some(ReachablePoi {
                 poi: Poi {
                     id: n.id,
@@ -187,8 +201,8 @@ pub(crate) async fn fetch_pois_within_reachability(
                     tags: n.tags.into_iter().map(|t| (t.key, t.value)).collect(),
                 },
                 travel_time_s,
-                snap_node_id: snapped.snap.node_id,
-                snap_distance_m: snapped.snap.distance_m,
+                snap_node_id: snap.node_id,
+                snap_distance_m: snap.distance_m,
             })
         })
         .collect();
@@ -202,7 +216,7 @@ pub(crate) fn pois_to_geojson(pois: &[Poi]) -> String {
     let features: Vec<geojson::Feature> = pois
         .iter()
         .map(|poi| {
-            let geometry = geojson::Geometry::new(geojson::Value::Point(vec![poi.lon, poi.lat]));
+            let geometry = geojson::Geometry::new_point((poi.lon, poi.lat));
             let props: geojson::JsonObject = poi
                 .tags
                 .iter()
@@ -233,25 +247,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_isochrone_valid() {
+    fn test_parse_area_polygon_uses_lon_as_x() {
         let geojson = r#"{"type":"Polygon","coordinates":[[[11.0,48.0],[11.1,48.0],[11.05,48.1],[11.0,48.0]]]}"#;
-        let polygon = parse_isochrone(geojson).unwrap();
-        let first = polygon.exterior().coords().next().unwrap();
+        let area = parse_area(geojson).unwrap();
+        let first = area.0[0].exterior().coords().next().unwrap();
         assert!(
-            (first.x - 48.0).abs() < 1e-9,
-            "x should be lat (48.0), got {}",
+            (first.x - 11.0).abs() < 1e-9,
+            "x should be lon, got {}",
             first.x
         );
         assert!(
-            (first.y - 11.0).abs() < 1e-9,
-            "y should be lon (11.0), got {}",
+            (first.y - 48.0).abs() < 1e-9,
+            "y should be lat, got {}",
             first.y
         );
     }
 
     #[test]
-    fn test_parse_isochrone_invalid_json() {
-        let result = parse_isochrone("not valid json");
+    fn test_parse_area_multipolygon_keeps_parts_and_holes() {
+        let geojson = r#"{"type":"MultiPolygon","coordinates":[
+            [[[0,0],[4,0],[4,4],[0,4],[0,0]],[[1,1],[2,1],[2,2],[1,2],[1,1]]],
+            [[[10,10],[11,10],[11,11],[10,10]]]]}"#;
+        let area = parse_area(geojson).unwrap();
+        assert_eq!(area.0.len(), 2);
+        assert_eq!(area.0[0].interiors().len(), 1);
+    }
+
+    #[test]
+    fn test_parse_area_invalid_json() {
+        let result = parse_area("not valid json");
         assert!(matches!(
             result,
             Err(crate::error::OsmGraphError::InvalidInput(_))
@@ -259,9 +283,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_isochrone_wrong_geometry_type() {
+    fn test_parse_area_wrong_geometry_type() {
         let geojson = r#"{"type":"Point","coordinates":[11.0,48.0]}"#;
-        let result = parse_isochrone(geojson);
+        let result = parse_area(geojson);
         assert!(matches!(
             result,
             Err(crate::error::OsmGraphError::InvalidInput(_))
@@ -291,7 +315,10 @@ mod tests {
         let gj: geojson::GeoJson = json.parse().unwrap();
         if let geojson::GeoJson::FeatureCollection(fc) = gj {
             let geom = fc.features[0].geometry.as_ref().unwrap();
-            if let geojson::Value::Point(coords) = &geom.value {
+            if let geojson::GeometryValue::Point {
+                coordinates: coords,
+            } = &geom.value
+            {
                 assert!((coords[0] - 11.0).abs() < 1e-9, "first coord should be lon");
                 assert!(
                     (coords[1] - 48.0).abs() < 1e-9,

@@ -1,6 +1,6 @@
 [package]
 name = "graphways"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/kyleloving/graphways"
@@ -38,21 +38,36 @@ crate-type = ["cdylib", "rlib"]
 # Enable this feature only when building the Python extension (handled by maturin).
 # Activating it pulls in pyo3 and compiles all Python bindings.
 # Without it the crate is a plain Rust library with no Python dependency.
-extension-module = ["pyo3/extension-module"]
+# Downloading from Overpass/Nominatim (on by default). Turn it off with
+# `default-features = false` to drop the HTTP and async stack when you
+# only load local PBF/XML files.
+default = ["network"]
+network = ["dep:reqwest", "dep:tokio"]
+extension-module = ["pyo3/extension-module", "pyo3/abi3-py38", "network"]
+
+# Repo-local benchmark harness: `cargo bench --bench pipeline`.
+[[bench]]
+name = "pipeline"
+path = "benchmarks/benchmark.rs"
+harness = false
 
 [profile.profiling]
 inherits = "release"
 debug = true
 
 [dependencies]
-pyo3 = { version = "0.20.2", optional = true }
-reqwest = { version = "0.11", features = ["json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
-quick-xml = { version = "0.31", features = ["serialize"] }
+pyo3 = { version = "0.29", optional = true }
+reqwest = { version = "0.13", features = ["json", "query", "form"], optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time"], optional = true }
+quick-xml = { version = "0.42", features = ["serialize"] }
 serde = { version = "1.0" , features = ["derive"] }
-petgraph = "0.6.4"
-geo = "0.28.0"
-geojson = "0.24.1"
-rstar = "0.12"
+petgraph = "0.8"
+geo = "0.33"
+geojson = "1"
+rstar = "0.12"  # match the version geo uses
 osmpbf = "0.3"
-spade = "2.15.1"
+rayon = "1.8"
+delaunator = "1"
+postcard = { version = "1", default-features = false, features = ["use-std"] }
+csv = "1"
+zip = { version = "4", default-features = false, features = ["deflate-flate2-zlib-rs"] }

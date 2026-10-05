@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
+    # Tags run this suite through release.yml instead.
+    branches: ["**"]
   pull_request:
+  workflow_call:
 
 jobs:
   rust:
@@ -20,13 +23,40 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test
-        run: cargo test --lib
+      - name: Clippy (no network feature)
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
 
-      - name: Check Python extension feature
-        run: cargo check --features extension-module
+      - name: Clippy (Python extension)
+        run: cargo clippy --all-targets --features extension-module -- -D warnings
+
+      - name: Test (unit, randomized cross-checks, doc tests)
+        run: cargo test
+
+      - name: Test without the network feature
+        run: cargo test --no-default-features
+
+      - name: Rustdoc
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Runs the Munich pipeline end to end and checks every route against
+      # Dijkstra; timings land in the job log.
+      - name: Pipeline benchmark (driving)
+        run: cargo bench --bench pipeline
+        env:
+          VERIFY: "1"
 
   python-wheel:
     runs-on: ubuntu-latest

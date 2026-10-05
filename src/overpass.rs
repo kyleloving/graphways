@@ -1,14 +1,19 @@
 // Define an enum for network types
+#[cfg(feature = "network")]
 use reqwest::header::{HeaderMap, RETRY_AFTER};
+#[cfg(feature = "network")]
 use std::sync::{Mutex, OnceLock};
+#[cfg(feature = "network")]
 use std::time::{Duration, Instant};
+#[cfg(feature = "network")]
 use tokio::time::sleep;
 
 const DEFAULT_OVERPASS_URL: &str = "https://overpass-api.de/api/interpreter";
 const DEFAULT_NOMINATIM_URL: &str = "https://nominatim.openstreetmap.org/search";
+#[cfg(feature = "network")]
 const MAX_RETRIES: usize = 2;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum NetworkType {
     Drive,
     DriveService,
@@ -21,6 +26,7 @@ pub enum NetworkType {
 // Custom error type for better error messages
 #[derive(Debug)]
 pub enum OverpassError {
+    #[cfg(feature = "network")]
     RequestError(reqwest::Error),
     InvalidNetworkType,
 }
@@ -28,6 +34,7 @@ pub enum OverpassError {
 impl std::fmt::Display for OverpassError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "network")]
             OverpassError::RequestError(err) => write!(f, "Request Error: {}", err),
             OverpassError::InvalidNetworkType => write!(f, "Invalid Network Type"),
         }
@@ -59,19 +66,29 @@ pub fn get_osm_filter(network_type: NetworkType) -> Result<&'static str, Overpas
 }
 
 // Function to create the Overpass query string
+/// The Overpass query for a road network in a bounding box. Driving queries
+/// also fetch the turn-restriction relations on those roads.
 pub fn create_overpass_query(polygon_coord_str: &str, network_type: NetworkType) -> String {
     let filter = get_osm_filter(network_type).unwrap_or("");
-    format!(
-        "[out:xml][timeout:50];(way{}({});>;);out;",
-        filter, polygon_coord_str
-    )
+    if crate::restrictions::applies_to(network_type) {
+        format!(
+            "[out:xml][timeout:50];(way{filter}({polygon_coord_str});>;)->.roads;\
+             (.roads;rel(bw.roads)[\"type\"=\"restriction\"];);out;"
+        )
+    } else {
+        format!("[out:xml][timeout:50];(way{filter}({polygon_coord_str});>;);out;")
+    }
 }
 
+#[cfg(feature = "network")]
 static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+#[cfg(feature = "network")]
 static OVERPASS_LAST_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+#[cfg(feature = "network")]
 static NOMINATIM_LAST_REQUEST: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 // Reuse a single reqwest::Client across all HTTP calls in the library.
+#[cfg(feature = "network")]
 pub(crate) fn client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
@@ -81,14 +98,17 @@ pub(crate) fn client() -> &'static reqwest::Client {
     })
 }
 
+#[cfg(feature = "network")]
 fn overpass_last_request() -> &'static Mutex<Option<Instant>> {
     OVERPASS_LAST_REQUEST.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg(feature = "network")]
 fn nominatim_last_request() -> &'static Mutex<Option<Instant>> {
     NOMINATIM_LAST_REQUEST.get_or_init(|| Mutex::new(None))
 }
 
+#[cfg_attr(not(feature = "network"), allow(dead_code))]
 pub(crate) fn user_agent() -> String {
     std::env::var("GRAPHWAYS_USER_AGENT").unwrap_or_else(|_| {
         format!(
@@ -106,6 +126,7 @@ pub fn nominatim_url() -> String {
     std::env::var("GRAPHWAYS_NOMINATIM_URL").unwrap_or_else(|_| DEFAULT_NOMINATIM_URL.to_string())
 }
 
+#[cfg(feature = "network")]
 async fn wait_for_slot(last_request: &Mutex<Option<Instant>>, min_interval: Duration) {
     let delay = {
         let mut last = match last_request.lock() {
@@ -126,6 +147,7 @@ async fn wait_for_slot(last_request: &Mutex<Option<Instant>>, min_interval: Dura
     }
 }
 
+#[cfg(feature = "network")]
 fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     headers
         .get(RETRY_AFTER)
@@ -134,6 +156,7 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+#[cfg(feature = "network")]
 pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status == reqwest::StatusCode::BAD_GATEWAY
@@ -141,20 +164,24 @@ pub(crate) fn is_retryable_status(status: reqwest::StatusCode) -> bool {
         || status == reqwest::StatusCode::GATEWAY_TIMEOUT
 }
 
+#[cfg(feature = "network")]
 pub(crate) async fn retry_delay(headers: &HeaderMap, attempt: usize) {
     let fallback = Duration::from_millis(500 * (attempt as u64 + 1));
     sleep(retry_after(headers).unwrap_or(fallback)).await;
 }
 
+#[cfg(feature = "network")]
 pub(crate) async fn wait_for_nominatim_slot() {
     wait_for_slot(nominatim_last_request(), Duration::from_secs(1)).await;
 }
 
+#[cfg(feature = "network")]
 async fn wait_for_overpass_slot() {
     wait_for_slot(overpass_last_request(), Duration::from_millis(250)).await;
 }
 
 // Function to make request to Overpass API
+#[cfg(feature = "network")]
 pub async fn make_request(url: &str, query: &str) -> Result<String, reqwest::Error> {
     for attempt in 0..=MAX_RETRIES {
         wait_for_overpass_slot().await;

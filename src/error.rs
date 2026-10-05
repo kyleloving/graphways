@@ -1,5 +1,6 @@
 #[derive(Debug)]
 pub enum OsmGraphError {
+    #[cfg(feature = "network")]
     Network(reqwest::Error),
     XmlParse(quick_xml::DeError),
     EmptyGraph,
@@ -18,11 +19,17 @@ pub enum OsmGraphError {
     InvalidInput(String),
     Io(std::io::Error),
     PbfError(String),
+    /// An origin-destination query whose trip cannot fit the time budget.
+    Infeasible(crate::feasibility::InfeasibleReason),
+    /// A saved graph file that is corrupt, truncated, or from an
+    /// incompatible version.
+    InvalidGraphFile(String),
 }
 
 impl std::fmt::Display for OsmGraphError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(feature = "network")]
             OsmGraphError::Network(e) => write!(f, "Network error: {}", e),
             OsmGraphError::XmlParse(e) => write!(f, "XML parse error: {}", e),
             OsmGraphError::EmptyGraph => write!(f, "Graph is empty"),
@@ -51,6 +58,8 @@ impl std::fmt::Display for OsmGraphError {
             OsmGraphError::InvalidInput(msg) => write!(f, "Invalid input: {}", msg),
             OsmGraphError::Io(e) => write!(f, "IO error: {}", e),
             OsmGraphError::PbfError(msg) => write!(f, "PBF error: {}", msg),
+            OsmGraphError::Infeasible(reason) => write!(f, "{reason}"),
+            OsmGraphError::InvalidGraphFile(msg) => write!(f, "Invalid graph file: {msg}"),
         }
     }
 }
@@ -58,14 +67,17 @@ impl std::fmt::Display for OsmGraphError {
 impl std::error::Error for OsmGraphError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            #[cfg(feature = "network")]
             OsmGraphError::Network(e) => Some(e),
             OsmGraphError::XmlParse(e) => Some(e),
             OsmGraphError::Io(e) => Some(e),
+            OsmGraphError::Infeasible(e) => Some(e),
             _ => None,
         }
     }
 }
 
+#[cfg(feature = "network")]
 impl From<reqwest::Error> for OsmGraphError {
     fn from(e: reqwest::Error) -> Self {
         OsmGraphError::Network(e)
@@ -75,6 +87,12 @@ impl From<reqwest::Error> for OsmGraphError {
 impl From<quick_xml::DeError> for OsmGraphError {
     fn from(e: quick_xml::DeError) -> Self {
         OsmGraphError::XmlParse(e)
+    }
+}
+
+impl From<crate::feasibility::InfeasibleReason> for OsmGraphError {
+    fn from(e: crate::feasibility::InfeasibleReason) -> Self {
+        OsmGraphError::Infeasible(e)
     }
 }
 
@@ -96,7 +114,14 @@ impl From<OsmGraphError> for pyo3::PyErr {
             OsmGraphError::XmlParse(_)
             | OsmGraphError::InvalidInput(_)
             | OsmGraphError::PbfError(_)
+            | OsmGraphError::InvalidGraphFile(_)
             | OsmGraphError::EmptyGraph => pyo3::exceptions::PyValueError::new_err(e.to_string()),
+            OsmGraphError::Infeasible(crate::feasibility::InfeasibleReason::BudgetTooTight {
+                ..
+            }) => pyo3::exceptions::PyValueError::new_err(e.to_string()),
+            OsmGraphError::Infeasible(crate::feasibility::InfeasibleReason::NoPathExists) => {
+                pyo3::exceptions::PyLookupError::new_err(e.to_string())
+            }
             OsmGraphError::NodeNotFound
             | OsmGraphError::OriginNodeNotFound
             | OsmGraphError::DestinationNodeNotFound
