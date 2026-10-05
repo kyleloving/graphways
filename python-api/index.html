@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -31,7 +31,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -881,7 +881,7 @@
 The primary API is <a href="../python-graph/"><code>SpatialGraph</code></a>. Build one graph, then run operations on it:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">graphways</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">gw</span>
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>
-</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">graph</span> <span class="o">=</span> <span class="n">gw</span><span class="o">.</span><span class="n">SpatialGraph</span><span class="o">.</span><span class="n">from_place</span><span class="p">(</span><span class="s2">&quot;Washington, DC&quot;</span><span class="p">,</span> <span class="n">network</span><span class="o">=</span><span class="s2">&quot;walk&quot;</span><span class="p">)</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="n">graph</span> <span class="o">=</span> <span class="n">gw</span><span class="o">.</span><span class="n">SpatialGraph</span><span class="o">.</span><span class="n">from_place</span><span class="p">(</span><span class="s2">"Washington, DC"</span><span class="p">,</span> <span class="n">network</span><span class="o">=</span><span class="s2">"walk"</span><span class="p">)</span>
 </span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">isos</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">isochrone</span><span class="p">((</span><span class="mf">38.9097</span><span class="p">,</span> <span class="o">-</span><span class="mf">77.0432</span><span class="p">),</span> <span class="n">minutes</span><span class="o">=</span><span class="p">[</span><span class="mi">10</span><span class="p">,</span> <span class="mi">20</span><span class="p">,</span> <span class="mi">30</span><span class="p">])</span>
 </span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="n">route</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">route</span><span class="p">((</span><span class="mf">38.9097</span><span class="p">,</span> <span class="o">-</span><span class="mf">77.0432</span><span class="p">),</span> <span class="p">(</span><span class="mf">38.8977</span><span class="p">,</span> <span class="o">-</span><span class="mf">77.0365</span><span class="p">))</span>
 </span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="nb">print</span><span class="p">(</span><span class="n">route</span><span class="o">.</span><span class="n">duration_s</span><span class="p">,</span> <span class="n">route</span><span class="o">.</span><span class="n">distance_m</span><span class="p">)</span>
@@ -918,7 +918,7 @@ transient <code>429</code> / <code>5xx</code> responses.</p>
 </table>
 <p><strong>Returns</strong> <code>(lat, lon)</code> as a tuple of floats</p>
 <p><strong>Example</strong></p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">lat</span><span class="p">,</span> <span class="n">lon</span> <span class="o">=</span> <span class="n">gw</span><span class="o">.</span><span class="n">geocode</span><span class="p">(</span><span class="s2">&quot;Marienplatz, Munich, Germany&quot;</span><span class="p">)</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">lat</span><span class="p">,</span> <span class="n">lon</span> <span class="o">=</span> <span class="n">gw</span><span class="o">.</span><span class="n">geocode</span><span class="p">(</span><span class="s2">"Marienplatz, Munich, Germany"</span><span class="p">)</span>
 </span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nb">print</span><span class="p">(</span><span class="n">lat</span><span class="p">,</span> <span class="n">lon</span><span class="p">)</span>  <span class="c1"># 48.137... 11.575...</span>
 </span></code></pre></div>
 <hr />
@@ -956,14 +956,14 @@ have a <code>SpatialGraph</code> object.</p>
 <p><strong>Example</strong></p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">graphways</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">gw</span>
 </span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="n">graph</span> <span class="o">=</span> <span class="n">gw</span><span class="o">.</span><span class="n">SpatialGraph</span><span class="o">.</span><span class="n">from_place</span><span class="p">(</span><span class="s2">&quot;Marienplatz, Munich, Germany&quot;</span><span class="p">,</span> <span class="n">network</span><span class="o">=</span><span class="s2">&quot;walk&quot;</span><span class="p">)</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="n">graph</span> <span class="o">=</span> <span class="n">gw</span><span class="o">.</span><span class="n">SpatialGraph</span><span class="o">.</span><span class="n">from_place</span><span class="p">(</span><span class="s2">"Marienplatz, Munich, Germany"</span><span class="p">,</span> <span class="n">network</span><span class="o">=</span><span class="s2">"walk"</span><span class="p">)</span>
 </span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="n">isos</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">isochrone</span><span class="p">((</span><span class="mf">48.137144</span><span class="p">,</span> <span class="mf">11.575399</span><span class="p">),</span> <span class="n">minutes</span><span class="o">=</span><span class="p">[</span><span class="mi">10</span><span class="p">])</span>
 </span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="n">pois</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">fetch_pois</span><span class="p">(</span><span class="n">isos</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>
 </span><span id="__span-4-6"><a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>
 </span><span id="__span-4-7"><a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="k">for</span> <span class="n">poi</span> <span class="ow">in</span> <span class="n">pois</span><span class="o">.</span><span class="n">pois</span><span class="p">:</span>
 </span><span id="__span-4-8"><a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a>    <span class="n">tags</span> <span class="o">=</span> <span class="n">poi</span><span class="o">.</span><span class="n">tags</span>
-</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a>    <span class="k">if</span> <span class="n">tags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;amenity&quot;</span><span class="p">)</span> <span class="o">==</span> <span class="s2">&quot;restaurant&quot;</span><span class="p">:</span>
-</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a>        <span class="nb">print</span><span class="p">(</span><span class="n">tags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;name&quot;</span><span class="p">,</span> <span class="s2">&quot;unnamed restaurant&quot;</span><span class="p">))</span>
+</span><span id="__span-4-9"><a id="__codelineno-4-9" name="__codelineno-4-9" href="#__codelineno-4-9"></a>    <span class="k">if</span> <span class="n">tags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"amenity"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"restaurant"</span><span class="p">:</span>
+</span><span id="__span-4-10"><a id="__codelineno-4-10" name="__codelineno-4-10" href="#__codelineno-4-10"></a>        <span class="nb">print</span><span class="p">(</span><span class="n">tags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"name"</span><span class="p">,</span> <span class="s2">"unnamed restaurant"</span><span class="p">))</span>
 </span></code></pre></div>
 <hr />
 <h2 id="cache_dir"><code>cache_dir</code><a class="headerlink" href="#cache_dir" title="Permanent link">&para;</a></h2>
@@ -1089,7 +1089,7 @@ instance or <code>SpatialGraph.from_pbf(...)</code>.</p>
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs", "navigation.instant", "navigation.top", "content.code.copy", "content.code.annotate"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

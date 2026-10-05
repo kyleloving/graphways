@@ -21,7 +21,7 @@
       
       
       <link rel="icon" href="assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -29,7 +29,7 @@
       
     
     
-      <link rel="stylesheet" href="assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="assets/stylesheets/palette.ab4e12ef.min.css">
@@ -856,8 +856,9 @@
 <h2 id="what-it-does">What it does<a class="headerlink" href="#what-it-does" title="Permanent link">&para;</a></h2>
 <p>graphways queries OpenStreetMap, builds a road-network graph, and gives you:</p>
 <ul>
-<li><strong>Isochrones</strong> -- polygons bounding everything reachable within a time limit</li>
-<li><strong>Point-to-point routing</strong> -- A* routes with per-waypoint cumulative travel times</li>
+<li><strong>Isochrones</strong> -- multipolygons covering everything reachable within a time limit, with holes for unreachable pockets</li>
+<li><strong>Point-to-point routing</strong> -- exact routes with per-waypoint cumulative travel times, sub-millisecond once prepared</li>
+<li><strong>Travel-time matrices</strong> -- many origins to many destinations in one call</li>
 <li><strong>POI fetching</strong> -- amenities, shops, and other features within any isochrone</li>
 <li><strong>Graph introspection</strong> -- inspect nodes, edges, and the network structure directly</li>
 </ul>
@@ -869,8 +870,8 @@ Call <code>.to_geojson()</code> when you need serialized GeoJSON for maps or fil
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>
 </span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="c1"># Build the graph once; reuse this object for repeated local queries.</span>
 </span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">graph</span> <span class="o">=</span> <span class="n">gw</span><span class="o">.</span><span class="n">SpatialGraph</span><span class="o">.</span><span class="n">from_place</span><span class="p">(</span>
-</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="s2">&quot;Marienplatz, Munich, Germany&quot;</span><span class="p">,</span>
-</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">network</span><span class="o">=</span><span class="s2">&quot;drive&quot;</span><span class="p">,</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>    <span class="s2">"Marienplatz, Munich, Germany"</span><span class="p">,</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>    <span class="n">network</span><span class="o">=</span><span class="s2">"drive"</span><span class="p">,</span>
 </span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="n">max_dist</span><span class="o">=</span><span class="mi">10_000</span><span class="p">,</span>
 </span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="p">)</span>
 </span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>
@@ -901,16 +902,32 @@ Call <code>.to_geojson()</code> when you need serialized GeoJSON for maps or fil
 <td>Collapses linear chains, deduplicates parallel edges, and preserves edge geometry</td>
 </tr>
 <tr>
-<td>Spatial index</td>
-<td>R-tree for O(log n) nearest-node lookups</td>
+<td>Snapping</td>
+<td>Points join the network at the closest point on any road (R-tree over road segments)</td>
+</tr>
+<tr>
+<td>Speed profiles</td>
+<td>Configurable walking, cycling and per-road-class driving speeds</td>
+</tr>
+<tr>
+<td>Turn restrictions</td>
+<td>OSM <code>type=restriction</code> relations are obeyed when driving</td>
 </tr>
 <tr>
 <td>Isochrones</td>
-<td>Bounded graph search plus triangulated travel-time contours</td>
+<td>Bounded graph search plus triangulated travel-time contours, as multipolygons with holes</td>
 </tr>
 <tr>
 <td>Routing</td>
-<td>A* with an admissible straight-line heuristic</td>
+<td>Contraction hierarchies once prepared, A* before; both exact</td>
+</tr>
+<tr>
+<td>Matrices</td>
+<td>Many-to-many travel times via hierarchy buckets</td>
+</tr>
+<tr>
+<td>Persistence</td>
+<td>Save a prepared graph and load it back in a fraction of the build time</td>
 </tr>
 <tr>
 <td>Network types</td>
@@ -922,7 +939,7 @@ Call <code>.to_geojson()</code> when you need serialized GeoJSON for maps or fil
 </tr>
 <tr>
 <td>Python bindings</td>
-<td>Structured result objects with explicit GeoJSON export</td>
+<td>Structured result objects with <code>__geo_interface__</code> and explicit GeoJSON export; the GIL is released during queries</td>
 </tr>
 </tbody>
 </table>
@@ -933,6 +950,7 @@ The benchmark suite reports graph construction separately from steady-state
 route, reachability, and isochrone queries:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>python<span class="w"> </span>benchmarks/comparison.py
 </span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>python<span class="w"> </span>benchmarks/engines/engines.py<span class="w"> </span>--pbf<span class="w"> </span>C:<span class="se">\p</span>ath<span class="se">\t</span>o<span class="se">\e</span>xtract.osm.pbf
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>cargo<span class="w"> </span>bench<span class="w"> </span>--bench<span class="w"> </span>pipeline<span class="w">              </span><span class="c1"># Rust pipeline on the bundled Munich extract</span>
 </span></code></pre></div>
 <p>Treat benchmark numbers as workload-specific. They depend on graph size,
 network profile, machine, cache state, and whether comparisons include
@@ -1022,7 +1040,7 @@ server-based routing engines such as OSRM or Valhalla.</p>
       <script id="__config" type="application/json">{"annotate": null, "base": ".", "features": ["navigation.tabs", "navigation.instant", "navigation.top", "content.code.copy", "content.code.annotate"], "search": "assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>

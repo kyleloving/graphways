@@ -23,7 +23,7 @@
       
       
       <link rel="icon" href="../assets/images/favicon.png">
-      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
     
     
       
@@ -31,7 +31,7 @@
       
     
     
-      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
       
         
         <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
@@ -885,8 +885,8 @@
 </span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="n">destination</span> <span class="o">=</span> <span class="p">(</span><span class="mf">48.154560</span><span class="p">,</span> <span class="mf">11.530840</span><span class="p">)</span>
 </span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>
 </span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">graph</span> <span class="o">=</span> <span class="n">gw</span><span class="o">.</span><span class="n">SpatialGraph</span><span class="o">.</span><span class="n">from_place</span><span class="p">(</span>
-</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="s2">&quot;Marienplatz, Munich, Germany&quot;</span><span class="p">,</span>
-</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">network</span><span class="o">=</span><span class="s2">&quot;drive&quot;</span><span class="p">,</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>    <span class="s2">"Marienplatz, Munich, Germany"</span><span class="p">,</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>    <span class="n">network</span><span class="o">=</span><span class="s2">"drive"</span><span class="p">,</span>
 </span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">max_dist</span><span class="o">=</span><span class="mi">10_000</span><span class="p">,</span>
 </span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="p">)</span>
 </span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a><span class="nb">print</span><span class="p">(</span><span class="n">graph</span><span class="p">)</span>
@@ -900,33 +900,46 @@
 </span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a><span class="nb">print</span><span class="p">(</span><span class="n">pois</span><span class="o">.</span><span class="n">count</span><span class="p">)</span>
 </span></code></pre></div>
 <p>Use <code>SpatialGraph.from_pbf(path, network="walk")</code> for local offline OSM PBF workflows, or <code>SpatialGraph.from_osm(xml, network="walk")</code> when you already have OSM XML.</p>
+<p>Points snap to the closest point on any road, so routes and isochrones start
+part-way along a street rather than at the nearest intersection.</p>
+<p>For repeated work over the same area, save the graph once and load it next
+time, and use a matrix when you need many trips at once:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">graph</span><span class="o">.</span><span class="n">save</span><span class="p">(</span><span class="s2">"munich-drive.graph"</span><span class="p">)</span>             <span class="c1"># includes the routing index</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="n">graph</span> <span class="o">=</span> <span class="n">gw</span><span class="o">.</span><span class="n">SpatialGraph</span><span class="o">.</span><span class="n">load</span><span class="p">(</span><span class="s2">"munich-drive.graph"</span><span class="p">)</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="n">stops</span> <span class="o">=</span> <span class="p">[(</span><span class="mf">48.140</span><span class="p">,</span> <span class="mf">11.560</span><span class="p">),</span> <span class="p">(</span><span class="mf">48.130</span><span class="p">,</span> <span class="mf">11.590</span><span class="p">),</span> <span class="p">(</span><span class="mf">48.150</span><span class="p">,</span> <span class="mf">11.580</span><span class="p">)]</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="n">matrix</span> <span class="o">=</span> <span class="n">graph</span><span class="o">.</span><span class="n">travel_time_matrix</span><span class="p">([</span><span class="n">origin</span><span class="p">],</span> <span class="n">stops</span><span class="p">)</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="nb">print</span><span class="p">(</span><span class="n">matrix</span><span class="o">.</span><span class="n">durations_s</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>                 <span class="c1"># seconds to each stop</span>
+</span></code></pre></div>
 <hr />
 <h2 id="working-with-structured-results">Working with structured results<a class="headerlink" href="#working-with-structured-results" title="Permanent link">&para;</a></h2>
-<p>Routes, snap diagnostics, and isochrones are structured Python objects. Export
-GeoJSON explicitly when you need to pass geometry to mapping tools:</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
-</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
-</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="c1"># Isochrone geometry</span>
-</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="n">iso</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">isos</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to_geojson</span><span class="p">())</span>
-</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="nb">print</span><span class="p">(</span><span class="n">iso</span><span class="p">[</span><span class="s2">&quot;type&quot;</span><span class="p">])</span>        <span class="c1"># &quot;Polygon&quot;</span>
-</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="nb">print</span><span class="p">(</span><span class="n">iso</span><span class="p">[</span><span class="s2">&quot;coordinates&quot;</span><span class="p">])</span> <span class="c1"># [[lon, lat], ...]</span>
-</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>
-</span><span id="__span-1-8"><a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="c1"># Route metrics and feature export</span>
-</span><span id="__span-1-9"><a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Distance: </span><span class="si">{</span><span class="n">route</span><span class="o">.</span><span class="n">distance_m</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> m&quot;</span><span class="p">)</span>
-</span><span id="__span-1-10"><a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Duration: </span><span class="si">{</span><span class="n">route</span><span class="o">.</span><span class="n">duration_s</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> s&quot;</span><span class="p">)</span>
-</span><span id="__span-1-11"><a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Waypoints: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">route</span><span class="o">.</span><span class="n">cumulative_times_s</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
-</span><span id="__span-1-12"><a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Origin snap: </span><span class="si">{</span><span class="n">route</span><span class="o">.</span><span class="n">origin_snap</span><span class="o">.</span><span class="n">distance_m</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> m&quot;</span><span class="p">)</span>
-</span><span id="__span-1-13"><a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a>
-</span><span id="__span-1-14"><a id="__codelineno-1-14" name="__codelineno-1-14" href="#__codelineno-1-14"></a><span class="n">route_data</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">route</span><span class="o">.</span><span class="n">to_geojson</span><span class="p">())</span>
-</span><span id="__span-1-15"><a id="__codelineno-1-15" name="__codelineno-1-15" href="#__codelineno-1-15"></a><span class="n">props</span> <span class="o">=</span> <span class="n">route_data</span><span class="p">[</span><span class="s2">&quot;properties&quot;</span><span class="p">]</span>
-</span><span id="__span-1-16"><a id="__codelineno-1-16" name="__codelineno-1-16" href="#__codelineno-1-16"></a>
-</span><span id="__span-1-17"><a id="__codelineno-1-17" name="__codelineno-1-17" href="#__codelineno-1-17"></a><span class="c1"># POI FeatureCollection</span>
-</span><span id="__span-1-18"><a id="__codelineno-1-18" name="__codelineno-1-18" href="#__codelineno-1-18"></a><span class="n">pois_data</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">pois</span><span class="o">.</span><span class="n">to_geojson</span><span class="p">())</span>
-</span><span id="__span-1-19"><a id="__codelineno-1-19" name="__codelineno-1-19" href="#__codelineno-1-19"></a><span class="k">for</span> <span class="n">feature</span> <span class="ow">in</span> <span class="n">pois_data</span><span class="p">[</span><span class="s2">&quot;features&quot;</span><span class="p">]:</span>
-</span><span id="__span-1-20"><a id="__codelineno-1-20" name="__codelineno-1-20" href="#__codelineno-1-20"></a>    <span class="n">tags</span> <span class="o">=</span> <span class="n">feature</span><span class="p">[</span><span class="s2">&quot;properties&quot;</span><span class="p">]</span>
-</span><span id="__span-1-21"><a id="__codelineno-1-21" name="__codelineno-1-21" href="#__codelineno-1-21"></a>    <span class="n">name</span> <span class="o">=</span> <span class="n">tags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;name&quot;</span><span class="p">,</span> <span class="s2">&quot;unnamed&quot;</span><span class="p">)</span>
-</span><span id="__span-1-22"><a id="__codelineno-1-22" name="__codelineno-1-22" href="#__codelineno-1-22"></a>    <span class="n">kind</span> <span class="o">=</span> <span class="n">tags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;amenity&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="n">tags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">&quot;shop&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">&quot;?&quot;</span>
-</span><span id="__span-1-23"><a id="__codelineno-1-23" name="__codelineno-1-23" href="#__codelineno-1-23"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">kind</span><span class="si">}</span><span class="s2">)&quot;</span><span class="p">)</span>
+<p>Routes, snap diagnostics, and isochrones are structured Python objects. Routes
+and isochrones implement <code>__geo_interface__</code>, so <code>shapely.geometry.shape(iso)</code>
+and GeoPandas accept them directly. Export GeoJSON explicitly when you need to
+pass geometry to other mapping tools:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="c1"># Isochrone geometry</span>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="n">iso</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">isos</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">to_geojson</span><span class="p">())</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="nb">print</span><span class="p">(</span><span class="n">iso</span><span class="p">[</span><span class="s2">"type"</span><span class="p">])</span>        <span class="c1"># "MultiPolygon": parts, each with holes</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="nb">print</span><span class="p">(</span><span class="n">iso</span><span class="p">[</span><span class="s2">"coordinates"</span><span class="p">])</span> <span class="c1"># [[[[lon, lat], ...], ...], ...]</span>
+</span><span id="__span-2-7"><a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>
+</span><span id="__span-2-8"><a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="c1"># Route metrics and feature export</span>
+</span><span id="__span-2-9"><a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Distance: </span><span class="si">{</span><span class="n">route</span><span class="o">.</span><span class="n">distance_m</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> m"</span><span class="p">)</span>
+</span><span id="__span-2-10"><a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Duration: </span><span class="si">{</span><span class="n">route</span><span class="o">.</span><span class="n">duration_s</span><span class="si">:</span><span class="s2">.0f</span><span class="si">}</span><span class="s2"> s"</span><span class="p">)</span>
+</span><span id="__span-2-11"><a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Waypoints: </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">route</span><span class="o">.</span><span class="n">cumulative_times_s</span><span class="p">)</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
+</span><span id="__span-2-12"><a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Origin snap: </span><span class="si">{</span><span class="n">route</span><span class="o">.</span><span class="n">origin_snap</span><span class="o">.</span><span class="n">distance_m</span><span class="si">:</span><span class="s2">.1f</span><span class="si">}</span><span class="s2"> m"</span><span class="p">)</span>
+</span><span id="__span-2-13"><a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>
+</span><span id="__span-2-14"><a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="n">route_data</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">route</span><span class="o">.</span><span class="n">to_geojson</span><span class="p">())</span>
+</span><span id="__span-2-15"><a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="n">props</span> <span class="o">=</span> <span class="n">route_data</span><span class="p">[</span><span class="s2">"properties"</span><span class="p">]</span>
+</span><span id="__span-2-16"><a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a>
+</span><span id="__span-2-17"><a id="__codelineno-2-17" name="__codelineno-2-17" href="#__codelineno-2-17"></a><span class="c1"># POI FeatureCollection</span>
+</span><span id="__span-2-18"><a id="__codelineno-2-18" name="__codelineno-2-18" href="#__codelineno-2-18"></a><span class="n">pois_data</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">pois</span><span class="o">.</span><span class="n">to_geojson</span><span class="p">())</span>
+</span><span id="__span-2-19"><a id="__codelineno-2-19" name="__codelineno-2-19" href="#__codelineno-2-19"></a><span class="k">for</span> <span class="n">feature</span> <span class="ow">in</span> <span class="n">pois_data</span><span class="p">[</span><span class="s2">"features"</span><span class="p">]:</span>
+</span><span id="__span-2-20"><a id="__codelineno-2-20" name="__codelineno-2-20" href="#__codelineno-2-20"></a>    <span class="n">tags</span> <span class="o">=</span> <span class="n">feature</span><span class="p">[</span><span class="s2">"properties"</span><span class="p">]</span>
+</span><span id="__span-2-21"><a id="__codelineno-2-21" name="__codelineno-2-21" href="#__codelineno-2-21"></a>    <span class="n">name</span> <span class="o">=</span> <span class="n">tags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"name"</span><span class="p">,</span> <span class="s2">"unnamed"</span><span class="p">)</span>
+</span><span id="__span-2-22"><a id="__codelineno-2-22" name="__codelineno-2-22" href="#__codelineno-2-22"></a>    <span class="n">kind</span> <span class="o">=</span> <span class="n">tags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"amenity"</span><span class="p">)</span> <span class="ow">or</span> <span class="n">tags</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"shop"</span><span class="p">)</span> <span class="ow">or</span> <span class="s2">"?"</span>
+</span><span id="__span-2-23"><a id="__codelineno-2-23" name="__codelineno-2-23" href="#__codelineno-2-23"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="n">kind</span><span class="si">}</span><span class="s2">)"</span><span class="p">)</span>
 </span></code></pre></div>
 <hr />
 <h2 id="choosing-a-network-type">Choosing a network type<a class="headerlink" href="#choosing-a-network-type" title="Permanent link">&para;</a></h2>
@@ -968,13 +981,13 @@ GeoJSON explicitly when you need to pass geometry to mapping tools:</p>
 <h2 id="caching">Caching<a class="headerlink" href="#caching" title="Permanent link">&para;</a></h2>
 <p>graphways caches Overpass XML responses so repeated <code>from_place(...)</code> calls can
 skip the network:</p>
-<div class="language-text highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>Overpass API (network) -&gt; disk XML -&gt; in-memory XML
+<div class="language-text highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>Overpass API (network) -&gt; disk XML -&gt; in-memory XML
 </span></code></pre></div>
 <p>Disk cache entries persist across process restarts. The in-memory XML cache only
 lasts for the current process. Built graphs are not hidden in a global cache;
 hold onto the returned <code>SpatialGraph</code> and reuse it directly.</p>
-<div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="nb">print</span><span class="p">(</span><span class="n">gw</span><span class="o">.</span><span class="n">cache_dir</span><span class="p">())</span>  <span class="c1"># shows the disk cache location</span>
-</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="n">gw</span><span class="o">.</span><span class="n">clear_cache</span><span class="p">()</span>       <span class="c1"># wipe XML caches</span>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nb">print</span><span class="p">(</span><span class="n">gw</span><span class="o">.</span><span class="n">cache_dir</span><span class="p">())</span>  <span class="c1"># shows the disk cache location</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="n">gw</span><span class="o">.</span><span class="n">clear_cache</span><span class="p">()</span>       <span class="c1"># wipe XML caches</span>
 </span></code></pre></div>
 <p>Set <code>GRAPHWAYS_CACHE_DIR</code> to override the default cache location.</p>
 <h2 id="network-services">Network services<a class="headerlink" href="#network-services" title="Permanent link">&para;</a></h2>
@@ -984,9 +997,9 @@ rate-limits Nominatim geocoding requests, and retries transient <code>429</code>
 responses.</p>
 <p>Set these environment variables when you need local mirrors, custom endpoints,
 or a project-specific contact string:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nv">GRAPHWAYS_OVERPASS_URL</span><span class="o">=</span>https://overpass-api.de/api/interpreter
-</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="nv">GRAPHWAYS_NOMINATIM_URL</span><span class="o">=</span>https://nominatim.openstreetmap.org/search
-</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="nv">GRAPHWAYS_USER_AGENT</span><span class="o">=</span><span class="s2">&quot;your-app/1.0 contact@example.com&quot;</span>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="nv">GRAPHWAYS_OVERPASS_URL</span><span class="o">=</span>https://overpass-api.de/api/interpreter
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="nv">GRAPHWAYS_NOMINATIM_URL</span><span class="o">=</span>https://nominatim.openstreetmap.org/search
+</span><span id="__span-5-3"><a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="nv">GRAPHWAYS_USER_AGENT</span><span class="o">=</span><span class="s2">"your-app/1.0 contact@example.com"</span>
 </span></code></pre></div>
 <p>Use <code>SpatialGraph.from_pbf(...)</code> for offline workflows that should not touch
 network services.</p>
@@ -1075,7 +1088,7 @@ network services.</p>
       <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs", "navigation.instant", "navigation.top", "content.code.copy", "content.code.annotate"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
     
     
-      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
       
     
   </body>
