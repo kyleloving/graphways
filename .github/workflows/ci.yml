@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
+    # Tags run this suite through release.yml instead.
+    branches: ["**"]
   pull_request:
+  workflow_call:
 
 jobs:
   rust:

@@ -43,7 +43,7 @@ crate-type = ["cdylib", "rlib"]
 # only load local PBF/XML files.
 default = ["network"]
 network = ["dep:reqwest", "dep:tokio"]
-extension-module = ["pyo3/extension-module", "network"]
+extension-module = ["pyo3/extension-module", "pyo3/abi3-py38", "network"]
 
 # Repo-local benchmark harness: `cargo bench --bench pipeline`.
 [[bench]]

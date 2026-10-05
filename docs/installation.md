@@ -8,7 +8,10 @@
 pip install graphways
 ```
 
-Wheels are provided for Python 3.8+ on Linux, macOS, and Windows (x86-64).
+Wheels are provided for CPython 3.8 and later on Linux (x86-64 and ARM64),
+macOS (Apple silicon and Intel) and Windows (x86-64): one wheel per platform
+covers every Python version. On other platforms pip builds from the source
+distribution, which needs [Rust](https://rustup.rs/).
 
 ### From source
 
