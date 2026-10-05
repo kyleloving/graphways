@@ -204,7 +204,7 @@ impl TriangulatedSurface {
             return None; // all points collinear
         }
         let mut triangles = triangulation.triangles;
-        for t in triangles.chunks_exact_mut(3) {
+        for t in triangles.as_chunks_mut::<3>().0 {
             if cross(&vertices[t[0]], &vertices[t[1]], &vertices[t[2]]) < 0.0 {
                 t.swap(1, 2);
             }
@@ -238,7 +238,7 @@ impl TriangulatedSurface {
     fn boundary_segments(&self, limit: f64) -> Vec<ContourSegment> {
         let inside = |v: &IsoVertex| v.time <= limit;
         let mut segments = Vec::new();
-        for t in self.triangles.chunks_exact(3) {
+        for t in self.triangles.as_chunks::<3>().0 {
             let [a, b, c] = [t[0], t[1], t[2]].map(|i| self.vertices[i]);
             let mut exit = None;
             let mut entry = None;
